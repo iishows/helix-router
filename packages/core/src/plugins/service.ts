@@ -148,11 +148,54 @@ export type GatewayPluginRegistration = {
   };
   gatewayRoutes?: GatewayPluginRouteRegistration[];
   gatewayRequestTransforms?: GatewayPluginRequestTransformRegistration[];
+  gatewayResponseHooks?: GatewayPluginResponseHookRegistration[];
   onStop?: GatewayPluginStopHandler;
   providerAccountConnectors?: GatewayPluginProviderAccountConnector[];
   proxyRoutes?: GatewayPluginProxyRouteRegistration[];
   stop?: GatewayPluginStopHandler;
   virtualModelProfiles?: unknown[];
+};
+
+// ============= Response Hook =============
+// 用于拦截 LLM 响应，实现 agentic loop（如 Context Cache Retrieve）
+
+export type LLMMessage = {
+  role: string;
+  content: string | Array<{ type: string; text?: string; [k: string]: unknown }>;
+  tool_call_id?: string;
+  [k: string]: unknown;
+};
+
+export type GatewayPluginResponseHookInput = {
+  body: Record<string, unknown>;
+  headers: Record<string, string>;
+  method: string;
+  path: string;
+  requestId: string;
+  responsePayload: unknown;
+  responseHeaders?: Record<string, string>;
+  statusCode: number;
+  protocol: "openai" | "anthropic";
+};
+
+export type GatewayPluginResponseHookResult = {
+  continueLoop: boolean;
+  messagesToAppend?: LLMMessage[];
+  finalResponse?: unknown;
+};
+
+export type GatewayPluginResponseHookHandler = (
+  input: GatewayPluginResponseHookInput,
+  context: GatewayPluginRequestTransformContext
+) => MaybePromise<GatewayPluginResponseHookResult | null | undefined>;
+
+export type GatewayPluginResponseHookRegistration = {
+  id?: string;
+  hook: GatewayPluginResponseHookHandler;
+};
+
+type RegisteredGatewayResponseHook = Required<Pick<GatewayPluginResponseHookRegistration, "id" | "hook">> & {
+  pluginId: string;
 };
 
 export type GatewayPluginContext = {
@@ -173,6 +216,7 @@ export type GatewayPluginContext = {
   registerApp: (app: GatewayPluginAppConfig) => void;
   registerGatewayRoute: (route: GatewayPluginRouteRegistration) => void;
   registerGatewayRequestTransform: (transform: GatewayPluginRequestTransformRegistration) => void;
+  registerGatewayResponseHook: (hook: GatewayPluginResponseHookRegistration) => void;
   registerHttpBackend: (backend: GatewayPluginHttpBackendRegistration) => Promise<RegisteredHttpBackend>;
   registerProviderAccountConnector: (connector: GatewayPluginProviderAccountConnector) => void;
   registerProxyRoute: (route: GatewayPluginProxyRouteRegistration) => void;
@@ -243,6 +287,7 @@ type PluginServiceStateSnapshot = {
   coreGatewayPlugins: unknown[];
   coreProviderPlugins: unknown[];
   gatewayRequestTransforms: RegisteredGatewayRequestTransform[];
+  gatewayResponseHooks: RegisteredGatewayResponseHook[];
   gatewayRoutes: RegisteredGatewayRoute[];
   providerAccountConnectors: Map<string, GatewayPluginProviderAccountConnector>;
   proxyRoutes: RegisteredProxyRoute[];
@@ -260,6 +305,7 @@ class GatewayPluginService {
   private coreProviderPlugins: unknown[] = [];
   private apps: InstalledBrowserApp[] = [];
   private gatewayRequestTransforms: RegisteredGatewayRequestTransform[] = [];
+  private gatewayResponseHooks: RegisteredGatewayResponseHook[] = [];
   private gatewayRoutes: RegisteredGatewayRoute[] = [];
   private proxyRoutes: RegisteredProxyRoute[] = [];
   private providerAccountConnectors = new Map<string, GatewayPluginProviderAccountConnector>();
@@ -315,6 +361,7 @@ class GatewayPluginService {
     this.coreGatewayPlugins = [];
     this.coreProviderPlugins = [];
     this.gatewayRequestTransforms = [];
+    this.gatewayResponseHooks = [];
     this.gatewayRoutes = [];
     this.proxyRoutes = [];
     this.providerAccountConnectors.clear();
@@ -574,6 +621,13 @@ class GatewayPluginService {
     for (const transform of registration.gatewayRequestTransforms ?? []) {
       this.registerGatewayRequestTransform(pluginId, transform);
     }
+    if ((registration.gatewayResponseHooks ?? []).length > 0) {
+      this.requirePluginSurface(pluginConfig, "gateway", "register gateway response hooks");
+      this.requirePluginPermission(permissions, "gateway-request-transforms", "register gateway response hooks");
+    }
+    for (const hook of registration.gatewayResponseHooks ?? []) {
+      this.registerGatewayResponseHook(pluginId, hook);
+    }
     if ((registration.proxyRoutes ?? []).length > 0) {
       this.requirePluginSurface(pluginConfig, "gateway", "register proxy routes");
       this.requirePluginPermission(permissions, "proxy-routes", "register proxy routes");
@@ -698,6 +752,52 @@ class GatewayPluginService {
     });
   }
 
+  private registerGatewayResponseHook(pluginId: string, hook: GatewayPluginResponseHookRegistration): void {
+    if (typeof hook.hook !== "function") {
+      throw new Error(`Plugin ${pluginId} registered an invalid gateway response hook.`);
+    }
+    this.gatewayResponseHooks.push({
+      id: hook.id?.trim() || `${pluginId}:response-hook:${this.gatewayResponseHooks.length + 1}`,
+      pluginId,
+      hook: hook.hook
+    });
+  }
+
+  async applyGatewayResponseHooks(input: GatewayPluginResponseHookInput): Promise<{
+    continueLoop: boolean;
+    messagesToAppend: LLMMessage[];
+    finalResponse?: unknown;
+  }> {
+    let messagesToAppend: LLMMessage[] = [];
+    let finalResponse: unknown;
+    let continueLoop = false;
+
+    for (const hook of this.gatewayResponseHooks) {
+      try {
+        const result = await hook.hook(input, this.createRequestTransformContext(hook.pluginId));
+        if (!result) continue;
+        if (Array.isArray(result.messagesToAppend) && result.messagesToAppend.length > 0) {
+          messagesToAppend = [...messagesToAppend, ...result.messagesToAppend];
+        }
+        if (result.finalResponse !== undefined) {
+          finalResponse = result.finalResponse;
+        }
+        if (result.continueLoop) {
+          continueLoop = true;
+        }
+      } catch (error) {
+        console.warn(`[plugin:${hook.pluginId}] Response hook ${hook.id} failed: ${formatError(error)}`);
+      }
+    }
+
+    const out: { continueLoop: boolean; messagesToAppend: LLMMessage[]; finalResponse?: unknown } = {
+      continueLoop,
+      messagesToAppend
+    };
+    if (finalResponse !== undefined) out.finalResponse = finalResponse;
+    return out;
+  }
+
   private registerBuiltInGatewayRequestTransforms(): void {
     this.gatewayRequestTransforms.push({
       id: "openrouter-discount-provider-router",
@@ -771,6 +871,11 @@ class GatewayPluginService {
         this.requirePluginSurface(pluginConfig, "gateway", "register gateway request transforms");
         this.requirePluginPermission(permissions, "gateway-request-transforms", "register gateway request transforms");
         this.registerGatewayRequestTransform(pluginConfig.id, transform);
+      },
+      registerGatewayResponseHook: (hook) => {
+        this.requirePluginSurface(pluginConfig, "gateway", "register gateway response hooks");
+        this.requirePluginPermission(permissions, "gateway-request-transforms", "register gateway response hooks");
+        this.registerGatewayResponseHook(pluginConfig.id, hook);
       },
       registerHttpBackend: (backend) => {
         this.requirePluginSurface(pluginConfig, "gateway", "register HTTP backends");
@@ -923,6 +1028,7 @@ class GatewayPluginService {
       coreGatewayPlugins: [...this.coreGatewayPlugins],
       coreProviderPlugins: [...this.coreProviderPlugins],
       gatewayRequestTransforms: [...this.gatewayRequestTransforms],
+      gatewayResponseHooks: [...this.gatewayResponseHooks],
       gatewayRoutes: [...this.gatewayRoutes],
       providerAccountConnectors: new Map(this.providerAccountConnectors),
       proxyRoutes: [...this.proxyRoutes],
@@ -939,6 +1045,7 @@ class GatewayPluginService {
     this.coreGatewayPlugins = snapshot.coreGatewayPlugins;
     this.coreProviderPlugins = snapshot.coreProviderPlugins;
     this.gatewayRequestTransforms = snapshot.gatewayRequestTransforms;
+    this.gatewayResponseHooks = snapshot.gatewayResponseHooks;
     this.gatewayRoutes = snapshot.gatewayRoutes;
     this.providerAccountConnectors = snapshot.providerAccountConnectors;
     this.proxyRoutes = snapshot.proxyRoutes;

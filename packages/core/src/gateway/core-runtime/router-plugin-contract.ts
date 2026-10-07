@@ -16,6 +16,13 @@ export const ccrLiveTokenRateConfigMessageType = "ccr:live-token-rate-config";
 export const ccrLiveTokenRateSnapshotMessageType = "ccr:live-token-rate-snapshot";
 export const ccrLiveTokenRateStreamHookKey = "ccr-live-token-rate-stream-hook";
 
+// helix-compressor recall (Context Cache Retrieve)
+export const helixCompressorResponseHookKey = "helix-compressor-response-hook";
+export const helixCompressorRecallToolName = "hc_recall";
+export const helixCompressorMaxLoopPerRequest = 3;
+export const helixCompressorMaxRecallPerRequest = 3;
+export const helixCompressorLoopTimeoutMs = 60000;
+
 export type CcrLiveTokenRateConfigMessage = {
   enabled: boolean;
   protocolVersion: 1;
