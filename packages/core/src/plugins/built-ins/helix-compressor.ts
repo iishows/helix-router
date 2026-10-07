@@ -757,7 +757,17 @@ async function fetchRecallBatch(
 
     if (resp.ok) {
       const data = await resp.json();
-      return (data.results || []).map((r: { hash: string; original?: string }) => ({
+      const raw = data.results || {};
+      // 兼容两种格式：
+      // 1. { hash: "content" } 对象（当前云端实现）
+      // 2. [{ hash, original }] 数组（未来可能改）
+      const items = Array.isArray(raw)
+        ? raw
+        : Object.entries(raw).map(([hash, original]) => ({
+            hash,
+            original: typeof original === "string" ? original : null
+          }));
+      return items.map((r: { hash: string; original?: string | null }) => ({
         hash: r.hash,
         original: r.original ?? null
       }));
