@@ -556,7 +556,7 @@ const HC_RECALL_INSTRUCTION = `${HC_RECALL_INSTRUCTION_MARKER}
 // hash_id 格式校验：8-128 位 hex
 const HASH_PATTERN = /^[0-9a-f]{8,128}$/;
 
-function hasHCPlaceholder(messages: LLMMessage[]): boolean {
+export function hasHCPlaceholder(messages: LLMMessage[]): boolean {
   for (const msg of messages) {
     if (!msg) continue;
     const content = msg.content;
@@ -572,7 +572,7 @@ function hasHCPlaceholder(messages: LLMMessage[]): boolean {
   return false;
 }
 
-function injectRecallInstruction(messages: LLMMessage[]): LLMMessage[] {
+export function injectRecallInstruction(messages: LLMMessage[]): LLMMessage[] {
   // 检测是否已注入
   for (const m of messages) {
     if (m?.role === "system" && typeof m.content === "string" && m.content.includes(HC_RECALL_INSTRUCTION_MARKER)) {
@@ -675,7 +675,7 @@ export const helixCompressorResponseHook: GatewayPluginResponseHookHandler = asy
 };
 
 // 提取 OpenAI 协议 hc_recall 调用
-function extractOpenAIHcrecallCalls(response: Record<string, unknown>): Array<{
+export function extractOpenAIHcrecallCalls(response: Record<string, unknown>): Array<{
   tool_call_id: string;
   hash_id: string;
   reason: string;
@@ -713,7 +713,7 @@ function extractOpenAIHcrecallCalls(response: Record<string, unknown>): Array<{
 }
 
 // 提取 Anthropic 协议 tool_use 调用
-function extractAnthropicHcrecallCalls(response: Record<string, unknown>): Array<{
+export function extractAnthropicHcrecallCalls(response: Record<string, unknown>): Array<{
   tool_call_id: string;
   hash_id: string;
   reason: string;
