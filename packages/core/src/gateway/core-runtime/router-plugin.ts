@@ -67,10 +67,8 @@ import {
 } from "@ccr/core/plugins/built-ins/openrouter-discount-provider-router";
 import {
   helixCompressorTransform,
-  helixCompressorRequestTransformKey,
-  helixCompressorResponseHook
+  helixCompressorRequestTransformKey
 } from "@ccr/core/plugins/built-ins/helix-compressor";
-import { helixCompressorResponseHookKey } from "@ccr/core/gateway/core-runtime/router-plugin-contract";
 import type {
   GatewayPluginRequestTransformContext,
   GatewayPluginRequestTransformInput as CcrGatewayPluginRequestTransformInput
@@ -462,52 +460,6 @@ export async function createGatewayPlugin(input: GatewayPluginFactoryInput = {})
       key: ccrOpenRouterDiscountFinalizeResponseHookKey,
       transformResponse: (responseInput: GatewayResponseHookInput) => {
         finalizeOpenRouterDiscountSelection(responseInput);
-        return undefined;
-      }
-    }, {
-      key: helixCompressorResponseHookKey,
-      transformResponse: async (responseInput: GatewayResponseHookInput) => {
-        const payload = responseInput.responsePayload;
-        if (!isRecord(payload)) return undefined;
-
-        // 协议识别
-        const protocol: "openai" | "anthropic" = inferProtocol(payload);
-
-        const result = await helixCompressorResponseHook(
-          {
-            body: responseInput.request as unknown as Record<string, unknown>,
-            headers: normalizeHookHeaders(responseInput.request?.headers),
-            method: responseInput.request?.method ?? "POST",
-            path: responseInput.request?.url ?? "/",
-            requestId: responseInput.request?.id ?? "",
-            responsePayload: payload,
-            responseHeaders: responseInput.responseHeaders,
-            statusCode: responseInput.statusCode ?? 200,
-            protocol
-          },
-          {
-            config,
-            logger: loggerForPlugin,
-            openSqliteStore: async () => {
-              throw new Error("openSqliteStore not available in helix-compressor response hook");
-            },
-            paths: { configDir: "", dataDir: "", pluginDataDir: "" },
-            permissions: [],
-            pluginConfig: config,
-            pluginId: "helix-compressor"
-          }
-        );
-
-        if (!result) return undefined;
-
-        if (result.finalResponse !== undefined) {
-          return { responsePayload: result.finalResponse };
-        }
-
-        if (result.continueLoop && result.messagesToAppend?.length) {
-          return { messagesToAppend: result.messagesToAppend };
-        }
-
         return undefined;
       }
     }],
@@ -1547,28 +1499,3 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
-
-function inferProtocol(payload: Record<string, unknown>): "openai" | "anthropic" {
-  // Anthropic: content 是数组且含 type === "tool_use"
-  if (Array.isArray(payload.content) && payload.content.some((b) => isRecord(b) && b.type === "tool_use")) {
-    return "anthropic";
-  }
-  return "openai";
-}
-
-function normalizeHookHeaders(headers?: Record<string, string | string[] | undefined>): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (!headers) return out;
-  for (const [k, v] of Object.entries(headers)) {
-    if (typeof v === "string") out[k.toLowerCase()] = v;
-    else if (Array.isArray(v) && v.length > 0 && typeof v[0] === "string") out[k.toLowerCase()] = v[0];
-  }
-  return out;
-}
-
-const loggerForPlugin = {
-  debug: (...args: unknown[]) => console.debug("[plugin:helix-compressor]", ...args),
-  info: (...args: unknown[]) => console.info("[plugin:helix-compressor]", ...args),
-  warn: (...args: unknown[]) => console.warn("[plugin:helix-compressor]", ...args),
-  error: (...args: unknown[]) => console.error("[plugin:helix-compressor]", ...args)
-};

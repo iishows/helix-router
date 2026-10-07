@@ -51,6 +51,7 @@ import { modelRegistryForConfig } from "@ccr/core/routing/model-registry";
 import { createClaudeCodeWebSearchContinuationContext, createHostedWebSearchProtocolContext, hostedWebSearchProtocolResponseStream, hostedWebSearchUnavailableMessage, prepareClaudeCodeWebSearchContinuationRequestBody, prepareHostedWebSearchProtocolRequestBody, selectClaudeCodeWebSearchContinuationRecords, selectHostedWebSearchProtocolRecords } from "@ccr/core/gateway/features/hosted-web-search/index";
 import { isModelAllowedForProfile, profileForApiKey } from "@ccr/core/profiles/model-allowlist";
 import { pluginService } from "@ccr/core/plugins/service";
+import { helixCompressorMaxLoopPerRequest } from "@ccr/core/gateway/core-runtime/router-plugin-contract";
 import { finalizeOpenRouterDiscountProviderRouterSelection } from "@ccr/core/plugins/built-ins/openrouter-discount-provider-router";
 import {
   ccrRouteHeaderNames,
@@ -62,6 +63,137 @@ import {
 } from "@ccr/core/gateway/core-runtime/router-plugin-contract";
 import { isRecord } from "@ccr/core/gateway/internal/value";
 import { combineStreamExperienceMetrics, createStreamExperienceMeter, monotonicNowMs } from "@ccr/core/observability/stream-experience";
+
+// ============= helix-compressor recall agentic loop =============
+
+type HelixCompressorRecallLoopInput = {
+  initialResult: UpstreamFetchResult;
+  initialBody: Buffer;
+  config: AppConfig;
+  headers: Record<string, string>;
+  method: string;
+  path: string;
+  requestId: string;
+  routeFallback: RouterFallbackConfig;
+  routedModel: string | undefined;
+  coreAuthToken: string;
+  signal: AbortSignal;
+  upstreamUrl: string;
+};
+
+type HelixCompressorRecallLoopResult = {
+  upstreamResult: UpstreamFetchResult;
+  body: Buffer;
+};
+
+/**
+ * Agentic loop for helix-compressor recall (Context Cache Retrieve).
+ *
+ * 流程：
+ * 1. 解析 LLM 响应，检查是否有 hc_recall tool_calls
+ * 2. 如果有，调 /v1/recall 查原文
+ * 3. 追加 tool result messages 到 body，重新发请求
+ * 4. 最多循环 helixCompressorMaxLoopPerRequest 次
+ *
+ * 退出条件：
+ * - 响应不包含 hc_recall 调用
+ * - HTTP 5xx 错误
+ * - 客户端 disconnect
+ * - 达到最大循环次数
+ * - 总耗时超过 60s
+ */
+async function runHelixCompressorRecallLoop(
+  input: HelixCompressorRecallLoopInput
+): Promise<HelixCompressorRecallLoopResult> {
+  let currentResult = input.initialResult;
+  let currentBody: Buffer = input.initialBody;
+  const loopStartedAt = Date.now();
+  const LOOP_TIMEOUT_MS = 60000;
+
+  for (let loopCount = 0; loopCount < helixCompressorMaxLoopPerRequest; loopCount++) {
+    // 退出条件检查
+    if (Date.now() - loopStartedAt > LOOP_TIMEOUT_MS) {
+      console.warn(`[helix-compressor] recall loop timeout after ${LOOP_TIMEOUT_MS}ms, breaking`);
+      break;
+    }
+    if (input.signal.aborted) break;
+    if (currentResult.response.status >= 500) break;
+
+    // 解析响应
+    const payload = await currentResult.response.clone().json().catch(() => null);
+    if (!payload || typeof payload !== "object") break;
+
+    // 协议识别
+    const isAnthropic = Array.isArray((payload as { content?: unknown[] }).content) &&
+      (payload as { content: Array<{ type?: string }> }).content.some(
+        (b) => b && typeof b === "object" && b.type === "tool_use"
+      );
+    const protocol: "openai" | "anthropic" = isAnthropic ? "anthropic" : "openai";
+
+    // 调用 pluginService 的 response hooks
+    const hookResult = await pluginService.applyGatewayResponseHooks({
+      body: {},
+      headers: input.headers,
+      method: input.method,
+      path: input.path,
+      requestId: input.requestId,
+      responsePayload: payload,
+      statusCode: currentResult.response.status,
+      protocol
+    });
+
+    // hook 返回 finalResponse：直接替换
+    if (hookResult.finalResponse !== undefined) {
+      const newResponse = new Response(JSON.stringify(hookResult.finalResponse), {
+        status: currentResult.response.status,
+        headers: currentResult.response.headers
+      });
+      return {
+        upstreamResult: { ...currentResult, response: newResponse },
+        body: currentBody
+      };
+    }
+
+    // 不需要继续 loop
+    if (!hookResult.continueLoop || !hookResult.messagesToAppend?.length) break;
+
+    // 构造新 body（追加 messages）
+    let bodyJson: Record<string, unknown>;
+    try {
+      bodyJson = JSON.parse(currentBody.toString("utf8"));
+    } catch {
+      console.warn(`[helix-compressor] failed to parse body JSON, breaking loop`);
+      break;
+    }
+    const existingMessages = Array.isArray(bodyJson.messages) ? bodyJson.messages : [];
+    bodyJson.messages = [...existingMessages, ...hookResult.messagesToAppend];
+    currentBody = Buffer.from(JSON.stringify(bodyJson), "utf8");
+
+    // 重发请求
+    let nextResult: UpstreamFetchResult;
+    try {
+      nextResult = await fetchUpstreamWithFallback({
+        body: currentBody,
+        config: input.config,
+        fallback: input.routeFallback,
+        headers: input.headers,
+        method: input.method,
+        path: input.path,
+        routedModel: input.routedModel,
+        coreAuthToken: input.coreAuthToken,
+        signal: input.signal,
+        upstreamUrl: input.upstreamUrl
+      });
+    } catch (err) {
+      console.warn(`[helix-compressor] recall loop refetch failed: ${(err as Error).message}`);
+      break;
+    }
+
+    currentResult = nextResult;
+  }
+
+  return { upstreamResult: currentResult, body: currentBody };
+}
 
 export type GatewayRequestPipelineDependencies = {
   getBrowserWebSearchMcpIntegration: () => BrowserWebSearchMcpIntegration | undefined;
@@ -780,6 +912,28 @@ export class GatewayRequestPipeline {
           trace: routeTrace,
           upstreamUrl
         });
+
+        // ============= helix-compressor recall agentic loop =============
+        // 拦截 LLM 响应，如果检测到 hc_recall 调用，查询 helix-compressor 缓存，
+        // 注入 tool results 后重新发送，最多循环 N 次。
+        if (bodyToForward && upstreamResult.response.ok && !upstreamAbortController.signal.aborted) {
+          const loopResult = await runHelixCompressorRecallLoop({
+            initialResult: upstreamResult,
+            initialBody: bodyToForward,
+            config: this.config,
+            headers,
+            method,
+            path: upstreamPath,
+            requestId,
+            routeFallback,
+            routedModel,
+            coreAuthToken: this.coreAuthToken,
+            signal: upstreamAbortController.signal,
+            upstreamUrl
+          });
+          upstreamResult = loopResult.upstreamResult;
+          bodyToForward = loopResult.body;
+        }
       } catch (error) {
         finalizeOpenRouterDiscountSelection(false);
         failContextArchiveRequest(contextArchiveRecord, contextArchiveRequestConfig);
