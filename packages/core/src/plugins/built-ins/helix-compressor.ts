@@ -678,22 +678,37 @@ export const HISTORY_RECALL_TOOL_SCHEMA = {
 const HISTORY_RECALL_INSTRUCTION_MARKER = "<<HISTORY_RECALL_INSTRUCTION_v1>>";
 
 const HISTORY_RECALL_INSTRUCTION = `${HISTORY_RECALL_INSTRUCTION_MARKER}
-## 工具调用: ${HISTORY_RECALL_TOOL_NAME}
+## ⚠️ 历史 Q&A 召回机制
 
-你会在对话中看到形如 ⟦QA:hash⟧ 的占位符（16 位十六进制）。
-这些占位符代表被压缩缓存的**整段 Q&A 对**（用户问题 + 助手回答的合并哈希）。
+对话中形如 \`⟦QA:abc123def4567890⟧\` 的标记是 **已被压缩的历史 Q&A 对**(原用户问题 + 原助手回答)。
+**这条占位符本身只携带"曾讨论过"信号**,不含具体细节 —— 看 hash 名不会让你知道那对 Q&A 说了什么。
 
-**规则**：
-1. 默认 \`with_media=false\`,只回文本(用户问题文本 + 助手回答文本)。**A 已包含助手对图片/视频/文档的理解**,通常够用。
-2. 当你需要**原图/原视频/原文档细节**(颜色、像素、文档原文某章节、对比两张图等),
-   设 \`with_media=true\`,会把原 media 一并返回。
-3. **不要**为每个占位符都 recall,只在**真正需要**时调。
-4. **不要**反复调同一个 hash_id。
+### 🎯 必须调用 \`${HISTORY_RECALL_TOOL_NAME}\` 的场景
+1. 当前任务需要某个历史 Q&A 里的 **具体数字 / 名称 / 代码 / 原文片段**
+2. 用户提问明确指向历史:"刚才/之前/我们前面聊过的 X 是什么"
+3. 比较/引用:**"对比之前那张图"**、"**用前面那份 PDF** 里的某段"
+4. 上下文依赖:**不调回历史内容,当前任务就无法正确完成**
 
-**示例**:
-占位符: \`⟦QA:abcdef0123456789⟧\`
-默认: ${HISTORY_RECALL_TOOL_NAME}(hash_id="abcdef0123456789", reason="need original A")
-要原图: ${HISTORY_RECALL_TOOL_NAME}(hash_id="abcdef0123456789", with_media=true, reason="need image detail")
+### ✅ 通常**不需要**调用的场景
+- 只关心"我们讨论过 X"的方向感,不需要细节
+- 答案能在上文 recent 段找到,不依赖压缩区
+
+### 🔧 调用方法
+- 占位符: \`⟦QA:abc123def4567890⟧\`
+- \`hash_id\` = 中间 16 位 hex(去掉 \`⟦QA:\` 前缀和 \`⟧\` 后缀):**\`abc123def4567890\`**
+- 默认 \`with_media=false\`,只返回 Q+A 文本 —— **A 已包含助手对图片/视频/文档内容的文字描述**,绝大多数情况已够用
+- 仅当 Q 中含**图片/视频/原文档**且你需要**像素级细节**或**原文某段引用**时,才设 \`with_media=true\`
+
+### 调用示例
+\`\`\`
+${HISTORY_RECALL_TOOL_NAME}(hash_id="abc123def4567890", reason="需要前面那张图的细节")
+${HISTORY_RECALL_TOOL_NAME}(hash_id="abc123def4567890", with_media=true, reason="对比新旧两份 PDF")
+\`\`\`
+
+### ⚠️ 禁止
+- ❌ 把 \`⟦QA:hash⟧\` 当作完整信息处理 —— 它只是摘要标签
+- ❌ 一次请求里为**所有**占位符都 recall —— 每请求有预算,浪费且无意义
+- ❌ 同一 \`hash_id\` 反复调 —— 一次即可
 `;
 
 /** 检测 ⟦QA:hash⟧ 占位符(V3.2 Q&A pair 压缩) */
@@ -705,8 +720,19 @@ export function hasQAPlaceholder(messages: LLMMessage[]): boolean {
   return false;
 }
 
-/** 注入 history_recall 工具的教学 prompt(同 V2 injectRecallInstruction 模式) */
-function injectHistoryRecallInstruction(messages: LLMMessage[]): LLMMessage[] {
+/** 注入 history_recall 工具的教学 prompt(同 V2 injectRecallInstruction 模式 + marker 幂等) */
+export function injectHistoryRecallInstruction(messages: LLMMessage[]): LLMMessage[] {
+  // marker 去重:避免多轮压缩时 system message 不断 prepend 同一段 instruction。
+  // V2 injectRecallInstruction 已用此模式,V3.2 历史版本漏了。
+  for (const m of messages) {
+    if (
+      m?.role === "system" &&
+      typeof m.content === "string" &&
+      m.content.includes(HISTORY_RECALL_INSTRUCTION_MARKER)
+    ) {
+      return messages;
+    }
+  }
   const out: LLMMessage[] = [];
   let injected = false;
   for (const m of messages) {
@@ -837,12 +863,17 @@ export const helixCompressorResponseHook: GatewayPluginResponseHookHandler = asy
 
   const messagesToAppend: LLMMessage[] = [...hcMessages, ...historyMessages];
 
-  // 审计日志
-  const hitCount = recallResults.filter(r => r.original !== null).length;
-  const missCount = recallResults.length - hitCount;
+  // 审计日志(V2 hc_recall + V3.2 history_recall 合并统计)
+  // 旧版此处引用 V2 时代的 `recallResults`/`validCalls`(V3.2 已拆分),
+  // 未定义变量导致 hook 抛 TypeError,gateway 吞掉 → LLM tool_call 没回结果,
+  // 表面看起来像 "LLM 不知道怎么用占位符"。
+  const hcHit = hcResults.filter(r => r.original !== null).length;
+  const qaHit = historyResults.filter(r => r.pair !== null).length;
+  const hcCount = validHcCalls.length;
+  const qaCount = validHistoryCalls.length;
   context.logger.info?.(
-    `[helix-compressor] recall completed request=${input.requestId} ` +
-    `protocol=${input.protocol} count=${validCalls.length} hit=${hitCount} miss=${missCount}`
+    `[helix-compressor] recall request=${input.requestId} protocol=${input.protocol} ` +
+    `hc=${hcCount}/${hcHit} qa=${qaCount}/${qaHit}`
   );
 
   return {
@@ -1032,7 +1063,7 @@ function makeToolResultMessage(
 }
 
 // V3.2: history_recall 调用提取
-function extractAnthropicHistoryRecallCalls(response: Record<string, unknown>): Array<{ hash_id: string; tool_call_id: string }> {
+export function extractAnthropicHistoryRecallCalls(response: Record<string, unknown>): Array<{ hash_id: string; tool_call_id: string }> {
   const calls: Array<{ hash_id: string; tool_call_id: string }> = [];
   const content = response.content;
   if (!Array.isArray(content)) return calls;
@@ -1051,7 +1082,7 @@ function extractAnthropicHistoryRecallCalls(response: Record<string, unknown>): 
   return calls;
 }
 
-function extractOpenAIHistoryRecallCalls(response: Record<string, unknown>): Array<{ hash_id: string; tool_call_id: string }> {
+export function extractOpenAIHistoryRecallCalls(response: Record<string, unknown>): Array<{ hash_id: string; tool_call_id: string }> {
   const calls: Array<{ hash_id: string; tool_call_id: string }> = [];
   const choices = response.choices;
   if (!Array.isArray(choices)) return calls;
