@@ -131,7 +131,26 @@ test("extractOpenAIHistoryRecallCalls: extracts history_recall tool_call", () =>
     }]
   };
   const calls = extractOpenAIHistoryRecallCalls(response);
-  assert.deepEqual(calls, [{ hash_id: "abc123def4567890", tool_call_id: "call_qa1" }]);
+  assert.deepEqual(calls, [{ hash_id: "abc123def4567890", tool_call_id: "call_qa1", with_media: false }]);
+});
+
+test("extractOpenAIHistoryRecallCalls: extracts with_media=true", () => {
+  const response = {
+    choices: [{
+      message: {
+        tool_calls: [{
+          id: "call_qa2",
+          type: "function",
+          function: {
+            name: HISTORY_RECALL_TOOL_NAME,
+            arguments: JSON.stringify({ hash_id: "abc123def4567890", with_media: true })
+          }
+        }]
+      }
+    }]
+  };
+  const calls = extractOpenAIHistoryRecallCalls(response);
+  assert.deepEqual(calls, [{ hash_id: "abc123def4567890", tool_call_id: "call_qa2", with_media: true }]);
 });
 
 test("extractOpenAIHistoryRecallCalls: filters non-history_recall", () => {
@@ -148,6 +167,7 @@ test("extractOpenAIHistoryRecallCalls: filters non-history_recall", () => {
   const calls = extractOpenAIHistoryRecallCalls(response);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].hash_id, "abc123def4567890");
+  assert.equal(calls[0].with_media, false);
 });
 
 test("extractAnthropicHistoryRecallCalls: extracts history_recall tool_use", () => {
@@ -160,7 +180,20 @@ test("extractAnthropicHistoryRecallCalls: extracts history_recall tool_use", () 
     }]
   };
   const calls = extractAnthropicHistoryRecallCalls(response);
-  assert.deepEqual(calls, [{ hash_id: "abc123def4567890", tool_call_id: "toolu_qa1" }]);
+  assert.deepEqual(calls, [{ hash_id: "abc123def4567890", tool_call_id: "toolu_qa1", with_media: false }]);
+});
+
+test("extractAnthropicHistoryRecallCalls: extracts with_media=true", () => {
+  const response = {
+    content: [{
+      type: "tool_use",
+      id: "toolu_qa2",
+      name: HISTORY_RECALL_TOOL_NAME,
+      input: { hash_id: "abc123def4567890", with_media: true, reason: "要看原图细节" }
+    }]
+  };
+  const calls = extractAnthropicHistoryRecallCalls(response);
+  assert.deepEqual(calls, [{ hash_id: "abc123def4567890", tool_call_id: "toolu_qa2", with_media: true }]);
 });
 
 // ============== response hook 不抛错(关键回归)==============

@@ -834,11 +834,11 @@ export const helixCompressorResponseHook: GatewayPluginResponseHookHandler = asy
   }
 
   // 并发批量召回(V2 hc_recall + V3.2 history_recall 各自调)
+  // V3.2: history_recall 调用带 with_media,LLM 决定是否回原图
   const hcHashes = validHcCalls.map(c => c.hash_id);
-  const historyHashes = validHistoryCalls.map(c => c.hash_id);
   const [hcResults, historyResults] = await Promise.all([
     hcHashes.length > 0 ? fetchRecallBatch(hcHashes, config) : Promise.resolve([]),
-    historyHashes.length > 0 ? fetchHistoryRecallBatch(historyHashes, config) : Promise.resolve([])
+    validHistoryCalls.length > 0 ? fetchHistoryRecallBatch(validHistoryCalls, config) : Promise.resolve([])
   ]);
 
   // 构造 tool result messages(V2 + V3.2 合并)
@@ -856,8 +856,12 @@ export const helixCompressorResponseHook: GatewayPluginResponseHookHandler = asy
     if (!result || !result.pair) {
       return makeToolResultMessage(input.protocol, call.tool_call_id, `[helix-compressor] Q&A pair not found: ${call.hash_id}`, true);
     }
-    // V3.2: history_recall 返回 q + a 两段
-    const content = JSON.stringify({ q: result.pair.q, a: result.pair.a }, null, 2);
+    // V3.2: history_recall 返回 q + a 两段;LLM 传 with_media=true 时附带 q_media(原图/原文档字节)
+    const content = JSON.stringify({
+      q: result.pair.q,
+      a: result.pair.a,
+      ...(result.pair.qMedia ? { q_media: result.pair.qMedia } : {})
+    }, null, 2);
     return makeToolResultMessage(input.protocol, call.tool_call_id, content, false);
   });
 
@@ -1007,13 +1011,17 @@ async function fetchRecallBatch(
   );
 }
 
-// V3.2: history_recall 批量召回(Q&A pair,含 q + a)
+// V3.2: history_recall 批量召回(Q&A pair,含 q + a,可按 LLM 选择回原图)
+// 参数:calls[].with_media → 告诉服务端是否回原图(默认 false = 只文本)
 async function fetchHistoryRecallBatch(
-  hashes: string[],
+  calls: Array<{ hash_id: string; with_media?: boolean }>,
   config: HelixCompressorConfig
-): Promise<Array<{ hash: string; pair: { q: string; a: string } | null }>> {
+): Promise<Array<{
+  hash: string;
+  pair: { q: string; a: string; qMedia?: unknown[] } | null;
+}>> {
   return Promise.all(
-    hashes.map(async (hash) => {
+    calls.map(async ({ hash_id: hash, with_media = false }) => {
       try {
         const resp = await fetch(`${config.helixApiUrl}/v1/history/recall`, {
           method: "POST",
@@ -1021,13 +1029,20 @@ async function fetchHistoryRecallBatch(
             Authorization: `Bearer ${config.helixApiKey}`,
             "Content-Type": "application/json"
           },
-          body: JSON.stringify({ hash_id: hash }),
+          body: JSON.stringify({ hash_id: hash, with_media }),
           signal: AbortSignal.timeout(5000)
         });
         if (!resp.ok) return { hash, pair: null };
         const data = await resp.json();
         if (data && data.q !== undefined) {
-          return { hash, pair: { q: data.q || "", a: data.a || "" } };
+          return {
+            hash,
+            pair: {
+              q: data.q || "",
+              a: data.a || "",
+              ...(Array.isArray(data.q_media) && data.q_media.length > 0 ? { qMedia: data.q_media } : {})
+            }
+          };
         }
         return { hash, pair: null };
       } catch {
@@ -1063,8 +1078,8 @@ function makeToolResultMessage(
 }
 
 // V3.2: history_recall 调用提取
-export function extractAnthropicHistoryRecallCalls(response: Record<string, unknown>): Array<{ hash_id: string; tool_call_id: string }> {
-  const calls: Array<{ hash_id: string; tool_call_id: string }> = [];
+export function extractAnthropicHistoryRecallCalls(response: Record<string, unknown>): Array<{ hash_id: string; tool_call_id: string; with_media?: boolean }> {
+  const calls: Array<{ hash_id: string; tool_call_id: string; with_media?: boolean }> = [];
   const content = response.content;
   if (!Array.isArray(content)) return calls;
   for (const block of content) {
@@ -1076,7 +1091,13 @@ export function extractAnthropicHistoryRecallCalls(response: Record<string, unkn
       typeof block.input.hash_id === "string" &&
       typeof block.id === "string"
     ) {
-      calls.push({ hash_id: block.input.hash_id, tool_call_id: block.id });
+      // with_media 是 LLM 决定本次召回要不要原图(默认 false=只文本)
+      const wm = block.input.with_media;
+      calls.push({
+        hash_id: block.input.hash_id,
+        tool_call_id: block.id,
+        with_media: typeof wm === "boolean" ? wm : false
+      });
     }
   }
   return calls;
@@ -1105,7 +1126,12 @@ export function extractOpenAIHistoryRecallCalls(response: Record<string, unknown
           args = {};
         }
         if (typeof args.hash_id === "string") {
-          calls.push({ hash_id: args.hash_id, tool_call_id: tc.id });
+          const wm = args.with_media;
+          calls.push({
+            hash_id: args.hash_id,
+            tool_call_id: tc.id,
+            with_media: typeof wm === "boolean" ? wm : false
+          });
         }
       }
     }
