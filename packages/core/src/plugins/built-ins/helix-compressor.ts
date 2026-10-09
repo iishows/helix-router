@@ -117,6 +117,8 @@ export const helixCompressorRatioHeader = "x-helix-compressor-ratio";
 export const helixCompressorRequestIdHeader = "x-helix-compressor-request-id";
 // v1.1：日志压缩量列 — 让 request_logs.response_headers 自动带上"压缩了多少"
 export const helixCompressorInputCharsHeader = "x-helix-compressor-input-chars";
+// V3.2: Q&A pair 压缩占位符数(⟦QA:hash⟧ 出现次数)
+export const helixCompressorQACompressedHeader = "x-helix-compressor-qa-compressed";
 export const helixCompressorOutputCharsHeader = "x-helix-compressor-output-chars";
 export const helixCompressorHashCountHeader = "x-helix-compressor-hash-count";
 export const helixCompressorScenarioHeader = "x-helix-compressor-scenario";
@@ -383,14 +385,17 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
   }
 
   // 5. 返回替换 messages 的 body
-  // 如果有 ⟦HC:hash⟧ 占位符，注入召回工具 + 教学 prompt
+  // 如果有 ⟦HC:hash⟧ 或 ⟦QA:hash⟧ 占位符，注入对应召回工具 + 教学 prompt
   let outputMessages = compressed.compressed as LLMMessage[];
   const outputBody: Record<string, unknown> = {
     ...body,
     messages: outputMessages
   };
 
-  if (hasHCPlaceholder(outputMessages)) {
+  const hasHC = hasHCPlaceholder(outputMessages);
+  const hasQA = hasQAPlaceholder(outputMessages);
+
+  if (hasHC) {
     // 注入 hc_recall 工具定义（去重）
     const existingTools = Array.isArray(body.tools) ? body.tools : [];
     const hasRecall = existingTools.some((t: unknown) =>
@@ -404,6 +409,19 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
     outputBody.messages = injectRecallInstruction(outputMessages);
   }
 
+  // V3.2: ⟦QA:hash⟧ 占位符(history_recall 工具)
+  if (hasQA) {
+    const existingTools = Array.isArray(outputBody.tools) ? outputBody.tools : [];
+    const hasHistoryRecall = existingTools.some((t: unknown) =>
+      isRecord(t) && ((t as Record<string, unknown>).function as Record<string, unknown> | undefined)?.name === HISTORY_RECALL_TOOL_NAME
+    );
+    if (!hasHistoryRecall) {
+      outputBody.tools = [...existingTools, HISTORY_RECALL_TOOL_SCHEMA];
+    }
+    // 注入教学 prompt(QA 版本)
+    outputBody.messages = injectHistoryRecallInstruction(outputMessages);
+  }
+
   return {
     body: outputBody,
     headers: {
@@ -411,6 +429,7 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
       [helixCompressorModelHeader]: model,
       [helixCompressorRatioHeader]: String(compressed.stats?.ratio ?? 0),
       [helixCompressorInputCharsHeader]: String(compressed.stats?.originalChars ?? 0),
+      [helixCompressorQACompressedHeader]: String(compressed.stats?.compressedCount ?? 0),
       // v1.3: output_chars 改写为"最终消息的实际 chars"(发给 LLM 的),
       //   而不是 helix 返回的 compressedChars(那是"省了多少",短消息时是 0)。
       //   这样 UI 看到 input=output 时知道是 pass-through,看到 input>output 时知道真的压了。
@@ -429,6 +448,7 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
     responseHeaders: {
       [helixCompressorRequestIdHeader]: upstreamRequestId,
       [helixCompressorInputCharsHeader]: String(compressed.stats?.originalChars ?? 0),
+      [helixCompressorQACompressedHeader]: String(compressed.stats?.compressedCount ?? 0),
       [helixCompressorOutputCharsHeader]: String(countChars(outputMessages)),
       [helixCompressorHashCountHeader]: String(compressed.stats?.compressedCount ?? 0),
       [helixCompressorScenarioHeader]: compressed.scenario ?? "",
@@ -616,6 +636,97 @@ const HC_RECALL_INSTRUCTION = `${HC_RECALL_INSTRUCTION_MARKER}
 // hash_id 格式校验：8-128 位 hex
 const HASH_PATTERN = /^[0-9a-f]{8,128}$/;
 
+// ============= history_recall Tool Schema（V3.2 Q&A pair 召回）=============
+
+export const HISTORY_RECALL_TOOL_NAME = "history_recall";
+
+export const HISTORY_RECALL_TOOL_SCHEMA = {
+  type: "function",
+  function: {
+    name: HISTORY_RECALL_TOOL_NAME,
+    description:
+      "Recall a compressed Q&A pair from conversation history. " +
+      "When you see ⟦QA:hash⟧ placeholders (16-char hex) in the conversation, " +
+      "call this tool to get the original user question and assistant answer. " +
+      "By default only the text content is returned; set with_media=true to include " +
+      "the original image/video/document that was in the question. " +
+      "Only call when you genuinely need the original content to answer accurately.",
+    parameters: {
+      type: "object",
+      properties: {
+        hash_id: {
+          type: "string",
+          pattern: "^[0-9a-f]{16}$",
+          description: "Hex hash from the ⟦QA:hash⟧ placeholder (without prefix and suffix)"
+        },
+        with_media: {
+          type: "boolean",
+          default: false,
+          description: "If true, include the original image/video/document that was in the user question. Default false (text-only, smaller)."
+        },
+        reason: {
+          type: "string",
+          description: "Brief reason why you need to recall (for audit logging)"
+        }
+      },
+      required: ["hash_id"],
+      additionalProperties: false
+    }
+  }
+} as const;
+
+const HISTORY_RECALL_INSTRUCTION_MARKER = "<<HISTORY_RECALL_INSTRUCTION_v1>>";
+
+const HISTORY_RECALL_INSTRUCTION = `${HISTORY_RECALL_INSTRUCTION_MARKER}
+## 工具调用: ${HISTORY_RECALL_TOOL_NAME}
+
+你会在对话中看到形如 ⟦QA:hash⟧ 的占位符（16 位十六进制）。
+这些占位符代表被压缩缓存的**整段 Q&A 对**（用户问题 + 助手回答的合并哈希）。
+
+**规则**：
+1. 默认 \`with_media=false\`,只回文本(用户问题文本 + 助手回答文本)。**A 已包含助手对图片/视频/文档的理解**,通常够用。
+2. 当你需要**原图/原视频/原文档细节**(颜色、像素、文档原文某章节、对比两张图等),
+   设 \`with_media=true\`,会把原 media 一并返回。
+3. **不要**为每个占位符都 recall,只在**真正需要**时调。
+4. **不要**反复调同一个 hash_id。
+
+**示例**:
+占位符: \`⟦QA:abcdef0123456789⟧\`
+默认: ${HISTORY_RECALL_TOOL_NAME}(hash_id="abcdef0123456789", reason="need original A")
+要原图: ${HISTORY_RECALL_TOOL_NAME}(hash_id="abcdef0123456789", with_media=true, reason="need image detail")
+`;
+
+/** 检测 ⟦QA:hash⟧ 占位符(V3.2 Q&A pair 压缩) */
+export function hasQAPlaceholder(messages: LLMMessage[]): boolean {
+  if (!Array.isArray(messages)) return false;
+  for (const m of messages) {
+    if (typeof m.content === "string" && m.content.includes("⟦QA:")) return true;
+  }
+  return false;
+}
+
+/** 注入 history_recall 工具的教学 prompt(同 V2 injectRecallInstruction 模式) */
+function injectHistoryRecallInstruction(messages: LLMMessage[]): LLMMessage[] {
+  const out: LLMMessage[] = [];
+  let injected = false;
+  for (const m of messages) {
+    if (!injected && m?.role === "system" && typeof m.content === "string") {
+      out.push({ ...m, content: HISTORY_RECALL_INSTRUCTION + "\n" + m.content });
+      injected = true;
+    } else if (!injected && m?.role !== "system") {
+      out.push({ role: "system", content: HISTORY_RECALL_INSTRUCTION });
+      out.push(m);
+      injected = true;
+    } else {
+      out.push(m);
+    }
+  }
+  if (!injected) {
+    out.unshift({ role: "system", content: HISTORY_RECALL_INSTRUCTION });
+  }
+  return out;
+}
+
 export function hasHCPlaceholder(messages: LLMMessage[]): boolean {
   for (const msg of messages) {
     if (!msg) continue;
@@ -670,55 +781,61 @@ export const helixCompressorResponseHook: GatewayPluginResponseHookHandler = asy
     return { continueLoop: false };
   }
 
-  // 根据协议提取 tool calls
-  const toolCalls = input.protocol === "anthropic"
+  // 根据协议提取 tool calls(hc_recall V2 + history_recall V3.2)
+  const hcCalls = input.protocol === "anthropic"
     ? extractAnthropicHcrecallCalls(response)
     : extractOpenAIHcrecallCalls(response);
+  const historyCalls = input.protocol === "anthropic"
+    ? extractAnthropicHistoryRecallCalls(response)
+    : extractOpenAIHistoryRecallCalls(response);
 
-  if (toolCalls.length === 0) {
+  if (hcCalls.length === 0 && historyCalls.length === 0) {
     return { continueLoop: false };
   }
 
-  // 校验 hash_id 格式 + 限流
-  const validCalls = toolCalls
+  // 校验 hash_id 格式 + 限流(V2 + V3.2)
+  const QA_HASH_PATTERN = /^[0-9a-f]{16}$/;
+  const validHcCalls = hcCalls
     .filter(c => HASH_PATTERN.test(c.hash_id))
     .slice(0, helixCompressorMaxRecallPerRequest);
+  const validHistoryCalls = historyCalls
+    .filter(c => QA_HASH_PATTERN.test(c.hash_id))
+    .slice(0, helixCompressorMaxRecallPerRequest);
 
-  if (validCalls.length === 0) {
-    context.logger.warn?.(`[helix-compressor] no valid hc_recall calls after hash_id validation`);
+  if (validHcCalls.length === 0 && validHistoryCalls.length === 0) {
+    context.logger.warn?.(`[helix-compressor] no valid recall calls after hash_id validation`);
     return { continueLoop: false };
   }
 
-  // 并发批量召回
-  const hashes = validCalls.map(c => c.hash_id);
-  const recallResults = await fetchRecallBatch(hashes, config);
+  // 并发批量召回(V2 hc_recall + V3.2 history_recall 各自调)
+  const hcHashes = validHcCalls.map(c => c.hash_id);
+  const historyHashes = validHistoryCalls.map(c => c.hash_id);
+  const [hcResults, historyResults] = await Promise.all([
+    hcHashes.length > 0 ? fetchRecallBatch(hcHashes, config) : Promise.resolve([]),
+    historyHashes.length > 0 ? fetchHistoryRecallBatch(historyHashes, config) : Promise.resolve([])
+  ]);
 
-  // 构造 tool result messages
-  const messagesToAppend: LLMMessage[] = validCalls.map(call => {
-    const result = recallResults.find(r => r.hash === call.hash_id);
+  // 构造 tool result messages(V2 + V3.2 合并)
+  const hcMessages = validHcCalls.map(call => {
+    const result = hcResults.find(r => r.hash === call.hash_id);
     const originalContent = result?.original ?? null;
     const content = originalContent !== null
       ? originalContent
       : `[helix-compressor] hash not found or expired: ${call.hash_id}`;
-
-    if (input.protocol === "anthropic") {
-      return {
-        role: "user",
-        content: [{
-          type: "tool_result",
-          tool_use_id: call.tool_call_id,
-          content,
-          is_error: originalContent === null
-        }]
-      } as unknown as LLMMessage;
-    }
-
-    return {
-      role: "tool",
-      tool_call_id: call.tool_call_id,
-      content
-    } as unknown as LLMMessage;
+    return makeToolResultMessage(input.protocol, call.tool_call_id, content, originalContent === null);
   });
+
+  const historyMessages = validHistoryCalls.map(call => {
+    const result = historyResults.find(r => r.hash === call.hash_id);
+    if (!result || !result.pair) {
+      return makeToolResultMessage(input.protocol, call.tool_call_id, `[helix-compressor] Q&A pair not found: ${call.hash_id}`, true);
+    }
+    // V3.2: history_recall 返回 q + a 两段
+    const content = JSON.stringify({ q: result.pair.q, a: result.pair.a }, null, 2);
+    return makeToolResultMessage(input.protocol, call.tool_call_id, content, false);
+  });
+
+  const messagesToAppend: LLMMessage[] = [...hcMessages, ...historyMessages];
 
   // 审计日志
   const hitCount = recallResults.filter(r => r.original !== null).length;
@@ -857,6 +974,112 @@ async function fetchRecallBatch(
       }
     })
   );
+}
+
+// V3.2: history_recall 批量召回(Q&A pair,含 q + a)
+async function fetchHistoryRecallBatch(
+  hashes: string[],
+  config: HelixCompressorConfig
+): Promise<Array<{ hash: string; pair: { q: string; a: string } | null }>> {
+  return Promise.all(
+    hashes.map(async (hash) => {
+      try {
+        const resp = await fetch(`${config.helixApiUrl}/v1/history/recall`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${config.helixApiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ hash_id: hash }),
+          signal: AbortSignal.timeout(5000)
+        });
+        if (!resp.ok) return { hash, pair: null };
+        const data = await resp.json();
+        if (data && data.q !== undefined) {
+          return { hash, pair: { q: data.q || "", a: data.a || "" } };
+        }
+        return { hash, pair: null };
+      } catch {
+        return { hash, pair: null };
+      }
+    })
+  );
+}
+
+// V3.2: 构造 tool result message(anthropic + openai 两种协议共用)
+function makeToolResultMessage(
+  protocol: "anthropic" | "openai",
+  toolCallId: string,
+  content: string,
+  isError: boolean
+): LLMMessage {
+  if (protocol === "anthropic") {
+    return {
+      role: "user",
+      content: [{
+        type: "tool_result",
+        tool_use_id: toolCallId,
+        content,
+        is_error: isError
+      }]
+    } as unknown as LLMMessage;
+  }
+  return {
+    role: "tool",
+    tool_call_id: toolCallId,
+    content
+  } as unknown as LLMMessage;
+}
+
+// V3.2: history_recall 调用提取
+function extractAnthropicHistoryRecallCalls(response: Record<string, unknown>): Array<{ hash_id: string; tool_call_id: string }> {
+  const calls: Array<{ hash_id: string; tool_call_id: string }> = [];
+  const content = response.content;
+  if (!Array.isArray(content)) return calls;
+  for (const block of content) {
+    if (
+      isRecord(block) &&
+      block.type === "tool_use" &&
+      block.name === HISTORY_RECALL_TOOL_NAME &&
+      isRecord(block.input) &&
+      typeof block.input.hash_id === "string" &&
+      typeof block.id === "string"
+    ) {
+      calls.push({ hash_id: block.input.hash_id, tool_call_id: block.id });
+    }
+  }
+  return calls;
+}
+
+function extractOpenAIHistoryRecallCalls(response: Record<string, unknown>): Array<{ hash_id: string; tool_call_id: string }> {
+  const calls: Array<{ hash_id: string; tool_call_id: string }> = [];
+  const choices = response.choices;
+  if (!Array.isArray(choices)) return calls;
+  for (const choice of choices) {
+    if (!isRecord(choice) || !isRecord(choice.message)) continue;
+    const toolCalls = choice.message.tool_calls;
+    if (!Array.isArray(toolCalls)) continue;
+    for (const tc of toolCalls) {
+      if (
+        isRecord(tc) &&
+        tc.type === "function" &&
+        isRecord(tc.function) &&
+        tc.function.name === HISTORY_RECALL_TOOL_NAME &&
+        typeof tc.id === "string"
+      ) {
+        let args: Record<string, unknown> = {};
+        try {
+          args = JSON.parse(String(tc.function.arguments || "{}"));
+        } catch {
+          args = {};
+        }
+        if (typeof args.hash_id === "string") {
+          calls.push({ hash_id: args.hash_id, tool_call_id: tc.id });
+        }
+      }
+    }
+  }
+  return calls;
 }
 
 // 抑制未使用变量的 lint 警告

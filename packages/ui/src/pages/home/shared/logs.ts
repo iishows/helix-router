@@ -62,6 +62,9 @@ export function formatLogCompressSummary(
     || readHeaderNumber(requestHeaders["x-helix-compressor-compressed-tokens"]);
   const scenario = readHeaderString(headers["x-helix-compressor-scenario"])
     || readHeaderString(requestHeaders["x-helix-compressor-scenario"]);
+  // V3.2: Q&A pair 压缩占位数(⟦QA:hash⟧ 出现次数)
+  const qaCompressed = readHeaderNumber(headers["x-helix-compressor-qa-compressed"])
+    || readHeaderNumber(requestHeaders["x-helix-compressor-qa-compressed"]);
   const hashCount = readHeaderNumber(headers["x-helix-compressor-hash-count"])
     || readHeaderNumber(requestHeaders["x-helix-compressor-hash-count"]);
   const enabled = readHeaderString(headers["x-helix-compressor-enabled"])
@@ -116,6 +119,10 @@ export function formatLogCompressSummary(
   } else if (hasActual) {
     // 没 baseline(老数据),只显示 actual
     text += ` · LLM ${inputTokens.toLocaleString()}`;
+  }
+  // V3.2: 标注 Q&A pair 压缩占位数
+  if (qaCompressed > 0) {
+    text += ` · ${qaCompressed} QA 占位`;
   }
 
   // title:完整事实(全 token,chars 只作补充)
