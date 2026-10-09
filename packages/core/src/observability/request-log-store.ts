@@ -1,3 +1,4 @@
+import { requestLogOutcome } from "@ccr/core/contracts/app";
 import { randomUUID } from "node:crypto";
 import { closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -150,6 +151,7 @@ export type RequestLogRecordInput = {
 };
 
 export type RequestLogRawTraceUpdateInput = {
+  pricing?: ProviderModelPricing;
   allowStandaloneRecord?: boolean;
   attempt?: number;
   bodyCapturePolicy?: "all" | "errors" | "none";
@@ -1680,6 +1682,7 @@ function standaloneRecordInputFromRawTrace(
     model: input.model,
     path: input.path ?? pathFromUrl(input.url) ?? "/",
     providerName: input.provider,
+    pricing: input.pricing,
     requestBody: requestBody.buffer,
     requestBodySizeBytes: requestBody.sizeBytes,
     requestBodyTruncated: requestBody.truncated,
@@ -3497,7 +3500,7 @@ function buildAgentRouteRows(requests: AnalyzedAgentRequest[]): AgentObservabili
 
 function buildAgentErrorRows(requests: AnalyzedAgentRequest[]): AgentObservabilityErrorRow[] {
   return requests
-    .filter((request) => !request.ok || Boolean(request.error))
+    .filter((request) => requestLogOutcome(request) === "error")
     .slice(-100)
     .reverse()
     .map((request) => ({
@@ -4013,7 +4016,8 @@ function buildAgentAnalysisTotals(requests: AnalyzedAgentRequest[]): AgentAnalys
   const costUsd = sum(requests, (request) => request.costUsd ?? 0);
   const totalTokens = sum(requests, agentAnalysisTotalTokenCount);
   const promptTokens = sum(requests, agentAnalysisPromptTokenCount);
-  const successfulRequests = requests.filter((request) => request.ok).length;
+  const successfulRequests = requests.filter((request) => requestLogOutcome(request) === "completed").length;
+  const errorCount = requests.filter((request) => requestLogOutcome(request) === "error").length;
   const sessionCount = new Set(requests.map((request) => `${request.agent}:${request.sessionId}`)).size;
   const durations = requests.map((request) => request.durationMs).sort((a, b) => a - b);
 
@@ -4024,7 +4028,7 @@ function buildAgentAnalysisTotals(requests: AnalyzedAgentRequest[]): AgentAnalys
     cacheTokens,
     cacheWriteTokens,
     costUsd,
-    errorCount: requests.length - successfulRequests,
+    errorCount,
     inputTokens,
     maxConcurrentRequests: maxConcurrentRequests(requests),
     maxDurationMs: durations.at(-1) ?? 0,
@@ -4035,7 +4039,7 @@ function buildAgentAnalysisTotals(requests: AnalyzedAgentRequest[]): AgentAnalys
     requestCount: requests.length,
     sessionCount,
     subagentCallCount: requests.filter((request) => Boolean(request.subagentModel)).length,
-    successRate: successfulRequests / requests.length,
+    successRate: ratio(successfulRequests, successfulRequests + errorCount),
     toolCallCount: sum(requests, (request) => request.toolCallCount),
     totalTokens
   };
@@ -4801,7 +4805,7 @@ function buildLogWhereClause(filter: RequestLogListFilter): { params: SqlValue[]
   if (status === "success") {
     where.push("ok = 1");
   } else if (status === "error") {
-    where.push("ok = 0");
+    where.push("ok = 0 AND (status_code > 0 OR error <> '')");
   }
   if (model) {
     where.push("model = ?");
@@ -6389,6 +6393,7 @@ function extractUsageSnapshot(payload: unknown): UsageSnapshot | undefined {
     inputDetails?.cached_tokens !== undefined ||
     inputDetails?.cache_creation_tokens !== undefined ||
     usage.cached_tokens !== undefined ||
+    usage.prompt_cache_hit_tokens !== undefined ||
     usage.prompt_tokens !== undefined;
   const cacheCreation = isRecord(usage.cache_creation) ? usage.cache_creation : undefined;
   const cacheWrite5mTokens = asNumber(cacheCreation?.ephemeral_5m_input_tokens);
@@ -6399,7 +6404,8 @@ function extractUsageSnapshot(payload: unknown): UsageSnapshot | undefined {
       asNumber(usage.cache_read_tokens) ??
       asNumber(usage.cache_read_input_tokens) ??
       asNumber(usage.cached_tokens) ??
-      asNumber(inputDetails?.cached_tokens),
+      asNumber(inputDetails?.cached_tokens) ??
+      asNumber(usage.prompt_cache_hit_tokens),
     cacheWrite1hTokens,
     cacheWrite5mTokens,
     cacheWriteTokens:

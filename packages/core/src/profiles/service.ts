@@ -48,6 +48,7 @@ import { claudeClientDiscoveryPayloads, createClaudeCliAutoCompactWindows } from
 import { claudeCodeOneMillionContextSuffix } from "@ccr/core/gateway/internal/shared";
 import { normalizeRouteSelector } from "@ccr/core/gateway/claude-code-router-plugin";
 import { findModelCatalogEntry, modelCatalogMaxInputTokens, readCatalogCapability, type ModelCatalogEntry } from "@ccr/core/gateway/model-catalog";
+import { windowsBatchEscapeValue as cmdValue, windowsBatchSetLine as cmdSetLine } from "@ccr/core/platform/windows-batch";
 import {
   TOOL_HUB_MCP_RUNTIME_FILE_NAME,
   TOOL_HUB_MCP_SERVER_NAME,
@@ -91,6 +92,9 @@ const claudeCodeNoProxyEnvKeys = [
 ] as const;
 const claudeCodeGatewayCompatibilityEnvKeys = [
   "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"
+] as const;
+const claudeCodeApiKeyHelperConflictPaths = [
+  "autoMode"
 ] as const;
 const claudeCodeRemovedAuthEnvKeys = [
   "ANTHROPIC_AUTH_TOKEN",
@@ -408,8 +412,9 @@ function applyClaudeCodeProfile(config: AppConfig, profile: ProfileConfig, token
 
     const endpoint = gatewayEndpoint(config);
     const currentSettings = readClaudeCodeSettingsObject(settingsFile);
+    const authMode = resolveClaudeCodeGatewayAuthMode(profile);
     const profileSettingsState = readClaudeCodeProfileSettingsState(profile);
-    const profileSettings = claudeCodeProfileSettings(profile);
+    const profileSettings = claudeCodeProfileSettings(profile, authMode);
     const profileSettingsEnv = withoutBotGatewayEnv(Object.fromEntries(stringRecord(profileSettings.env)));
     delete profileSettings.env;
     const profileEnvValues = profileEnv(profile);
@@ -418,8 +423,13 @@ function applyClaudeCodeProfile(config: AppConfig, profile: ProfileConfig, token
       ...Object.keys(profileEnvValues)
     ]);
     const managedSettingPaths = claudeCodeProfileSettingsPaths(profileSettings);
-    const managedSettingComparePaths = uniquePathStrings([...profileSettingsState.paths, ...managedSettingPaths]);
-    const settings = removeClaudeCodeProfileSettings(currentSettings, profileSettingsState.paths, managedSettingPaths);
+    const managedSettingComparePaths = uniquePathStrings([
+      ...profileSettingsState.paths,
+      ...managedSettingPaths,
+      ...(authMode === "api-key-helper" ? claudeCodeApiKeyHelperConflictPaths : [])
+    ]);
+    const compatibleCurrentSettings = withoutClaudeCodeApiKeyHelperAuthConflicts(currentSettings, authMode);
+    const settings = removeClaudeCodeProfileSettings(compatibleCurrentSettings, profileSettingsState.paths, managedSettingPaths);
     const settingsEnv = removeClaudeCodeProfileEnv(
       withoutBotGatewayEnv(Object.fromEntries(stringRecord(settings.env))),
       profileSettingsState.envKeys,
@@ -448,7 +458,6 @@ function applyClaudeCodeProfile(config: AppConfig, profile: ProfileConfig, token
     const toolHubMcpConfigResult = writeClaudeCodeToolHubMcpConfig(config, profile, token);
     const mcpConfigEnv = claudeCodeMcpConfigEnv(toolHubMcpConfigResult.file);
     const timezoneEnv = claudeCodeUtcTimezoneEnvOverride();
-    const authMode = resolveClaudeCodeGatewayAuthMode(profile);
     const wifResult = writeClaudeCodeWifIdentityToken(profile, token);
     const wifEnv = authMode === "wif" ? claudeCodeWifEnv(wifResult.file) : {};
     Object.assign(env, mcpConfigEnv, timezoneEnv, wifEnv);
@@ -1274,8 +1283,23 @@ function claudeCodeNextSettings(
   };
 }
 
-function claudeCodeProfileSettings(profile: ProfileConfig): Record<string, unknown> {
-  return sanitizeClaudeCodeJsonObject(profile.claudeSettings);
+function claudeCodeProfileSettings(
+  profile: ProfileConfig,
+  authMode = resolveClaudeCodeGatewayAuthMode(profile)
+): Record<string, unknown> {
+  return withoutClaudeCodeApiKeyHelperAuthConflicts(sanitizeClaudeCodeJsonObject(profile.claudeSettings), authMode);
+}
+
+function withoutClaudeCodeApiKeyHelperAuthConflicts(
+  settings: Record<string, unknown>,
+  authMode: ClaudeCodeGatewayAuthMode
+): Record<string, unknown> {
+  if (authMode !== "api-key-helper" || settings.autoMode !== true) {
+    return settings;
+  }
+  const compatibleSettings = { ...settings };
+  delete compatibleSettings.autoMode;
+  return compatibleSettings;
 }
 
 function sanitizeClaudeCodeJsonObject(value: unknown): Record<string, unknown> {
@@ -4222,21 +4246,8 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-function cmdSetLine(key: string, value: string, indent = ""): string {
-  return `${indent}set "${key}=${cmdValue(value)}"`;
-}
-
 function cmdQuote(value: string): string {
   return `"${cmdValue(value)}"`;
-}
-
-function cmdValue(value: string): string {
-  return value
-    .replace(/\r?\n/g, " ")
-    .replace(/\^/g, "^^")
-    .replace(/%/g, "%%")
-    .replace(/"/g, '^"')
-    .replace(/[&|<>()]/g, "^$&");
 }
 
 function trimLeadingBlankLines(value: string): string {

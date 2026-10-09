@@ -696,6 +696,51 @@ test("RequestLogStore redacts secrets and records CCR metadata", async () => {
   }
 });
 
+test("#1791 RequestLogStore records DeepSeek-native prompt cache hits", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-request-log-deepseek-cache-test-"));
+  let store;
+  try {
+    store = new RequestLogStore(path.join(dir, "request-logs.sqlite"));
+    const startedAt = new Date().toISOString();
+    await store.record({
+      completedAt: startedAt,
+      durationMs: 75,
+      method: "POST",
+      path: "/v1/messages",
+      providerName: "OpenCode Go",
+      providerProtocol: "openai_chat_completions",
+      requestBody: Buffer.from(JSON.stringify({ model: "deepseek-v4.1-flash" }), "utf8"),
+      requestHeaders: { "content-type": "application/json" },
+      requestId: "request-log-deepseek-cache",
+      responseBodyText: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        usage: {
+          completion_tokens: 10,
+          prompt_cache_hit_tokens: 800,
+          prompt_cache_miss_tokens: 200,
+          prompt_tokens: 1000,
+          prompt_tokens_details: {},
+          total_tokens: 1010
+        }
+      }),
+      responseHeaders: { "content-type": "application/json" },
+      startedAt,
+      statusCode: 200,
+      url: "http://127.0.0.1:3456/v1/messages"
+    });
+
+    const page = await store.list({ pageSize: 25 });
+    const detail = await store.getDetail({ id: page.items[0].id });
+    assert.equal(detail?.inputTokens, 200);
+    assert.equal(detail?.cacheReadTokens, 800);
+    assert.equal(detail?.outputTokens, 10);
+    assert.equal(detail?.totalTokens, 1010);
+  } finally {
+    await store?.close();
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("RequestLogStore marks interrupted successful-status streams as errors", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ccr-request-log-interrupted-stream-test-"));
   let store;
@@ -2090,4 +2135,20 @@ test("RequestLogStore does not identify an unknown client as OpenCode from its m
     await store?.close();
     rmSync(dir, { force: true, recursive: true });
   }
+});
+
+test("#1801 unknown raw trace status is neutral while transport and HTTP errors remain failures", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-log-outcome-"));
+  const store = new RequestLogStore(path.join(dir, "logs.sqlite"));
+  try {
+    for (const [requestId, statusCode, error] of [["unknown", 0, undefined], ["success", 200, undefined], ["http-error", 500, undefined], ["transport-error", 0, "connection reset"]]) {
+      const now = new Date().toISOString();
+      await store.record({ completedAt: now, startedAt: now, durationMs: 1, error, method: "POST", path: "/v1/messages", requestId, statusCode, url: "/v1/messages", requestHeaders: {}, responseHeaders: {}, requestBody: Buffer.from("{}"), responseBodyText: "{}" });
+    }
+    const errors = await store.list({ status: "error" });
+    assert.deepEqual(errors.items.map(item => item.requestId).sort(), ["http-error", "transport-error"]);
+    const analysis = await store.analyze({ range: "30d" });
+    assert.equal(analysis.totals.errorCount, 2);
+    assert.equal(analysis.totals.successRate, 1 / 3);
+  } finally { await store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
