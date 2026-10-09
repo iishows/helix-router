@@ -27,6 +27,137 @@ export function formatLogDateTime(value: string): string {
   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds} ${offset}`;
 }
 
+/**
+ * 读取 helix-compressor plugin 写入的 headers,生成压缩状态摘要。
+ * v1.6: baseline 用真 tokenizer (gpt-tokenizer cl100k_base) 算 user messages 的 token 数。
+ *   显示格式:
+ *     - chars 压缩了:`3,127→21 (99.3%) · 560 tok (user) · 549 tok (LLM)`
+ *     - pass-through:`未压缩 · 560 tok (user) · 549 tok (LLM)`
+ *   不再算 e2e 比例(实际 LLM input 含 system+tool+cache,baseline 只算 user messages,
+ *   两边维度不同,比 % 一定误导)。
+ *   显示 baseline + actual 两个独立数字,让用户自己看:
+ *     - 两者接近 → user messages ≈ 整个 context(干净请求,小)
+ *     - baseline << actual → 大头是 system/tool/cache(从 cache 数也能看出来)
+ * v1.2: 兼容 cli serve 模式下 response_headers 为空的场景——
+ *   plugin transform 实际跑了(stats.ratio 写入 request_headers),
+ *   但 CCR 本地 pipeline 的 response_headers 是 {}。
+ *   所以 fallback 从 request_headers 读。
+ */
+export function formatLogCompressSummary(
+  entry: RequestLogEntry,
+  t: (value: string) => string
+): { text: string; title: string } {
+  // 优先读 response_headers(理想路径);fallback 到 request_headers(cli serve bug workaround)
+  const headers = entry.responseHeaders ?? {};
+  const requestHeaders = entry.requestHeaders ?? {};
+  const inputChars = readHeaderNumber(headers["x-helix-compressor-input-chars"])
+    || readHeaderNumber(requestHeaders["x-helix-compressor-input-chars"]);
+  const outputChars = readHeaderNumber(headers["x-helix-compressor-output-chars"])
+    || readHeaderNumber(requestHeaders["x-helix-compressor-output-chars"]);
+  const ratioHeader = readHeaderNumber(headers["x-helix-compressor-ratio"])
+    || readHeaderNumber(requestHeaders["x-helix-compressor-ratio"]);
+  const baselineTokens = readHeaderNumber(headers["x-helix-compressor-baseline-tokens"])
+    || readHeaderNumber(requestHeaders["x-helix-compressor-baseline-tokens"]);
+  const compressedTokens = readHeaderNumber(headers["x-helix-compressor-compressed-tokens"])
+    || readHeaderNumber(requestHeaders["x-helix-compressor-compressed-tokens"]);
+  const scenario = readHeaderString(headers["x-helix-compressor-scenario"])
+    || readHeaderString(requestHeaders["x-helix-compressor-scenario"]);
+  const hashCount = readHeaderNumber(headers["x-helix-compressor-hash-count"])
+    || readHeaderNumber(requestHeaders["x-helix-compressor-hash-count"]);
+  const enabled = readHeaderString(headers["x-helix-compressor-enabled"])
+    || readHeaderString(requestHeaders["x-helix-compressor-enabled"]);
+
+  const inputTokens = typeof entry.inputTokens === "number" ? entry.inputTokens : 0;
+  const cacheReadTokens = typeof entry.cacheReadTokens === "number" ? entry.cacheReadTokens : 0;
+  const freshTokens = Math.max(0, inputTokens - cacheReadTokens);
+
+  // 没经过 helix / 跳过 / silent fail → -
+  if (!enabled && ratioHeader === 0 && (inputChars === 0 || outputChars === 0) && inputTokens === 0) {
+    return { text: "-", title: t("未压缩（helix 跳过或未调用）") };
+  }
+
+  // 内容压缩率(chars 维度)
+  const contentRatio = ratioHeader > 0 ? ratioHeader : inputChars > 0 ? 1 - outputChars / inputChars : 0;
+  const contentRatioPct = (contentRatio * 100).toFixed(1);
+  const charsCompressed = inputChars > 0 && outputChars > 0 && outputChars < inputChars;
+  const isPassThrough = inputChars > 0 && outputChars === inputChars;
+
+  // cell 文本:全 token 视图(避免 chars/tokens 混用歧义)
+  //   压缩了:`~14,890→1,400 tok (91%)` — 原始 vs 压缩后 messages,真 tokenizer 算
+  //   pass-through:`未压缩 · 549 tok` — chars 没变,但 LLM 看到 N tok
+  //   只有一个:fallback
+  let text: string;
+  const hasBaseline = baselineTokens > 0;
+  const hasCompressed = compressedTokens > 0 && compressedTokens < baselineTokens;
+  const hasActual = inputTokens > 0;
+
+  if (hasBaseline && hasCompressed) {
+    // 主视图:全 token 维度
+    const saved = baselineTokens - compressedTokens;
+    const pct = (saved / baselineTokens * 100).toFixed(0);
+    text = `~${baselineTokens.toLocaleString()}→${compressedTokens.toLocaleString()} tok (-${pct}%)`;
+  } else if (hasBaseline) {
+    // baseline 有但 compressed 没拿到(老 header)
+    text = `~${baselineTokens.toLocaleString()} tok`;
+  } else if (inputTokens > 0) {
+    text = `${inputTokens.toLocaleString()} tok`;
+  } else if (inputChars > 0) {
+    text = `${inputChars.toLocaleString()} chars`;
+  } else {
+    text = "-";
+  }
+  if (hasActual && hasBaseline) {
+    // 有 baseline + actual:补 e2e(压缩 vs 实际 LLM 消费)
+    const e2eSaved = baselineTokens - inputTokens;
+    const e2eRatio = baselineTokens > 0 ? e2eSaved / baselineTokens : 0;
+    const e2ePct = (e2eRatio * 100).toFixed(0);
+    const e2eSign = e2eSaved >= 0 ? "-" : "+";
+    text += ` · LLM ${inputTokens.toLocaleString()} (${e2eSign}${Math.abs(parseFloat(e2ePct))}%)`;
+  } else if (hasActual) {
+    // 没 baseline(老数据),只显示 actual
+    text += ` · LLM ${inputTokens.toLocaleString()}`;
+  }
+
+  // title:完整事实(全 token,chars 只作补充)
+  const titleParts: string[] = [];
+  if (baselineTokens > 0) {
+    titleParts.push(`user msgs baseline ${baselineTokens.toLocaleString()} tok (gpt-tokenizer)`);
+  }
+  if (compressedTokens > 0 && compressedTokens < baselineTokens) {
+    const saved = baselineTokens - compressedTokens;
+    const pct = (saved / baselineTokens * 100).toFixed(1);
+    titleParts.push(`压缩后 msgs ${compressedTokens.toLocaleString()} tok (省 ${saved.toLocaleString()}, -${pct}%)`);
+  } else if (compressedTokens > 0) {
+    titleParts.push(`压缩后 msgs ${compressedTokens.toLocaleString()} tok (=baseline,pass-through)`);
+  }
+  if (inputTokens > 0) {
+    const cachePart = cacheReadTokens > 0 ? ` (缓存 ${cacheReadTokens.toLocaleString()})` : "";
+    titleParts.push(`实际 LLM input ${inputTokens.toLocaleString()} tokens${cachePart}`);
+    if (freshTokens > 0 && freshTokens !== inputTokens) {
+      titleParts.push(`本请求新 token ${freshTokens.toLocaleString()}`);
+    }
+  }
+  if (inputChars > 0) {
+    titleParts.push(`内容 ${inputChars.toLocaleString()}→${outputChars.toLocaleString()} chars (${contentRatioPct}%)`);
+  }
+  if (hashCount > 0) titleParts.push(`hash 占位 ${hashCount}`);
+  if (scenario) titleParts.push(`场景 ${scenario}`);
+  return { text, title: titleParts.join(" · ") };
+}
+
+function readHeaderNumber(value: string | string[] | undefined): number {
+  if (value === undefined) return 0;
+  const s = Array.isArray(value) ? value[0] : value;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function readHeaderString(value: string | string[] | undefined): string {
+  if (value === undefined) return "";
+  const s = Array.isArray(value) ? value[0] : value;
+  return typeof s === "string" ? s : "";
+}
+
 export function formatLogTokenSummary(entry: RequestLogEntry, t: (value: string) => string, locale?: Intl.LocalesArgument): string {
   if (
     entry.totalTokens === 0 &&

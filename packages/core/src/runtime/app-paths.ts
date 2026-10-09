@@ -1,7 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 
-export const APP_NAME = "Claude Code Router";
+export const APP_NAME = "Helix Router";
 export const APP_STORAGE_NAME = "claude-code-router";
 
 const homeDirEnv = "CCR_INTERNAL_HOME_DIR";

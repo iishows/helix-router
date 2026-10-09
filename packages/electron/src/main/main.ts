@@ -46,7 +46,7 @@ function reportFatalStartupError(error: unknown): void {
   console.error(detail);
 
   try {
-    dialog.showErrorBox("Claude Code Router failed to start", startupErrorMessage(detail));
+    dialog.showErrorBox("Helix Router failed to start", startupErrorMessage(detail));
   } catch {
     // If the platform dialog is unavailable, the console output above still
     // preserves the actionable failure for command-line launches.

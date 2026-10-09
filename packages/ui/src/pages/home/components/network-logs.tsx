@@ -6,7 +6,7 @@ import {
   AnimatedIconSwap, Check, ChevronDown, ChevronLeft,
   ChevronRight, clampNumber, clientInitial, cn, Copy, copyTextToClipboard,
   createLogBodyPreviewText, Database, Dialog, DialogBody, DialogContent, DialogHeader, DialogTitle, formatBytes, formatCompactNumber, formatDuration,
-  formatLogDateTime, formatLogTokenSummary, formatNetworkRequestRaw, formatNetworkResponseRaw, formatRouteTracePath, formatUsdCost,
+  formatLogDateTime, formatLogCompressSummary, formatLogTokenSummary, formatNetworkRequestRaw, formatNetworkResponseRaw, formatRouteTracePath, formatUsdCost,
   FormattedLogBody,
   isJsonContainer, isLargeLogBody, jsonChildPath, logRequestModel,
   LogBodyFormatMode, logBodyLargeTextThreshold, logBodyPreviewTextLimit, LogBodyWorkerResponse,
@@ -27,7 +27,7 @@ const logJsonContainerPreviewLimit = 80;
 const logJsonAutoExpandTextLimit = 160 * 1024;
 const logBodyAutoLoadJsonBytes = 2 * 1024 * 1024;
 const logBodyWorkerFilterDebounceMs = 180;
-type LogTableColumnId = "time" | "status" | "stream" | "model" | "credential" | "tokens" | "duration";
+type LogTableColumnId = "time" | "status" | "stream" | "model" | "credential" | "tokens" | "duration" | "compress";
 type LogTableColumn = {
   id: LogTableColumnId;
   minWidth: number;
@@ -44,6 +44,7 @@ const baseLogTableColumns: LogTableColumn[] = [
   { id: "stream", minWidth: 108 },
   { id: "model", minWidth: 180 },
   { id: "tokens", minWidth: 140 },
+  { id: "compress", minWidth: 200 },
   { id: "duration", minWidth: 92 }
 ];
 const credentialLogTableColumn: LogTableColumn = { id: "credential", minWidth: 128 };
@@ -387,8 +388,8 @@ export function LogsView({
     page.items.some(logHasCredentialInfo);
   const visibleLogColumns = useMemo(() => getLogTableColumns(hasAnyCredentialInfo), [hasAnyCredentialInfo]);
   const logTableGridClass = hasAnyCredentialInfo
-    ? "grid-cols-[minmax(0,0.8fr)_minmax(92px,0.38fr)_minmax(98px,0.4fr)_minmax(0,0.78fr)_minmax(120px,0.42fr)_minmax(0,0.68fr)_82px]"
-    : "grid-cols-[minmax(0,0.8fr)_minmax(92px,0.38fr)_minmax(98px,0.4fr)_minmax(0,0.9fr)_minmax(0,0.74fr)_82px]";
+    ? "grid-cols-[minmax(0,0.8fr)_minmax(92px,0.38fr)_minmax(98px,0.4fr)_minmax(0,0.78fr)_minmax(120px,0.42fr)_minmax(0,0.68fr)_minmax(180px,0.7fr)_82px]"
+    : "grid-cols-[minmax(0,0.8fr)_minmax(92px,0.38fr)_minmax(98px,0.4fr)_minmax(0,0.9fr)_minmax(0,0.74fr)_minmax(180px,0.7fr)_82px]";
   const logTableGridStyle = useMemo(
     () => createLogTableGridStyle(visibleLogColumns, logColumnWidths),
     [logColumnWidths, visibleLogColumns]
@@ -786,6 +787,8 @@ function logTableColumnLabel(columnId: LogTableColumnId, t: (value: string) => s
       return t("Credential");
     case "tokens":
       return t("Token");
+    case "compress":
+      return t("压缩");
     case "duration":
       return t("持续时间");
   }
@@ -902,6 +905,7 @@ const LogRow = memo(function LogRow({
   const numberLocale = useAppNumberLocale();
   const createdAt = useMemo(() => formatLogDateTime(item.createdAt), [item.createdAt]);
   const tokenSummary = useMemo(() => formatLogTokenSummary(item, t, numberLocale), [item, numberLocale, t]);
+  const compressSummary = useMemo(() => formatLogCompressSummary(item, t), [item, t]);
 
   return (
     <div>
@@ -937,6 +941,7 @@ const LogRow = memo(function LogRow({
         <LogModelRouteCell entry={item} />
         {hasCredentialInfo ? <LogCredentialCell entry={item} /> : null}
         <div className="network-row-secondary truncate px-2" title={tokenSummary}>{tokenSummary}</div>
+        <div className="network-row-secondary truncate px-2 font-mono" title={compressSummary.title}>{compressSummary.text}</div>
         <div className="network-row-secondary truncate px-2">{formatDuration(item.durationMs)}</div>
       </button>
       {expanded ? <LogExpandedDetails detailError={detailError} detailLoading={detailLoading} entry={item} /> : null}
@@ -991,6 +996,7 @@ export function LogExpandedDetails({
         {entry.credentialChain.length ? <LogMetric label={t("Credential chain")} value={entry.credentialChain.join(" > ")} /> : null}
         {hasCredentialInfo ? <LogMetric label={t("Credential saturated")} value={entry.credentialSaturated ? t("Yes") : t("No")} /> : null}
         {entry.retryAttempts.length > 0 ? <LogMetric label={t("Retry attempts")} value={String(entry.retryAttempts.length)} /> : null}
+        <LogCompressDetails entry={entry} />
         <LogMetric label={t("输入")} value={formatCompactNumber(entry.inputTokens, numberLocale)} />
         <LogMetric label={t("输出")} value={formatCompactNumber(entry.outputTokens, numberLocale)} />
         <LogMetric label={t("Thinking")} value={formatCompactNumber(entry.reasoningTokens, numberLocale)} />
@@ -1391,6 +1397,74 @@ function LogMetric({ label, value }: { label: string; value: string }) {
       <div className="network-muted truncate text-[11px]">{label}</div>
       <div className="truncate font-mono text-[12px] font-semibold">{value}</div>
     </div>
+  );
+}
+
+/**
+ * 压缩详情块：在展开详情里展示"原始 chars / 压缩后 chars / 压缩率 / 场景 / hash 数"。
+ * 若没有 helix 响应头则不渲染。
+ */
+function LogCompressDetails({ entry }: { entry: RequestLogEntry }) {
+  const t = useAppText();
+  const headers = entry.responseHeaders ?? {};
+  const enabled = headers["x-helix-compressor-enabled"];
+  if (!enabled) return null;
+
+  const inputChars = Number(headers["x-helix-compressor-input-chars"] ?? 0);
+  const outputChars = Number(headers["x-helix-compressor-output-chars"] ?? 0);
+  const ratioHeader = Number(headers["x-helix-compressor-ratio"] ?? 0);
+  const baselineTokens = Number(headers["x-helix-compressor-baseline-tokens"] ?? 0);
+  const compressedTokens = Number(headers["x-helix-compressor-compressed-tokens"] ?? 0);
+  const scenario = headers["x-helix-compressor-scenario"];
+  const hashCount = Number(headers["x-helix-compressor-hash-count"] ?? 0);
+  const inputTokens = typeof entry.inputTokens === "number" ? entry.inputTokens : 0;
+  const cacheReadTokens = typeof entry.cacheReadTokens === "number" ? entry.cacheReadTokens : 0;
+  const freshTokens = Math.max(0, inputTokens - cacheReadTokens);
+
+  if (inputChars === 0 && outputChars === 0 && inputTokens === 0 && baselineTokens === 0) return null;
+
+  const contentRatio = ratioHeader > 0 ? ratioHeader : inputChars > 0 ? 1 - outputChars / inputChars : 0;
+  const contentRatioPct = (contentRatio * 100).toFixed(1);
+  const savedChars = Math.max(0, inputChars - outputChars);
+  const charsCompressed = inputChars > 0 && outputChars > 0 && outputChars < inputChars;
+  const isPassThrough = inputChars > 0 && outputChars === inputChars;
+
+  return (
+    <>
+      <LogMetric
+        label={t("baseline (原始 msgs)")}
+        value={baselineTokens > 0 ? `~${baselineTokens.toLocaleString()} tok (gpt-tokenizer)` : "—"}
+      />
+      <LogMetric
+        label={t("压缩后 msgs")}
+        value={compressedTokens > 0 ? `${compressedTokens.toLocaleString()} tok` : "—"}
+      />
+      {baselineTokens > 0 && compressedTokens > 0 && compressedTokens < baselineTokens ? (
+        <LogMetric
+          label={t("msg 压缩率")}
+          value={`-${((baselineTokens - compressedTokens) / baselineTokens * 100).toFixed(1)}% (-${(baselineTokens - compressedTokens).toLocaleString()} tok)`}
+        />
+      ) : null}
+      <LogMetric
+        label={t("实际 LLM input")}
+        value={inputTokens > 0
+          ? `${inputTokens.toLocaleString()} tok${cacheReadTokens > 0 ? ` (缓存 ${cacheReadTokens.toLocaleString()})` : ""}`
+          : "—"}
+      />
+      {freshTokens > 0 && freshTokens !== inputTokens ? (
+        <LogMetric label={t("本请求新 token")} value={`${freshTokens.toLocaleString()} tok`} />
+      ) : null}
+      <LogMetric
+        label={t("内容 chars 压缩率")}
+        value={charsCompressed
+          ? `${contentRatioPct}% (-${savedChars.toLocaleString()} chars)`
+          : isPassThrough
+            ? t("未压缩(pass-through)")
+            : "—"}
+      />
+      {scenario ? <LogMetric label={t("压缩场景")} value={String(scenario)} /> : null}
+      {hashCount > 0 ? <LogMetric label={t("hash 占位")} value={String(hashCount)} /> : null}
+    </>
   );
 }
 

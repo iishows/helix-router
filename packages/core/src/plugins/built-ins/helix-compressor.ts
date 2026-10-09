@@ -19,7 +19,8 @@
  * 集成步骤见 docs/PLUGIN_INTEGRATION.md 附录 A
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { encode as gptEncode } from "gpt-tokenizer";
 import type {
   GatewayPluginRequestTransformHandler,
   GatewayPluginRequestTransformResult,
@@ -114,6 +115,17 @@ export const helixCompressorResponseHookKey = "helix-compressor-quality-feedback
 export const helixCompressorModelHeader = "x-helix-compressor-model";
 export const helixCompressorRatioHeader = "x-helix-compressor-ratio";
 export const helixCompressorRequestIdHeader = "x-helix-compressor-request-id";
+// v1.1：日志压缩量列 — 让 request_logs.response_headers 自动带上"压缩了多少"
+export const helixCompressorInputCharsHeader = "x-helix-compressor-input-chars";
+export const helixCompressorOutputCharsHeader = "x-helix-compressor-output-chars";
+export const helixCompressorHashCountHeader = "x-helix-compressor-hash-count";
+export const helixCompressorScenarioHeader = "x-helix-compressor-scenario";
+export const helixCompressorEnabledHeader = "x-helix-compressor-enabled";
+// v1.3：端到端压缩率 — 估算原始 messages 的 tokens(baseline),
+//   UI 拿到真实 inputTokens 后算 e2e_saved = baseline - inputTokens(扣 cache 后)。
+export const helixCompressorBaselineTokensHeader = "x-helix-compressor-baseline-tokens";
+// v1.5：压缩后 messages 的 tokens(真 tokenizer 算)—— UI 用来显示 "~X→Y tok" 全 token 视图
+export const helixCompressorCompressedTokensHeader = "x-helix-compressor-compressed-tokens";
 
 // ============= Few-shot Prompt =============
 
@@ -318,6 +330,13 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
 
   if (!Array.isArray(messages) || typeof model !== "string") return undefined;
 
+  // 决定传给云端的 request_id。
+  // Fastify 默认 req.id 是 "req-<letter>"，太短会被 helix 记成单字符；
+  // 客户端若有完整 ID（>=8 字符）就用它，否则用 randomUUID() 生成稳定的 nanoid。
+  const upstreamRequestId = input.requestId && input.requestId.length >= 8
+    ? input.requestId
+    : randomUUID();
+
   // 1. 调云端压缩
   let compressed: CompressResponse;
   try {
@@ -328,7 +347,7 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        request_id: input.requestId,
+        request_id: upstreamRequestId,
         messages,
         model,
         thinking_mode: extractThinkingMode(body)
@@ -351,13 +370,13 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
   }
 
   // 2. 抽样
-  if (shouldSample(input.requestId, config.sampleMod)) {
+  if (shouldSample(upstreamRequestId, config.sampleMod)) {
     // 3. 评估
     const quality = await evaluateCompression(messages, compressed.compressed, model, config);
 
     // 4. 上报（异步，不阻塞 transform 返回）
     if (quality) {
-      void reportFeedback(input.requestId, quality, config).catch((err) => {
+      void reportFeedback(upstreamRequestId, quality, config).catch((err) => {
         context.logger.warn(`[helix-compressor] report error: ${(err as Error).message}`);
       });
     }
@@ -388,12 +407,35 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
   return {
     body: outputBody,
     headers: {
-      [helixCompressorRequestIdHeader]: input.requestId,
+      [helixCompressorRequestIdHeader]: upstreamRequestId,
       [helixCompressorModelHeader]: model,
-      [helixCompressorRatioHeader]: String(compressed.stats?.ratio ?? 0)
+      [helixCompressorRatioHeader]: String(compressed.stats?.ratio ?? 0),
+      [helixCompressorInputCharsHeader]: String(compressed.stats?.originalChars ?? 0),
+      // v1.3: output_chars 改写为"最终消息的实际 chars"(发给 LLM 的),
+      //   而不是 helix 返回的 compressedChars(那是"省了多少",短消息时是 0)。
+      //   这样 UI 看到 input=output 时知道是 pass-through,看到 input>output 时知道真的压了。
+      [helixCompressorOutputCharsHeader]: String(countChars(outputMessages)),
+      [helixCompressorHashCountHeader]: String(compressed.stats?.compressedCount ?? 0),
+      [helixCompressorScenarioHeader]: compressed.scenario ?? "",
+      [helixCompressorEnabledHeader]: "1",
+      // v1.4: 端到端 baseline = 原始 messages 用 gpt-tokenizer(cl100k_base)真实 token 化。
+      //   UI 拿真实 inputTokens 后能对比。注意:这只算 user messages 字段,
+      //   system/tool/cache 不在 baseline 里(那些本来也不被压缩)。
+      [helixCompressorBaselineTokensHeader]: String(tokenizeMessages(messages)),
+      // v1.5: 压缩后 messages 的 token 数。UI 显示 "X→Y tok (Z%)" 时用,
+      //   全 token 视图避免 chars/tokens 混用的歧义。
+      [helixCompressorCompressedTokensHeader]: String(tokenizeMessages(outputMessages))
     },
     responseHeaders: {
-      [helixCompressorRequestIdHeader]: input.requestId
+      [helixCompressorRequestIdHeader]: upstreamRequestId,
+      [helixCompressorInputCharsHeader]: String(compressed.stats?.originalChars ?? 0),
+      [helixCompressorOutputCharsHeader]: String(countChars(outputMessages)),
+      [helixCompressorHashCountHeader]: String(compressed.stats?.compressedCount ?? 0),
+      [helixCompressorScenarioHeader]: compressed.scenario ?? "",
+      [helixCompressorRatioHeader]: String(compressed.stats?.ratio ?? 0),
+      [helixCompressorEnabledHeader]: "1",
+      [helixCompressorBaselineTokensHeader]: String(tokenizeMessages(messages)),
+      [helixCompressorCompressedTokensHeader]: String(tokenizeMessages(outputMessages))
     }
   };
 };
@@ -487,6 +529,24 @@ function countChars(messages: LLMMessage[]): number {
     }
     return total;
   }, 0);
+}
+
+/**
+ * 用 gpt-tokenizer(cl100k_base)真实 token 化原始 messages。
+ * 比 chars/3 估算准很多——实测 1 token ≈ 4-5 chars,messages 字段可能更密(role/JSON)。
+ * 注意:这是 OpenAI tokenizer 估算,Anthropic tokenizer 会略有差异(±5%)。
+ * 返回值写进 x-helix-compressor-baseline-tokens,UI 用它和真实 inputTokens 对比。
+ */
+function tokenizeMessages(messages: LLMMessage[]): number {
+  if (!Array.isArray(messages) || messages.length === 0) return 0;
+  // 用 messages 的 JSON 表示做 token 化(更接近实际 LLM 看到的格式)
+  try {
+    const serialized = JSON.stringify(messages);
+    return gptEncode(serialized).length;
+  } catch {
+    // fallback:chars 估算
+    return Math.round((countChars(messages) / 3) * 1.05);
+  }
 }
 
 /**
