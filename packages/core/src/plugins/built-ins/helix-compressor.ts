@@ -55,6 +55,12 @@ export interface HelixCompressorConfig {
   skipOnErrorStatusCodes?: number[];
   /** 自定义 header 名（用于传递 request_id 等） */
   requestIdHeader?: string;
+  /**
+   * V3.2:是否在压缩时同时存原 media bytes(image / video / doc / audio)
+   * 默认 false —— A 文本已包含 LLM 对媒体的文字描述,占位符召回 q+a 文本即可
+   * 设 true —— 把 Q 里的原 media 块也存进 cache,recall with_media=true 才能取回
+   */
+  storeWithMedia?: boolean;
 }
 
 /**
@@ -352,7 +358,9 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
         request_id: upstreamRequestId,
         messages,
         model,
-        thinking_mode: extractThinkingMode(body)
+        thinking_mode: extractThinkingMode(body),
+        // V3.2: 默认不存原 media bytes。LLM 真要看像素级细节时手动开启
+        store_media: config.storeWithMedia === true
       })
     });
 
@@ -474,7 +482,8 @@ function parseConfig(value: unknown): HelixCompressorConfig {
     ...(typeof value.sampleMod === "number" ? { sampleMod: value.sampleMod } : {}),
     ...(typeof value.timeoutMs === "number" ? { timeoutMs: value.timeoutMs } : {}),
     ...(typeof value.reportFailuresSilent === "boolean" ? { reportFailuresSilent: value.reportFailuresSilent } : {}),
-    ...(Array.isArray(value.skipOnErrorStatusCodes) ? { skipOnErrorStatusCodes: value.skipOnErrorStatusCodes as number[] } : {})
+    ...(Array.isArray(value.skipOnErrorStatusCodes) ? { skipOnErrorStatusCodes: value.skipOnErrorStatusCodes as number[] } : {}),
+    ...(typeof value.storeWithMedia === "boolean" ? { storeWithMedia: value.storeWithMedia } : {})
   };
 }
 
