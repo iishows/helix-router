@@ -1049,6 +1049,51 @@ async function applyHelixCompressorTransform(
   };
   const strOf = (key: string): string => (typeof h[key] === "string" ? (h[key] as string) : "");
   const resolveModel = () => strOf("x-helix-compressor-model") || (routedModel ?? requestInput.model ?? "");
+
+  // V3.2:估算压缩前 tokens(原始 messages 字符数 / 4)
+  // 包含 image/document 等 blocks — 这就是 "raw full submission" 基线
+  let preCompressionTokens = 0;
+  const reqBody = requestInput.requestBody as Record<string, unknown> | undefined;
+  if (reqBody && Array.isArray(reqBody.messages)) {
+    for (const m of reqBody.messages as Array<{ content?: unknown }>) {
+      if (typeof m.content === "string") {
+        preCompressionTokens += Math.ceil(m.content.length / 4);
+      } else if (Array.isArray(m.content)) {
+        for (const blk of m.content as Array<Record<string, unknown>>) {
+          if (blk && typeof blk === "object") {
+            // text block
+            if (typeof blk.text === "string") {
+              preCompressionTokens += Math.ceil((blk.text as string).length / 4);
+            }
+            // image / document / video / audio block:b64 字节数
+            if (typeof blk.source === "object" && blk.source !== null) {
+              const data = (blk.source as Record<string, unknown>).data;
+              if (typeof data === "string") {
+                preCompressionTokens += Math.ceil(data.length / 4);
+              }
+            } else if (typeof blk.image_url === "object" && blk.image_url !== null) {
+              const url = ((blk.image_url as Record<string, unknown>).url) as string | undefined;
+              if (typeof url === "string" && url.startsWith("data:")) {
+                const mt = url.match(/^data:[^;]+;base64,(.+)$/);
+                if (mt) preCompressionTokens += Math.ceil(mt[1].length / 4);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  // 压缩后 tokens = 给 LLM 的实际 tokens(input_tokens + cache_read 不算;只看 input 真正算力)
+  // 但 input_tokens 字段是 helix-compressor 报的 client 视角。实际 plugin transform 改了 messages 后给 LLM,
+  // LLM 看到的是压缩后的 messages 数量 ≈ h['x-helix-compressor-input-chars'] / 4
+  // 用 helix 报的 input_chars / 4 = 给 LLM 的 token 数(估算)
+  const postCompressionTokens = numOf("x-helix-compressor-input-chars")
+    ? Math.round(numOf("x-helix-compressor-input-chars") / 4)
+    : 0;
+  const savedPct = preCompressionTokens > 0 && postCompressionTokens > 0
+    ? Math.round((1 - postCompressionTokens / preCompressionTokens) * 10000) / 100
+    : 0;
+
   compressionStatsStore.set(statKey, {
     model: resolveModel(),
     scenario: strOf("x-helix-compressor-scenario"),
@@ -1059,6 +1104,31 @@ async function applyHelixCompressorTransform(
     hashMapSize: numOf("x-helix-compressor-hash-count"),
     qMediaStored: false
   });
+
+  // V3.2:sidecar log 持久化压缩前/后 tokens + 节省百分百(用户 UI 看不到 x-helix-* 头时也能看)
+  // Helix Router 的 request_logs.response_headers 字段是空,这条 sidecar 补上缺失
+  try {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const pathMod = require("node:path") as typeof import("node:path");
+    const os = require("node:os") as typeof import("node:os");
+    // 用 user data 目录而不是 cwd(Electron 应用 cwd 可能不可写)
+    const logDir = pathMod.join(os.homedir(), ".helix-router", "logs");
+    if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      requestId,
+      model: resolveModel(),
+      scenario: strOf("x-helix-compressor-scenario"),
+      pre_tokens: preCompressionTokens,
+      post_tokens: postCompressionTokens,
+      saved_pct: savedPct,
+      qa_compressed: numOf("x-helix-compressor-qa-compressed"),
+      ratio: numOf("x-helix-compressor-ratio")
+    });
+    fs.appendFileSync(pathMod.join(logDir, "compression-stats.jsonl"), line + "\n", "utf8");
+  } catch {
+    // sidecar 写失败不影响主流程
+  }
 
   return {
     ...(result.body ? { body: result.body } : {}),
