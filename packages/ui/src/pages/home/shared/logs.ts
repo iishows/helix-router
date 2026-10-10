@@ -28,6 +28,17 @@ export function formatLogDateTime(value: string): string {
 }
 
 /**
+ * V3.2 压缩率格式化:把巨大 token 数用 K/M 缩写,1 位小数百分比
+ * 例: 2,934,201 → "2.9M", 350,908 → "350.9K"
+ */
+function formatTokenCount(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return n.toLocaleString();
+}
+
+/**
  * 读取 helix-compressor plugin 写入的 headers,生成压缩状态摘要。
  * v1.6: baseline 用真 tokenizer (gpt-tokenizer cl100k_base) 算 user messages 的 token 数。
  *   显示格式:
@@ -95,15 +106,15 @@ export function formatLogCompressSummary(
   const hasActual = inputTokens > 0;
 
   if (hasBaseline && hasCompressed) {
-    // 主视图:全 token 维度
+    // 主视图:全 token 维度(K/M 缩写)
     const saved = baselineTokens - compressedTokens;
-    const pct = (saved / baselineTokens * 100).toFixed(0);
-    text = `~${baselineTokens.toLocaleString()}→${compressedTokens.toLocaleString()} tok (-${pct}%)`;
+    const pct = (saved / baselineTokens * 100);
+    text = `${formatTokenCount(baselineTokens)}→${formatTokenCount(compressedTokens)} tok (-${pct.toFixed(1)}%)`;
   } else if (hasBaseline) {
     // baseline 有但 compressed 没拿到(老 header)
-    text = `~${baselineTokens.toLocaleString()} tok`;
+    text = `${formatTokenCount(baselineTokens)} tok`;
   } else if (inputTokens > 0) {
-    text = `${inputTokens.toLocaleString()} tok`;
+    text = `${formatTokenCount(inputTokens)} tok`;
   } else if (inputChars > 0) {
     text = `${inputChars.toLocaleString()} chars`;
   } else {
@@ -113,12 +124,12 @@ export function formatLogCompressSummary(
     // 有 baseline + actual:补 e2e(压缩 vs 实际 LLM 消费)
     const e2eSaved = baselineTokens - inputTokens;
     const e2eRatio = baselineTokens > 0 ? e2eSaved / baselineTokens : 0;
-    const e2ePct = (e2eRatio * 100).toFixed(0);
+    const e2ePct = (e2eRatio * 100);
     const e2eSign = e2eSaved >= 0 ? "-" : "+";
-    text += ` · LLM ${inputTokens.toLocaleString()} (${e2eSign}${Math.abs(parseFloat(e2ePct))}%)`;
+    text += ` · LLM ${formatTokenCount(inputTokens)} (${e2eSign}${Math.abs(e2ePct).toFixed(1)}%)`;
   } else if (hasActual) {
     // 没 baseline(老数据),只显示 actual
-    text += ` · LLM ${inputTokens.toLocaleString()}`;
+    text += ` · LLM ${formatTokenCount(inputTokens)}`;
   }
   // V3.2: 标注 Q&A pair 压缩占位数
   if (qaCompressed > 0) {
