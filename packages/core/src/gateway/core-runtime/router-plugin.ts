@@ -194,6 +194,34 @@ type GatewayRouteResolution = {
   targetProviderName?: string;
 };
 
+// V3.2:request transform 写压缩 stat,response hook 读 + 推 x-helix-compressor-* header 到客户端
+// keyed by upstreamRequestId(同一 id 在 transform/hook 间是稳定标识)
+// 模块级 Map(单 gateway 实例就够,容量上限保护避免内存泄漏)
+type CompressionStat = {
+  inputChars: number;
+  compressedChars: number;
+  ratio: number;
+  compressedCount: number;
+  hashMapSize: number;
+  model?: string;
+  scenario?: string;
+  durationMs?: number;
+  qMediaStored?: boolean;
+};
+const compressionStatsStore = (() => {
+  const store = new Map<string, CompressionStat>();
+  const origSet = store.set.bind(store);
+  const MAX_ENTRIES = 1000;
+  store.set = (key: string, value: CompressionStat) => {
+    if (store.size >= MAX_ENTRIES && !store.has(key)) {
+      const firstKey = store.keys().next().value;
+      if (firstKey !== undefined) store.delete(firstKey);
+    }
+    return origSet(key, value);
+  };
+  return store;
+})();
+
 export async function createGatewayPlugin(input: GatewayPluginFactoryInput = {}) {
   const config = readAppConfig(input.plugin?.config);
   if (!config) {
@@ -464,6 +492,10 @@ export async function createGatewayPlugin(input: GatewayPluginFactoryInput = {})
       key: ccrCodexBridgeResponseHookKey,
       transformResponse: (responseInput: GatewayResponseHookInput) =>
         applyCodexBridgeResponseTransform(responseInput)
+    }, {
+      // V3.2: helix-compressor 压缩 stat 推到客户端响应头
+      key: "helix-compressor-response-headers",
+      transformResponse: helixCompressorResponseHeadersHook
     }, {
       key: ccrOpenRouterDiscountFinalizeResponseHookKey,
       transformResponse: (responseInput: GatewayResponseHookInput) => {
@@ -1003,12 +1035,77 @@ async function applyHelixCompressorTransform(
     return undefined;
   }
 
+  // V3.2:把压缩 stat 存到模块级 store,response hook 推 x-helix-compressor-* 到客户端响应
+  const statKey = requestId || `auto-${Date.now()}`;
+  // helixCompressorTransform 真实回包 shape:
+  //   { body: ..., headers: { 'x-helix-compressor-*': value, ... }, responseHeaders: {...} }
+  // 所以 stat 都在 result.headers 里(由 built-ins 内的 fetch + 拼接而成)
+  type HeadersLike = Record<string, string | number | boolean | null | undefined>;
+  const h: HeadersLike = (result.headers ?? {}) as HeadersLike;
+  const numOf = (key: string): number => {
+    const v = h[key];
+    const n = typeof v === "string" || typeof v === "number" ? Number(v) : NaN;
+    return Number.isFinite(n) ? n : 0;
+  };
+  const strOf = (key: string): string => (typeof h[key] === "string" ? (h[key] as string) : "");
+  const resolveModel = () => strOf("x-helix-compressor-model") || (routedModel ?? requestInput.model ?? "");
+  compressionStatsStore.set(statKey, {
+    model: resolveModel(),
+    scenario: strOf("x-helix-compressor-scenario"),
+    inputChars: numOf("x-helix-compressor-input-chars"),
+    compressedChars: numOf("x-helix-compressor-output-chars"),
+    ratio: numOf("x-helix-compressor-ratio"),
+    compressedCount: numOf("x-helix-compressor-qa-compressed"),
+    hashMapSize: numOf("x-helix-compressor-hash-count"),
+    qMediaStored: false
+  });
+
   return {
     ...(result.body ? { body: result.body } : {}),
     ...(result.headers ? { headers: cleanStringHeaders(result.headers) } : {}),
     ...(result.responseHeaders ? { responseHeaders: cleanStringHeaders(result.responseHeaders) } : {})
   };
 }
+
+/**
+ * V3.2 response hook: 从模块级 store 查压缩 stat,推 x-helix-compressor-* 头到客户端响应
+ */
+const helixCompressorResponseHeadersHook: (responseInput: any) => { headers?: Record<string, string | number | boolean> } | undefined =
+  (responseInput: any) => {
+    const stats = compressionStatsStore;
+    // 多种 ID 策略兜底,适应不同网关层的 request id 字段
+    const upstreamReq = (responseInput.upstreamRequest as any) ?? null;
+    const requestLike = (responseInput.request as any) ?? null;
+    const upstreamReqId =
+      upstreamReq?.headers?.["x-helix-request-id"] ??
+      upstreamReq?.requestId ??
+      upstreamReq?.id ??
+      requestLike?.id ??
+      "";
+    let key: string | undefined = upstreamReqId ? upstreamReqId : undefined;
+    if (!key && stats.size > 0) {
+      // fallback:对仅剩 1 个 key 的情况,极可能是它;否则放弃
+      const keys = Array.from(stats.keys());
+      key = keys.length === 1 ? keys[0] : undefined;
+    }
+    if (!key) return undefined;
+    const stat = stats.get(key);
+    if (!stat) return undefined;
+    stats.delete(key); // 一次性消费即删
+
+    return {
+      headers: {
+        "x-helix-compressor-input-chars": String(stat.inputChars),
+        "x-helix-compressor-output-chars": String(stat.compressedChars),
+        "x-helix-compressor-ratio": String(stat.ratio ?? 0),
+        "x-helix-compressor-qa-compressed": String(stat.compressedCount ?? 0),
+        "x-helix-compressor-hash-count": String(stat.hashMapSize ?? 0),
+        "x-helix-compressor-model": stat.model ?? "",
+        "x-helix-compressor-scenario": stat.scenario ?? "",
+        "x-helix-compressor-stored-media": stat.qMediaStored ? "1" : "0"
+      }
+    };
+  };
 
 async function resolvePublicGatewayAuth(
   config: AppConfig,
