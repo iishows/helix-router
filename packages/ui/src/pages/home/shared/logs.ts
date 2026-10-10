@@ -121,12 +121,18 @@ export function formatLogCompressSummary(
     text = "-";
   }
   if (hasActual && hasBaseline) {
-    // 有 baseline + actual:补 e2e(压缩 vs 实际 LLM 消费)
-    const e2eSaved = baselineTokens - inputTokens;
-    const e2eRatio = baselineTokens > 0 ? e2eSaved / baselineTokens : 0;
-    const e2ePct = (e2eRatio * 100);
-    const e2eSign = e2eSaved >= 0 ? "-" : "+";
-    text += ` · LLM ${formatTokenCount(inputTokens)} (${e2eSign}${Math.abs(e2ePct).toFixed(1)}%)`;
+    // e2e 真实节省(账单维度):actual_cost vs baseline_cost(假设全部重算)
+    //   baseline_cost = pre_tokens × P_in + output × P_out
+    //   节省 % = 1 - actual_cost / baseline_cost
+    //   缓存命中按 M3 折价(~0.1× input)算,不算免费
+    const P_IN = 0.55;       // 反推实测: $0.55/M input
+    const P_OUT = 2.76;      // 反推实测: $2.76/M output (5x input)
+    const outputTokens = entry.outputTokens ?? 0;
+    const baselineCost = (baselineTokens * P_IN + outputTokens * P_OUT) / 1_000_000;
+    const actualCost = entry.costUsd ?? 0;
+    const e2eSaved = baselineCost - actualCost;
+    const e2ePct = baselineCost > 0 ? (e2eSaved / baselineCost * 100) : 0;
+    text += ` · e2e -$${e2eSaved.toFixed(4)} (-${e2ePct.toFixed(1)}%)`;
   } else if (hasActual) {
     // 没 baseline(老数据),只显示 actual
     text += ` · LLM ${formatTokenCount(inputTokens)}`;
