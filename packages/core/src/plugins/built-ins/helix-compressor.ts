@@ -61,6 +61,13 @@ export interface HelixCompressorConfig {
    * 设 true —— 把 Q 里的原 media 块也存进 cache,recall with_media=true 才能取回
    */
   storeWithMedia?: boolean;
+  /**
+   * V3.2 严格压缩:保留最新 K 对 Q&A verbatim
+   * 默认 1 —— 只最新提交的图片必看,anchor + 历史全部 ⟦QA:⟧ 占位符
+   * 设 0 —— 全部压缩(当前问题必看的图片也跟着隐藏,LLM 看不到当前图)
+   * 设 2+ —— 较宽松,2 对 Q&A 不动(默认旧行为)
+   */
+  keepRecentPairs?: number;
 }
 
 /**
@@ -360,7 +367,9 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
         model,
         thinking_mode: extractThinkingMode(body),
         // V3.2: 默认不存原 media bytes。LLM 真要看像素级细节时手动开启
-        store_media: config.storeWithMedia === true
+        store_media: config.storeWithMedia === true,
+        // 严格压缩:只保留最新 1 对 Q&A(默认 1),anchor + 历史消息(含图片/PDF)都替成 ⟦QA:⟧
+        keep_recent_pairs: config.keepRecentPairs ?? 1
       })
     });
 
@@ -483,7 +492,8 @@ function parseConfig(value: unknown): HelixCompressorConfig {
     ...(typeof value.timeoutMs === "number" ? { timeoutMs: value.timeoutMs } : {}),
     ...(typeof value.reportFailuresSilent === "boolean" ? { reportFailuresSilent: value.reportFailuresSilent } : {}),
     ...(Array.isArray(value.skipOnErrorStatusCodes) ? { skipOnErrorStatusCodes: value.skipOnErrorStatusCodes as number[] } : {}),
-    ...(typeof value.storeWithMedia === "boolean" ? { storeWithMedia: value.storeWithMedia } : {})
+    ...(typeof value.storeWithMedia === "boolean" ? { storeWithMedia: value.storeWithMedia } : {}),
+    ...(typeof value.keepRecentPairs === "number" ? { keepRecentPairs: value.keepRecentPairs } : {})
   };
 }
 
