@@ -1,0 +1,35 @@
+=== Test run mv1ncir3 ===
+Total messages: 25
+Total chars: 6942
+
+=== A) Baseline 直接 curl Helix Router ===
+status: 200
+usage: {"total_tokens":3971,"total_characters":0,"prompt_tokens":3171,"completion_tokens":800,"completion_tokens_details":{"reasoning_tokens":387},"prompt_tokens_details":{"cached_tokens":156}}
+content length: 976
+
+=== C) 直打 helix-compressor 看压缩结果 ===
+compress: {"originalChars":5733,"compressedChars":210,"ratio":0.9633699633699634,"compressedCount":10,"candidateCount":10,"naturalRatio":0.9633699633699634,"maxRatio":null,"skipped":false,"skipReason":null,"duration_ms":5}
+hashMap entries: 10
+any qMedia stored: false
+
+=== D) 看 compressed messages 输出 ===
+  [0] user: [mv1ncir3-0] 用户问:详细说明 Apache Kafka 分区机制,这是第 1 轮测试。Kafka Topic 由 partition 组成,每个 
+  [1] assistant: [mv1ncir3-0-A] 这是助手对 Apache Kafka 分区机制 的回答。Kafka Topic 由 partition 组成,每个 partiti
+  [2] PLACEHOLDER: ⟦QA:3714130b381e5e88⟧
+  [3] PLACEHOLDER: ⟦QA:5f46bb4bf55877b7⟧
+  [4] PLACEHOLDER: ⟦QA:35194f8e7cadd6e0⟧
+  [5] PLACEHOLDER: ⟦QA:68e474a544fcd3c4⟧
+  [6] PLACEHOLDER: ⟦QA:57ef0acd28c2fee8⟧
+  [7] PLACEHOLDER: ⟦QA:4343910f40b74587⟧
+  [8] PLACEHOLDER: ⟦QA:db087ffa26a35ed9⟧
+  [9] PLACEHOLDER: ⟦QA:a7c8c8567b824197⟧
+  [10] PLACEHOLDER: ⟦QA:5cbfbe8f62902777⟧
+  [11] PLACEHOLDER: ⟦QA:b79ee61a87ce8314⟧
+  [12] user: [mv1ncir3-11] 用户问:详细说明 OAuth 2.0 授权流程,这是第 12 轮测试。OAuth 2.0 有 4 种 grant type:Auth
+  [13] assistant: [mv1ncir3-11-A] 这是助手对 OAuth 2.0 授权流程 的回答。OAuth 2.0 有 4 种 grant type:Authorizatio
+  [14] user: [mv1ncir3-final] 综合上面 12 轮,列出每个主题核心要点与它们之间的关联。
+消息层: 原始 6942 → 压缩 1419 (降幅 79.56%)
+
+预测: LLM 实际收到 ≈ 405 tokens (按 ~3.5 char/token 估算)
+Actual: Baseline A 收到 3171 tokens
+Delta: +2766 tokens(差异可能源于 image/cache/tool schema 等额外开销)
