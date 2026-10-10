@@ -1,6 +1,7 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
+import { encode as gptEncode } from "gpt-tokenizer";
 import type { ApiKeyConfig, AppConfig, GatewayProviderConfig, GatewayProviderProtocol, ProfileConfig, RouterRule } from "@ccr/core/contracts/app";
 import {
   claudeCodeWifTokenPath,
@@ -1050,46 +1051,22 @@ async function applyHelixCompressorTransform(
   const strOf = (key: string): string => (typeof h[key] === "string" ? (h[key] as string) : "");
   const resolveModel = () => strOf("x-helix-compressor-model") || (routedModel ?? requestInput.model ?? "");
 
-  // V3.2:估算压缩前 tokens(原始 messages 字符数 / 4)
-  // 包含 image/document 等 blocks — 这就是 "raw full submission" 基线
-  let preCompressionTokens = 0;
+  // V3.2:用 gpt-tokenizer(cl100k_base)真实 token 化原始 request body
+  // 这是 "raw full submission" 的精确 token 数,包含 image/document b64 在内
   const reqBody = requestInput.requestBody as Record<string, unknown> | undefined;
+  let preCompressionTokens = 0;
   if (reqBody && Array.isArray(reqBody.messages)) {
-    for (const m of reqBody.messages as Array<{ content?: unknown }>) {
-      if (typeof m.content === "string") {
-        preCompressionTokens += Math.ceil(m.content.length / 4);
-      } else if (Array.isArray(m.content)) {
-        for (const blk of m.content as Array<Record<string, unknown>>) {
-          if (blk && typeof blk === "object") {
-            // text block
-            if (typeof blk.text === "string") {
-              preCompressionTokens += Math.ceil((blk.text as string).length / 4);
-            }
-            // image / document / video / audio block:b64 字节数
-            if (typeof blk.source === "object" && blk.source !== null) {
-              const data = (blk.source as Record<string, unknown>).data;
-              if (typeof data === "string") {
-                preCompressionTokens += Math.ceil(data.length / 4);
-              }
-            } else if (typeof blk.image_url === "object" && blk.image_url !== null) {
-              const url = ((blk.image_url as Record<string, unknown>).url) as string | undefined;
-              if (typeof url === "string" && url.startsWith("data:")) {
-                const mt = url.match(/^data:[^;]+;base64,(.+)$/);
-                if (mt) preCompressionTokens += Math.ceil(mt[1].length / 4);
-              }
-            }
-          }
-        }
-      }
+    try {
+      // 拿全部 messages 序列化为 JSON,tokenize — 与 plugin 现有的 tokenizeMessages 走同一路径
+      preCompressionTokens = gptEncode(JSON.stringify(reqBody.messages)).length;
+    } catch {
+      preCompressionTokens = 0;
     }
   }
-  // 压缩后 tokens = 给 LLM 的实际 tokens(input_tokens + cache_read 不算;只看 input 真正算力)
-  // 但 input_tokens 字段是 helix-compressor 报的 client 视角。实际 plugin transform 改了 messages 后给 LLM,
-  // LLM 看到的是压缩后的 messages 数量 ≈ h['x-helix-compressor-input-chars'] / 4
-  // 用 helix 报的 input_chars / 4 = 给 LLM 的 token 数(估算)
-  const postCompressionTokens = numOf("x-helix-compressor-input-chars")
-    ? Math.round(numOf("x-helix-compressor-input-chars") / 4)
-    : 0;
+  // post_tokens:压缩后给 LLM 实际看到的 token 数(helix-compressor 内部用 gpt-tokenizer 算过)
+  // x-helix-compressor-compressed-tokens = 压缩后 messages 的 token 数
+  // x-helix-compressor-baseline-tokens = 原始 messages 的 token 数(== preCompressionTokens,用于双径校验)
+  const postCompressionTokens = numOf("x-helix-compressor-compressed-tokens");
   const savedPct = preCompressionTokens > 0 && postCompressionTokens > 0
     ? Math.round((1 - postCompressionTokens / preCompressionTokens) * 10000) / 100
     : 0;
