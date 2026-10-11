@@ -141,10 +141,7 @@ export function MainLayout({
   requestLogsEnabled: boolean;
   visibleNavigation: MainNavigationItem[];
 }) {
-  const showUpdateButton = updateStatus.supported;
-  const windowControlSafeAreaWidth = showUpdateButton
-    ? (isMac ? 188 : 124)
-    : (isMac ? 152 : 88);
+  const windowControlSafeAreaWidth = isMac ? 152 : 88;
   const navigationGroups = groupSidebarNavigation(visibleNavigation);
 
   return (
@@ -179,14 +176,6 @@ export function MainLayout({
           state={gatewayStatus.state}
           targetActive={gatewayTargetActive}
         />
-        {showUpdateButton ? (
-          <UpdateEntryButton
-            actionBusy={updateActionBusy}
-            copy={copy}
-            onOpen={onOpenUpdate}
-            status={updateStatus}
-          />
-        ) : null}
       </div>
 
       <motion.aside
