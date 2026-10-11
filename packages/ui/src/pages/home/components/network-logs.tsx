@@ -1417,6 +1417,13 @@ function LogCompressDetails({ entry }: { entry: RequestLogEntry }) {
   const compressedTokens = Number(headers["x-helix-compressor-compressed-tokens"] ?? 0);
   const scenario = headers["x-helix-compressor-scenario"];
   const hashCount = Number(headers["x-helix-compressor-hash-count"] ?? 0);
+  // V4.5 字段(V3.x 路径下 strategy='v3x', budget/target/under-budget 都为 0)
+  const strategy = headers["x-helix-compressor-strategy"] ?? "v3x";
+  const budget = Number(headers["x-helix-compressor-budget"] ?? 0);
+  const target = Number(headers["x-helix-compressor-target"] ?? 0);
+  const underBudgetHeader = headers["x-helix-compressor-under-budget"];
+  const underBudget = underBudgetHeader === "1" ? true : underBudgetHeader === "0" ? false : null;
+  const durationMs = Number(headers["x-helix-compressor-duration-ms"] ?? 0);
   const inputTokens = typeof entry.inputTokens === "number" ? entry.inputTokens : 0;
   const cacheReadTokens = typeof entry.cacheReadTokens === "number" ? entry.cacheReadTokens : 0;
   const freshTokens = Math.max(0, inputTokens - cacheReadTokens);
@@ -1428,12 +1435,37 @@ function LogCompressDetails({ entry }: { entry: RequestLogEntry }) {
   const savedChars = Math.max(0, inputChars - outputChars);
   const charsCompressed = inputChars > 0 && outputChars > 0 && outputChars < inputChars;
   const isPassThrough = inputChars > 0 && outputChars === inputChars;
+  const isV45 = strategy === "budget_greedy";
 
   return (
     <>
       <LogMetric
+        label={t("策略 / Strategy")}
+        value={strategy === "budget_greedy" ? "V4.5 budget_greedy" : strategy === "v3x" ? "V3.x threshold" : String(strategy)}
+      />
+      {isV45 ? (
+        <>
+          <LogMetric
+            label={t("budget 上限")}
+            value={budget > 0 ? `${budget.toLocaleString()} tok` : "—"}
+          />
+          <LogMetric
+            label={t("实际 target")}
+            value={target > 0 ? `${target.toLocaleString()} tok` : "—"}
+          />
+          <LogMetric
+            label={t("under budget")}
+            value={underBudget === true ? t("✓ 命中") : underBudget === false ? t("✗ 未达(尽力压缩)") : "—"}
+          />
+        </>
+      ) : null}
+      <LogMetric
         label={t("baseline (原始 msgs)")}
-        value={baselineTokens > 0 ? `~${baselineTokens.toLocaleString()} tok (gpt-tokenizer)` : "—"}
+        value={baselineTokens > 0
+          ? isV45
+            ? `${baselineTokens.toLocaleString()} tok (gpt-tokenizer)`
+            : `~${baselineTokens.toLocaleString()} tok (chars/4 估算)`
+          : "—"}
       />
       <LogMetric
         label={t("压缩后 msgs")}
@@ -1464,6 +1496,7 @@ function LogCompressDetails({ entry }: { entry: RequestLogEntry }) {
       />
       {scenario ? <LogMetric label={t("压缩场景")} value={String(scenario)} /> : null}
       {hashCount > 0 ? <LogMetric label={t("hash 占位")} value={String(hashCount)} /> : null}
+      {durationMs > 0 ? <LogMetric label={t("压缩耗时")} value={`${durationMs} ms`} /> : null}
     </>
   );
 }
