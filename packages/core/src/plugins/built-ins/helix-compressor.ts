@@ -761,8 +761,11 @@ function extractMessageText(m: unknown): string {
  * 判定消息是否"事实上为空":
  * - content 是空字符串
  * - content 是空数组
- * - content 是 array 且所有文本块都是空字符串/缺失
+ * - content 是 array 且"只有" text 块,且所有 text 块都空/缺失
  *   (实测本样本 98 条 assistant 是这种形态,光判 length===0 会漏)
+ *
+ * 注意: 含 tool_use / image / tool_result 等非 text 块的 content 不算空,
+ *   因为这些块本身承载语义(工具调用、图片内容等)
  */
 function isEffectivelyEmpty(m: unknown): boolean {
   if (!isRecord(m)) return false;
@@ -770,7 +773,14 @@ function isEffectivelyEmpty(m: unknown): boolean {
   if (c === "") return true;
   if (Array.isArray(c) && c.length === 0) return true;
   if (Array.isArray(c)) {
-    return c.every((b: unknown) => {
+    // 提取所有 type==="text" 的块
+    const textBlocks = c.filter((b: unknown) =>
+      isRecord(b) && (b as Record<string, unknown>).type === "text"
+    );
+    // 如果没有任何 text 块但有其他块(tool_use/image/tool_result),不算空
+    if (textBlocks.length === 0) return false;
+    // 所有 text 块都空/缺失才算空
+    return textBlocks.every((b: unknown) => {
       if (!isRecord(b)) return false;
       const t = (b as Record<string, unknown>).text;
       return !t || (typeof t === "string" && t.trim() === "");

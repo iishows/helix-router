@@ -92,6 +92,56 @@ test("clientPreprocess: 保留 task-notification 但 retrieval_status=pending", 
   assert.equal(out.length, 1, "pending 状态的 task-notif 不应被删");
 });
 
+// 边界 case: 不能误删含 tool_use / image 的消息
+test("clientPreprocess: 含 tool_use 的 assistant 消息不算空(关键边界)", () => {
+  const input = [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [{ type: "tool_use", name: "Read", input: { path: "/x" } }] }
+  ];
+  const out = clientPreprocess(input);
+  assert.equal(out.length, 2, "含 tool_use 不算空,不能删");
+  assert.equal(out[1].content[0].name, "Read");
+});
+
+test("clientPreprocess: 含 image 块的用户消息不算空(关键边界)", () => {
+  const input = [
+    { role: "user", content: [{ type: "image", source: { type: "base64", data: "..." } }] },
+    { role: "user", content: "" }  // 这条才算空
+  ];
+  const out = clientPreprocess(input);
+  assert.equal(out.length, 1, "image 块 + 空文本块 = 不算空");
+  assert.equal(out[0].content[0].type, "image");
+});
+
+test("clientPreprocess: 含 tool_result 的 user 消息不算空(关键边界)", () => {
+  const input = [
+    {
+      role: "user",
+      content: [
+        { type: "tool_result", tool_use_id: "abc", content: "actual tool output" }
+      ]
+    }
+  ];
+  const out = clientPreprocess(input);
+  assert.equal(out.length, 1, "tool_result 不算空");
+});
+
+test("clientPreprocess: 仅含空白文本块算空", () => {
+  const input = [
+    { role: "assistant", content: [{ type: "text", text: "  \n  \t  " }] }
+  ];
+  const out = clientPreprocess(input);
+  assert.equal(out.length, 0, "纯空白文本算空");
+});
+
+test("clientPreprocess: 混合空白 + 真实文本不算空", () => {
+  const input = [
+    { role: "assistant", content: [{ type: "text", text: "real" }, { type: "text", text: "  " }] }
+  ];
+  const out = clientPreprocess(input);
+  assert.equal(out.length, 1, "有真实文本块不算空");
+});
+
 // ============= PR-2: clientCompactSkills 测试 =============
 
 test("clientCompactSkills: 无 Skill 调用时替换 27 KB skills reminder 为压缩索引", () => {
