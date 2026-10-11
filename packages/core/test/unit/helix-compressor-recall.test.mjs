@@ -7,6 +7,9 @@ import test from "node:test";
 import {
   helixCompressorResponseHook,
   HC_RECALL_TOOL_SCHEMA,
+  HC_RECALL_TOOL_SCHEMA_ANTHROPIC,
+  HISTORY_RECALL_TOOL_SCHEMA,
+  HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC,
   extractOpenAIHcrecallCalls,
   extractAnthropicHcrecallCalls,
   hasHCPlaceholder,
@@ -332,4 +335,51 @@ test("response hook: Anthropic protocol returns user+tool_result", async () => {
   assert.equal(result.messagesToAppend[0].content[0].tool_use_id, "toolu_1");
 
   global.fetch = originalFetch;
+});
+
+// ============= H2 修复验证: Anthropic 格式 schema =============
+
+test("HC_RECALL_TOOL_SCHEMA_ANTHROPIC uses Anthropic format (no type:function, has input_schema)", () => {
+  assert.equal(HC_RECALL_TOOL_SCHEMA_ANTHROPIC.name, "hc_recall");
+  assert.equal(HC_RECALL_TOOL_SCHEMA_ANTHROPIC.type, undefined, "Anthropic 顶层无 type 字段");
+  assert.equal(HC_RECALL_TOOL_SCHEMA_ANTHROPIC.function, undefined, "Anthropic 顶层无 function 包裹");
+  assert.ok(HC_RECALL_TOOL_SCHEMA_ANTHROPIC.input_schema, "Anthropic 必须有 input_schema");
+  assert.equal(HC_RECALL_TOOL_SCHEMA_ANTHROPIC.input_schema.type, "object");
+  assert.ok(HC_RECALL_TOOL_SCHEMA_ANTHROPIC.input_schema.properties.hash_id);
+  assert.ok(HC_RECALL_TOOL_SCHEMA_ANTHROPIC.input_schema.properties.reason);
+  assert.ok(HC_RECALL_TOOL_SCHEMA_ANTHROPIC.input_schema.required.includes("hash_id"));
+});
+
+test("HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC uses Anthropic format with with_media", () => {
+  assert.equal(HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC.name, "history_recall");
+  assert.equal(HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC.type, undefined);
+  assert.equal(HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC.function, undefined);
+  assert.ok(HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC.input_schema);
+  assert.ok(HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC.input_schema.properties.hash_id);
+  assert.ok(HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC.input_schema.properties.with_media);
+  assert.ok(HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC.input_schema.properties.reason);
+  assert.ok(HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC.input_schema.required.includes("hash_id"));
+});
+
+test("OpenAI and Anthropic HC schemas have equivalent field semantics", () => {
+  const openaiParams = HC_RECALL_TOOL_SCHEMA.function.parameters;
+  const anthropicSchema = HC_RECALL_TOOL_SCHEMA_ANTHROPIC.input_schema;
+  assert.deepEqual(
+    Object.keys(openaiParams.properties).sort(),
+    Object.keys(anthropicSchema.properties).sort(),
+    "两个 schema 必须有相同的 properties key 集合"
+  );
+  assert.deepEqual(openaiParams.required, anthropicSchema.required, "required 字段必须一致");
+  assert.equal(openaiParams.type, anthropicSchema.type, "type 必须一致");
+});
+
+test("OpenAI and Anthropic HISTORY schemas have equivalent field semantics", () => {
+  const openaiParams = HISTORY_RECALL_TOOL_SCHEMA.function.parameters;
+  const anthropicSchema = HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC.input_schema;
+  assert.deepEqual(
+    Object.keys(openaiParams.properties).sort(),
+    Object.keys(anthropicSchema.properties).sort(),
+    "两个 schema 必须有相同的 properties key 集合"
+  );
+  assert.deepEqual(openaiParams.required, anthropicSchema.required, "required 字段必须一致");
 });

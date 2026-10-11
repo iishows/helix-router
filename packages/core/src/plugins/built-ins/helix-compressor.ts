@@ -68,6 +68,12 @@ export interface HelixCompressorConfig {
    * 设 2+ —— 较宽松,2 对 Q&A 不动(默认旧行为)
    */
   keepRecentPairs?: number;
+  /**
+   * V3.3 block 级压缩阈值(字符):任意 role 的 text 块 ≥ 该阈值即纳入压缩候选
+   * 默认 0 = 关闭(向后兼容);200 是实测推荐的甜区
+   * 设为 0 走原 V3.2 Q&A pair 压缩,>0 额外压缩任意 role 的大文本块
+   */
+  blockThresholdChars?: number;
 }
 
 /**
@@ -369,7 +375,10 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
         // V3.2: 默认不存原 media bytes。LLM 真要看像素级细节时手动开启
         store_media: config.storeWithMedia === true,
         // 严格压缩:只保留最新 1 对 Q&A(默认 1),anchor + 历史消息(含图片/PDF)都替成 ⟦QA:⟧
-        keep_recent_pairs: config.keepRecentPairs ?? 1
+        keep_recent_pairs: config.keepRecentPairs ?? 1,
+        // V3.3 block 级压缩:任意 role 的 text 块 ≥ 阈值字符即纳入候选
+        // 默认 0 = 关闭(向后兼容);设为 >0 启用
+        block_threshold_chars: config.blockThresholdChars ?? 0
       })
     });
 
@@ -413,27 +422,42 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
   const hasQA = hasQAPlaceholder(outputMessages);
 
   if (hasHC) {
-    // 注入 hc_recall 工具定义（去重）
+    // 注入 hc_recall 工具定义（去重）。协议分发: Anthropic 用 input_schema, OpenAI 用 parameters
     const existingTools = Array.isArray(body.tools) ? body.tools : [];
-    const hasRecall = existingTools.some((t: unknown) =>
-      isRecord(t) && ((t as Record<string, unknown>).function as Record<string, unknown> | undefined)?.name === helixCompressorRecallToolName
-    );
+    const format = inferRequestFormat(body);
+    const recallName = helixCompressorRecallToolName;
+    const hasRecall = existingTools.some((t: unknown) => {
+      if (!isRecord(t)) return false;
+      // 兼容两种格式的查重
+      const fnName = (t.function as Record<string, unknown> | undefined)?.name;
+      return t.name === recallName || fnName === recallName;
+    });
     if (!hasRecall) {
-      outputBody.tools = [...existingTools, HC_RECALL_TOOL_SCHEMA];
+      const schema = format === "anthropic"
+        ? HC_RECALL_TOOL_SCHEMA_ANTHROPIC
+        : HC_RECALL_TOOL_SCHEMA;
+      outputBody.tools = [...existingTools, schema];
     }
 
     // 注入教学 prompt
     outputBody.messages = injectRecallInstruction(outputMessages);
   }
 
-  // V3.2: ⟦QA:hash⟧ 占位符(history_recall 工具)
+  // V3.2: ⟦QA:hash⟧ 占位符(history_recall 工具)。同样按协议分发
   if (hasQA) {
     const existingTools = Array.isArray(outputBody.tools) ? outputBody.tools : [];
-    const hasHistoryRecall = existingTools.some((t: unknown) =>
-      isRecord(t) && ((t as Record<string, unknown>).function as Record<string, unknown> | undefined)?.name === HISTORY_RECALL_TOOL_NAME
-    );
+    const format = inferRequestFormat(body);
+    const historyName = HISTORY_RECALL_TOOL_NAME;
+    const hasHistoryRecall = existingTools.some((t: unknown) => {
+      if (!isRecord(t)) return false;
+      const fnName = (t.function as Record<string, unknown> | undefined)?.name;
+      return t.name === historyName || fnName === historyName;
+    });
     if (!hasHistoryRecall) {
-      outputBody.tools = [...existingTools, HISTORY_RECALL_TOOL_SCHEMA];
+      const schema = format === "anthropic"
+        ? HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC
+        : HISTORY_RECALL_TOOL_SCHEMA;
+      outputBody.tools = [...existingTools, schema];
     }
     // 注入教学 prompt(QA 版本)
     outputBody.messages = injectHistoryRecallInstruction(outputMessages);
@@ -493,7 +517,8 @@ function parseConfig(value: unknown): HelixCompressorConfig {
     ...(typeof value.reportFailuresSilent === "boolean" ? { reportFailuresSilent: value.reportFailuresSilent } : {}),
     ...(Array.isArray(value.skipOnErrorStatusCodes) ? { skipOnErrorStatusCodes: value.skipOnErrorStatusCodes as number[] } : {}),
     ...(typeof value.storeWithMedia === "boolean" ? { storeWithMedia: value.storeWithMedia } : {}),
-    ...(typeof value.keepRecentPairs === "number" ? { keepRecentPairs: value.keepRecentPairs } : {})
+    ...(typeof value.keepRecentPairs === "number" ? { keepRecentPairs: value.keepRecentPairs } : {}),
+    ...(typeof value.blockThresholdChars === "number" ? { blockThresholdChars: value.blockThresholdChars } : {})
   };
 }
 
@@ -631,6 +656,33 @@ export const HC_RECALL_TOOL_SCHEMA = {
   }
 } as const;
 
+// Anthropic 协议版本: 字段名从 parameters 改为 input_schema,顶层去 type/function 包裹
+export const HC_RECALL_TOOL_SCHEMA_ANTHROPIC = {
+  name: helixCompressorRecallToolName,
+  description:
+    "Recall the original content of a HC-compressed block. " +
+    "When you see ⟦HC:hash⟧ placeholders (hex hash) in the conversation, " +
+    "call this tool with the hash_id to get the full original text. " +
+    "Only call when you genuinely need the original content to answer accurately. " +
+    "Do NOT call repeatedly — there's a per-request budget.",
+  input_schema: {
+    type: "object",
+    properties: {
+      hash_id: {
+        type: "string",
+        pattern: "^[0-9a-f]+$",
+        description: "Hex hash from the ⟦HC:hash⟧ placeholder (without prefix and suffix)"
+      },
+      reason: {
+        type: "string",
+        description: "Brief reason why you need to recall (for audit logging)"
+      }
+    },
+    required: ["hash_id"],
+    additionalProperties: false
+  }
+} as const;
+
 const HC_RECALL_INSTRUCTION_MARKER = "<<HC_RECALL_INSTRUCTION_v1>>";
 
 const HC_RECALL_INSTRUCTION = `${HC_RECALL_INSTRUCTION_MARKER}
@@ -654,6 +706,22 @@ const HC_RECALL_INSTRUCTION = `${HC_RECALL_INSTRUCTION_MARKER}
 
 // hash_id 格式校验：8-128 位 hex
 const HASH_PATTERN = /^[0-9a-f]{8,128}$/;
+
+/**
+ * 检测请求 body 的工具 schema 协议
+ * - Anthropic: 工具用 {name, description, input_schema}
+ * - OpenAI:    工具用 {type:"function", function:{...}}
+ * 不存在或无法识别时默认 "OpenAI"（向后兼容原行为）
+ */
+function inferRequestFormat(body: unknown): "anthropic" | "openai" {
+  if (!isRecord(body)) return "openai";
+  const tools = (body as Record<string, unknown>).tools;
+  if (!Array.isArray(tools) || tools.length === 0) return "openai";
+  const sample = tools[0];
+  if (!isRecord(sample)) return "openai";
+  if ("input_schema" in sample) return "anthropic";
+  return "openai";
+}
 
 // ============= history_recall Tool Schema（V3.2 Q&A pair 召回）=============
 
@@ -691,6 +759,39 @@ export const HISTORY_RECALL_TOOL_SCHEMA = {
       required: ["hash_id"],
       additionalProperties: false
     }
+  }
+} as const;
+
+// Anthropic 协议版本
+export const HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC = {
+  name: HISTORY_RECALL_TOOL_NAME,
+  description:
+    "Recall a compressed Q&A pair from conversation history. " +
+    "When you see ⟦QA:hash⟧ placeholders (16-char hex) in the conversation, " +
+    "call this tool to get the original user question and assistant answer. " +
+    "By default only the text content is returned; set with_media=true to include " +
+    "the original image/video/document that was in the question. " +
+    "Only call when you genuinely need the original content to answer accurately.",
+  input_schema: {
+    type: "object",
+    properties: {
+      hash_id: {
+        type: "string",
+        pattern: "^[0-9a-f]{16}$",
+        description: "Hex hash from the ⟦QA:hash⟧ placeholder (without prefix and suffix)"
+      },
+      with_media: {
+        type: "boolean",
+        default: false,
+        description: "If true, include the original image/video/document that was in the user question. Default false (text-only, smaller)."
+      },
+      reason: {
+        type: "string",
+        description: "Brief reason why you need to recall (for audit logging)"
+      }
+    },
+    required: ["hash_id"],
+    additionalProperties: false
   }
 } as const;
 
