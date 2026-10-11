@@ -345,7 +345,7 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
   const body = input.body;
   if (!isRecord(body)) return undefined;
 
-  const messages = body.messages;
+  let messages = body.messages as LLMMessage[];
   const model = (typeof input.routedModel === "string" ? input.routedModel : undefined)
     ?? (typeof body.model === "string" ? body.model : undefined);
 
@@ -357,6 +357,20 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
   const upstreamRequestId = input.requestId && input.requestId.length >= 8
     ? input.requestId
     : randomUUID();
+
+  // PR-1: 客户端 preprocess（删空消息 + task-notif 死信）
+  // CCR_HELIX_PREPROCESS=off 时跳过,行为与之前一致
+  const preprocessEnabled = process.env.CCR_HELIX_PREPROCESS !== "off";
+  if (preprocessEnabled) {
+    messages = clientPreprocess(messages);
+  }
+
+  // PR-2: 客户端 skills reminder 压缩索引（仅当本会话未调 Skill tool 时）
+  // CCR_HELIX_SKILLS_COMPACT=off 时跳过
+  const skillsCompactEnabled = process.env.CCR_HELIX_SKILLS_COMPACT !== "off";
+  if (skillsCompactEnabled) {
+    messages = clientCompactSkills(messages);
+  }
 
   // 1. 调云端压缩
   let compressed: CompressResponse;
@@ -721,6 +735,131 @@ function inferRequestFormat(body: unknown): "anthropic" | "openai" {
   if (!isRecord(sample)) return "openai";
   if ("input_schema" in sample) return "anthropic";
   return "openai";
+}
+
+// ============= PR-1: 客户端 preprocess(空消息 + task-notif 死信) =============
+
+/**
+ * 提取消息文本(content 是 string / array 都支持)
+ */
+function extractMessageText(m: unknown): string {
+  if (!isRecord(m)) return "";
+  const c = (m as Record<string, unknown>).content;
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) {
+    return c.map((b: unknown) => {
+      if (isRecord(b) && typeof (b as Record<string, unknown>).text === "string") {
+        return (b as Record<string, unknown>).text as string;
+      }
+      return "";
+    }).join("");
+  }
+  return "";
+}
+
+/**
+ * 判定消息是否"事实上为空":
+ * - content 是空字符串
+ * - content 是空数组
+ * - content 是 array 且所有文本块都是空字符串/缺失
+ *   (实测本样本 98 条 assistant 是这种形态,光判 length===0 会漏)
+ */
+function isEffectivelyEmpty(m: unknown): boolean {
+  if (!isRecord(m)) return false;
+  const c = (m as Record<string, unknown>).content;
+  if (c === "") return true;
+  if (Array.isArray(c) && c.length === 0) return true;
+  if (Array.isArray(c)) {
+    return c.every((b: unknown) => {
+      if (!isRecord(b)) return false;
+      const t = (b as Record<string, unknown>).text;
+      return !t || (typeof t === "string" && t.trim() === "");
+    });
+  }
+  return false;
+}
+
+/**
+ * 客户端 preprocess 钩子(Helix 不做的事)
+ * - 删除已结束的 <task-notification> 死信
+ * - 删除 assistant / user 事实上为空的消息
+ * - 保留 file_modified 类 <system-reminder>(影响后续 Read 决策)
+ * - 保留 cache_control 字段(Anthropic prompt caching)
+ */
+export function clientPreprocess(messages: LLMMessage[]): LLMMessage[] {
+  return messages.filter((m) => {
+    const text = extractMessageText(m);
+
+    // A1: task-notification 死信
+    // 实测本样本 7 条 task-notif 总 ~3.4 KB / ~850 tokens
+    // 分布在 user 消息顶层,不是 tool_result 块内
+    if (text.includes("<task-notification>") &&
+        text.includes("<retrieval_status>success</retrieval_status>")) {
+      return false;
+    }
+
+    // A2: 空消息
+    // 实测本样本 124 user(content=""空串) + 98 assistant(content 是 [{...empty text...}])
+    if (isEffectivelyEmpty(m)) return false;
+
+    return true;
+  });
+}
+
+// ============= PR-2: 客户端 skills reminder 压缩索引 =============
+
+/**
+ * 压缩后的 skills reminder 索引(原 27 KB → ~3 KB)
+ * 当本会话未调用 Skill tool 时,把 123 个 skill 列表压成目录,
+ * 真正需要时通过 Skill 工具调用(原文会展开)。
+ */
+const COMPRESSED_SKILLS_INDEX = `可用 skills (共 123) 分类索引:
+- ai-drama / novel-* / ads-* / wigolo-* / yt-dlp / hypit / mmx-cli
+- update-config / co-math-* / math-proof / life-decision-guide
+- ego-browser / capture / executor / nuclei / mcp-builder
+- gpt-image-2 / mmx-cli / awesome-gpt-image-api-proxy-skills
+触发词匹配后用 Skill 工具调用(参数=name),无需完整列表。`;
+
+/**
+ * 客户端 skills reminder 压缩(仅当本会话未调 Skill tool 时)
+ * 实测本样本 0 次 Skill 调用,skills reminder 26,686 字节 ≈ 6.7 K tokens;
+ * 压缩索引 ~600 字节 ≈ 150 tokens,节省 ~6.5 K tokens。
+ */
+export function clientCompactSkills(messages: LLMMessage[]): LLMMessage[] {
+  // 判定: 本会话是否调用过 Skill tool?
+  const usedSkill = messages.some((m) =>
+    Array.isArray(m.content) &&
+    m.content.some((b: unknown) =>
+      isRecord(b) && (b as Record<string, unknown>).type === "tool_use" &&
+      (b as Record<string, unknown>).name === "Skill"
+    )
+  );
+  if (usedSkill) return messages;
+
+  // 替换 skills reminder 为压缩索引
+  return messages.map((m): LLMMessage => {
+    const text = extractMessageText(m);
+    if (!text.includes("The following skills are available for use with the Skill tool")) {
+      return m;
+    }
+    // 替换顶层文本;content 是 string 的直接换,array 的找 type=text 块换
+    if (typeof m.content === "string") {
+      return { ...m, content: COMPRESSED_SKILLS_INDEX };
+    }
+    if (Array.isArray(m.content)) {
+      const newContent = m.content.map((b: unknown) => {
+        if (!isRecord(b)) return b;
+        const bRec = b as Record<string, unknown>;
+        if (bRec.type === "text" && typeof bRec.text === "string" &&
+            bRec.text.includes("The following skills are available for use with the Skill tool")) {
+          return { ...bRec, text: COMPRESSED_SKILLS_INDEX };
+        }
+        return b;
+      });
+      return { ...m, content: newContent as LLMMessage["content"] };
+    }
+    return m;
+  });
 }
 
 // ============= history_recall Tool Schema（V3.2 Q&A pair 召回）=============
