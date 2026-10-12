@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { ApiKeyConfig, AppConfig, GatewayStatus, RouteScriptTestRequest, RouteScriptTestResult, RouteScriptValidationRequest, RouteScriptValidationResult, RouterRule } from "@ccr/core/contracts/app";
 import { NO_AVAILABLE_GATEWAY_MODELS_MESSAGE, hasAvailableGatewayModels } from "@ccr/core/contracts/app";
-import { loadAppConfig } from "@ccr/core/config/config";
+import { loadAppConfig, saveAppConfig } from "@ccr/core/config/config";
 import { backendService } from "@ccr/core/plugins/backend-service";
 import { getSystemProxyUrlForProtocol } from "@ccr/core/proxy/system-proxy-fetch";
 import { pluginService } from "@ccr/core/plugins/service";
@@ -630,6 +630,19 @@ class GatewayService {
         }
       } else {
         await this.updateConfig(nextConfig);
+      }
+      // helix V1.2 / 2026-10-13: reload 成功后,确保 saved config 的 revision
+      //   跟 in-memory 一致。否则 ccr UI 会反复 push 同一个 config,触发 timeout。
+      //   用 saveAppConfig 写回(无变化时 SQLite 不写,不会浪费 IO)。
+      try {
+        const currentSaved = await loadAppConfig();
+        const currentRunning = this.config;
+        if (currentRunning && gatewayRuntimeConfigRevision(currentRunning) !== gatewayRuntimeConfigRevision(currentSaved)) {
+          await saveAppConfig({ ...currentSaved, Providers: currentRunning.Providers });
+        }
+      } catch (writebackErr) {
+        // 写回失败不阻塞 reload,但记 log 提示 ops
+        console.warn(`[gateway] Could not writeback running config to disk: ${formatError(writebackErr)}`);
       }
       this.runtimeConfigReloadError = undefined;
     } catch (error) {

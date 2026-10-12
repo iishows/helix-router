@@ -2,6 +2,7 @@ import { loadAppConfig, saveAppConfig } from "@ccr/core/config/config";
 import {
   isGatewayProviderEnabled,
   type AppConfig,
+  type GatewayProviderCapability,
   type GatewayProviderCapabilityProtocol,
   type GatewayProviderConfig,
   type GatewayProviderProtocol,
@@ -147,19 +148,35 @@ export async function refreshAutoFetchProviderModels(
       const addedModels = hasKnownModelBaseline ? modelsNotIn(knownModels, fetchedModels) : [];
       const mergedModels = mergeModelLists(provider.models, addedModels);
       const nextKnownModels = mergeModelLists(knownModels, fetchedModels);
+
+      // helix V1.2 / 2026-10-13: 同时 sync capabilities + api_base_url 到 saved config。
+      //   不然 auto-refresh 只更新 model 列表,probe 探测到的新 baseUrl 永远不写回,
+      //   saved revision 跟不上 in-memory,触发 ccr 一直 push config 超时。
+      //   probe.ts 的 preferVersionedOpenAiBaseUrls 已经保证 /v1 候选优先,
+      //   这里只做"无脑覆盖"——probe 说啥就是啥。
+      const probedCapabilities = Array.isArray(probe.capabilities) ? probe.capabilities : undefined;
+      const nextApiBaseUrl = probe.normalizedBaseUrl || provider.api_base_url;
+      const capabilitiesChanged = probedCapabilities && !sameProviderCapabilities(provider.capabilities, probedCapabilities);
+      const apiBaseUrlChanged = nextApiBaseUrl && nextApiBaseUrl !== provider.api_base_url;
+
       providerResults.push({
         addedModels,
         fetchedModels,
         provider: providerName,
         providerIndex
       });
-      if (addedModels.length === 0 && sameModelList(provider.autoFetchKnownModels, nextKnownModels)) {
+      if (addedModels.length === 0
+          && sameModelList(provider.autoFetchKnownModels, nextKnownModels)
+          && !capabilitiesChanged
+          && !apiBaseUrlChanged) {
         continue;
       }
 
       const nextProvider = {
         ...provider,
+        api_base_url: apiBaseUrlChanged ? nextApiBaseUrl : provider.api_base_url,
         autoFetchKnownModels: nextKnownModels.length > 0 ? nextKnownModels : undefined,
+        capabilities: capabilitiesChanged ? probedCapabilities : provider.capabilities,
         modelDisplayNames: mergeProviderModelDisplayNames(provider.modelDisplayNames, discovered.modelDisplayNames, mergedModels),
         modelMetadata: mergeProviderModelMetadata(provider.modelMetadata, discovered.modelMetadata, mergedModels),
         models: mergedModels
@@ -669,6 +686,18 @@ function sameModelList(left: string[] | undefined, right: string[] | undefined):
     return false;
   }
   return normalizedLeft.every((model, index) => model.toLowerCase() === normalizedRight[index].toLowerCase());
+}
+
+function sameProviderCapabilities(
+  left: GatewayProviderCapability[] | undefined,
+  right: GatewayProviderCapability[] | undefined
+): boolean {
+  if (!left && !right) return true;
+  if (!left || !right) return false;
+  if (left.length !== right.length) return false;
+  const a = left.map((c) => `${c.type}@${c.baseUrl}|${c.endpoint ?? ""}`).sort();
+  const b = right.map((c) => `${c.type}@${c.baseUrl}|${c.endpoint ?? ""}`).sort();
+  return a.every((v, i) => v === b[i]);
 }
 
 function mergeModelLists(...groups: string[][]): string[] {

@@ -1465,14 +1465,14 @@ function endpointsForProtocol(
   model: string | undefined
 ): ProtocolEndpoint[] {
   if (protocol === "openai_responses") {
-    return parsed.openaiBaseUrlCandidates.map((baseUrl) => ({
+    return preferVersionedOpenAiBaseUrls(parsed.openaiBaseUrlCandidates).map((baseUrl) => ({
       baseUrl,
       endpoint: `${baseUrl}/responses`
     }));
   }
 
   if (protocol === "openai_chat_completions") {
-    return parsed.openaiBaseUrlCandidates.map((baseUrl) => ({
+    return preferVersionedOpenAiBaseUrls(parsed.openaiBaseUrlCandidates).map((baseUrl) => ({
       baseUrl,
       endpoint: `${baseUrl}/chat/completions`
     }));
@@ -1505,14 +1505,14 @@ function endpointsForProtocol(
   }
 
   if (protocol === "openai_image_generations") {
-    return parsed.openaiBaseUrlCandidates.map((baseUrl) => ({
+    return preferVersionedOpenAiBaseUrls(parsed.openaiBaseUrlCandidates).map((baseUrl) => ({
       baseUrl,
       endpoint: `${baseUrl}/images/generations`
     }));
   }
 
   if (protocol === "openai_video_generations" || protocol === "xai_video_generations") {
-    return parsed.openaiBaseUrlCandidates.map((baseUrl) => ({
+    return preferVersionedOpenAiBaseUrls(parsed.openaiBaseUrlCandidates).map((baseUrl) => ({
       baseUrl,
       endpoint: `${baseUrl}/videos/generations`
     }));
@@ -1533,6 +1533,32 @@ function geminiApiEndpoint(baseUrl: string, path: string, defaultVersion: "v1" |
     return `${normalizedBaseUrl}/${path}`;
   }
   return `${normalizedBaseUrl}/${defaultVersion}/${path}`;
+}
+
+/**
+ * 排序 OpenAI 候选 baseUrl,让 /v1 路径排在前面。
+ *
+ * 背景:auto-refresh 调用 probe 时会按 candidates 顺序试,第一个
+ * supported 的会被存到 config.sqlite 的 capabilities[].baseUrl。
+ * 如果 non-/v1 路径在某些 upstream 也返回 200(例如某些 nginx 配错
+ * 把 /chat/completions 也路由了),ccr 会把无 /v1 的 baseUrl 写回,
+ * 后续真正调用 ccr→upstream 就 404。把 /v1 候选排在前面后:
+ *   - 真 OpenAI-compatible 路径(/v1/chat/completions)先试
+ *   - 选中的 capabilities[].baseUrl 永远是 /v1 形式
+ *   - 如果 /v1 真的不通,fallback 到 non-/v1 不受影响
+ */
+function preferVersionedOpenAiBaseUrls(candidates: string[]): string[] {
+  return candidates.slice().sort((a, b) => {
+    const aVersioned = isVersionedOpenAiBaseUrl(a);
+    const bVersioned = isVersionedOpenAiBaseUrl(b);
+    if (aVersioned && !bVersioned) return -1;
+    if (!aVersioned && bVersioned) return 1;
+    return 0;
+  });
+}
+
+function isVersionedOpenAiBaseUrl(value: string): boolean {
+  return /\/v[0-9]+(?:\.[0-9]+)?(?:[/?#]|$)/i.test(value);
 }
 
 function withGeminiKey(url: string, apiKey: string | undefined): string {
