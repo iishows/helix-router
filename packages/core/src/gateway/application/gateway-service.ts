@@ -402,7 +402,21 @@ class GatewayService {
   async updateConfig(config: AppConfig): Promise<void> {
     assertLoopbackCoreHost(config.gateway.coreHost);
     if (this.status.gatewayManagedExternally) {
-      await this.reloadExternalGatewayConfig(config, false);
+      // helix V1.2 / 2026-10-13: 防止死循环。
+      //   旧实现调 reloadExternalGatewayConfig → POST 给自己 → 等 running 改 revision
+      //   → 但 saved 写回后 running 还是 in-memory 旧值 → 超时 → 反复。
+      //   外部 gateway 的 config 由 UI 管,这边只是占位:
+      //   - 同步 in-memory config(this.config)
+      //   - 重建 plugin(让 plugin.config 也是新值,GET /__ccr/runtime/config 才返回新 revision)
+      //   - 不触发 reload loop
+      this.config = config;
+      if (this.routeScriptRuntime && this.plugin) {
+        const scriptValidationErrors = await this.routeScriptRuntime.prepare(config.Router.rules);
+        this.plugin = new ClaudeCodeRouterPlugin(config, {
+          scriptRuntime: this.routeScriptRuntime,
+          scriptValidationErrors
+        });
+      }
       return;
     }
     if (this.config && this.status.state === "running" &&
