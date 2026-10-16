@@ -548,10 +548,21 @@ function selectToolResultCandidates(
   if (opts.threshold <= 0 || opts.maxCount <= 0) return [];
 
   // 先收集全部 tool_result 出现位置(按消息逆序)以定位"最近 N 条"
+  // 两种形状都收:
+  //   ① Anthropic:`{role, content:[{type:"tool_result", content:<str|block[]>}]}`
+  //   ② OpenAI:`{role:"tool", content:"<str>", tool_call_id}` —— 真实 Claude Code
+  //      经 ccr 转成 OpenAI chat 形状后,tool 输出是**顶层字符串**,不是数组块。
+  //      旧实现只扫数组块 → 真实流量里 95% 工具输出从不被压缩(最大杠杆漏压)。
   const all: Array<{ msgIdx: number; blockIdx: number; block: Record<string, unknown>; text: string }> = [];
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
-    if (!msg || !Array.isArray(msg.content)) continue;
+    if (!msg) continue;
+    if (msg.role === "tool" && typeof msg.content === "string") {
+      // OpenAI 形状:blockIdx=-1 表示整条消息内容(string)就是 tool 输出。
+      all.push({ msgIdx: i, blockIdx: -1, block: msg as unknown as Record<string, unknown>, text: msg.content });
+      continue;
+    }
+    if (!Array.isArray(msg.content)) continue;
     for (let bi = 0; bi < msg.content.length; bi++) {
       const b = msg.content[bi] as Record<string, unknown> | undefined;
       if (!b || typeof b !== "object" || b.type !== "tool_result") continue;
@@ -630,6 +641,12 @@ function collectBlockCandidates(
 /** 把 block 候选的占位符写回消息(tool_result 保留 block 与 tool_use_id,只换 content)。 */
 function applyBlockCandidate(m: LocalCompressMessage, bc: BlockCandidate): void {
   const content = m.content;
+  // OpenAI 形状的 role:"tool" 消息:content 是顶层字符串,blockIdx=-1 → 整条换占位符。
+  //   保留 role / tool_call_id,只替换 content(与 Anthropic tool_result 的"只换 content"语义一致)。
+  if (bc.blockIdx === -1) {
+    if (typeof content === "string") m.content = bc.placeholder;
+    return;
+  }
   if (!Array.isArray(content) || bc.blockIdx < 0 || bc.blockIdx >= content.length) {
     // 顶层字符串(仅 text 候选)
     if (typeof content === "string") m.content = bc.placeholder;

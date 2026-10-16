@@ -514,3 +514,37 @@ test("tool-dense history is no longer skipped as 'too short' (shouldSkipMessage 
     "工具密集历史必须被压缩(旧算法只数 text 块导致 0)"
   );
 });
+
+// ============= OpenAI 形状的 tool 输出必须被压缩(真实 Claude Code 流量) =============
+// 真实流量经 ccr 转成 OpenAI chat 形状:tool 输出是 `{role:"tool", content:"<字符串>"}`,
+// 不是 Anthropic 的 `content:[{type:"tool_result"}]` 数组块。旧实现只扫数组块 →
+// 真实流量 95% 工具输出(占 body 大半)从不被压缩、原样明文发给上游。
+
+test("OpenAI role:tool string output is compressed (real Claude Code shape)", () => {
+  const body = "SECRET-marker " + "y".repeat(3000);
+  const msgs = [
+    { role: "system", content: "sys" },
+    { role: "user", content: "run cmd" },
+    { role: "assistant", content: "running", tool_calls: [{ id: "c1", type: "function", function: { name: "Bash", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "c1", content: body },
+    { role: "user", content: "next" }
+  ];
+  const r = compressV3x(msgs, { keepRecentToolResults: 0 });
+  const hash = computeHash(body);
+  assert.ok(r.hashMap[hash], "OpenAI role:tool 的字符串输出必须进召回缓存");
+  const toolMsg = r.messages.find((m) => m.role === "tool");
+  assert.equal(toolMsg.content, `⟦QA:${hash}⟧`, "tool 消息内容应被替换为占位符");
+  assert.equal(toolMsg.tool_call_id, "c1", "tool_call_id 必须保留(与原 tool_use 配对)");
+});
+
+test("OpenAI role:tool below threshold stays plaintext", () => {
+  const msgs = [
+    { role: "system", content: "sys" },
+    { role: "user", content: "run cmd" },
+    { role: "assistant", content: "running", tool_calls: [{ id: "c1", type: "function", function: { name: "Bash", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "c1", content: "short output" },
+    { role: "user", content: "next" }
+  ];
+  const r = compressV3x(msgs, { keepRecentToolResults: 0 });
+  assert.equal(r.messages.find((m) => m.role === "tool").content, "short output");
+});
