@@ -1,4 +1,5 @@
 import type {
+  CompressionProactiveCompactStat,
   RequestLogBody,
   RequestLogEntry
 } from "@ccr/core/contracts/app";
@@ -40,15 +41,12 @@ function formatTokenCount(n: number): string {
 
 /**
  * 读取 helix-compressor plugin 写入的 headers,生成压缩状态摘要。
+ * v1.7: cell 只显示「净端到端节省」百分比 = (baseline - 上游实收) / baseline,
+ *   其中上游实收 = input_tokens + cache_read_tokens(含 history_recall 回填的原文)。
+ *   这才是"真正省了多少";纯压缩比 baseline→post 不再放 cell。
+ *   完整分解(压缩后 post / 净额 / 召回回填 / content chars / hash / scenario)进 title,
+ *   点击行展开详情(LogCompressDetails)有同样的数字。
  * v1.6: baseline 用真 tokenizer (gpt-tokenizer cl100k_base) 算 user messages 的 token 数。
- *   显示格式:
- *     - chars 压缩了:`3,127→21 (99.3%) · 560 tok (user) · 549 tok (LLM)`
- *     - pass-through:`未压缩 · 560 tok (user) · 549 tok (LLM)`
- *   不再算 e2e 比例(实际 LLM input 含 system+tool+cache,baseline 只算 user messages,
- *   两边维度不同,比 % 一定误导)。
- *   显示 baseline + actual 两个独立数字,让用户自己看:
- *     - 两者接近 → user messages ≈ 整个 context(干净请求,小)
- *     - baseline << actual → 大头是 system/tool/cache(从 cache 数也能看出来)
  * v1.2: 兼容 cli serve 模式下 response_headers 为空的场景——
  *   plugin transform 实际跑了(stats.ratio 写入 request_headers),
  *   但 CCR 本地 pipeline 的 response_headers 是 {}。
@@ -67,10 +65,13 @@ export function formatLogCompressSummary(
     || readHeaderNumber(requestHeaders["x-helix-compressor-output-chars"]);
   const ratioHeader = readHeaderNumber(headers["x-helix-compressor-ratio"])
     || readHeaderNumber(requestHeaders["x-helix-compressor-ratio"]);
-  const baselineTokens = readHeaderNumber(headers["x-helix-compressor-baseline-tokens"])
-    || readHeaderNumber(requestHeaders["x-helix-compressor-baseline-tokens"]);
-  const compressedTokens = readHeaderNumber(headers["x-helix-compressor-compressed-tokens"])
-    || readHeaderNumber(requestHeaders["x-helix-compressor-compressed-tokens"]);
+  // helix V1.2 / 2026-10-13: 优先用 entry 字段(从 DB compression_* 列读),fallback 到 headers(老数据/transform 时)
+  const baselineTokens = entry.compressionBaselineTokens
+    ?? readHeaderNumber(headers["x-helix-compressor-baseline-tokens"])
+    ?? readHeaderNumber(requestHeaders["x-helix-compressor-baseline-tokens"]) ?? 0;
+  const compressedTokens = entry.compressionPostTokens
+    ?? readHeaderNumber(headers["x-helix-compressor-compressed-tokens"])
+    ?? readHeaderNumber(requestHeaders["x-helix-compressor-compressed-tokens"]) ?? 0;
   const scenario = readHeaderString(headers["x-helix-compressor-scenario"])
     || readHeaderString(requestHeaders["x-helix-compressor-scenario"]);
   // V3.2: Q&A pair 压缩占位数(⟦QA:hash⟧ 出现次数)
@@ -84,6 +85,13 @@ export function formatLogCompressSummary(
   const inputTokens = typeof entry.inputTokens === "number" ? entry.inputTokens : 0;
   const cacheReadTokens = typeof entry.cacheReadTokens === "number" ? entry.cacheReadTokens : 0;
   const freshTokens = Math.max(0, inputTokens - cacheReadTokens);
+  // helix V1.4 / 2026-10-15: "净额" = 上游实际收到的 prompt token 总量
+  //   = input_tokens + cache_read_tokens(MiniMax 命中 prompt cache 时 input_tokens
+  //   只计未缓存部分,cache_read 才是命中部分,两者之和才等于上游看到的 prompt)。
+  //   与"压缩后"(post)分开显示:post 是 transform 出口的 messages(纯压缩),
+  //   净额是真正发往 provider 的 prompt —— 含模型调用 history_recall 后回填进来的原文。
+  //   两者之差 = 召回回填的代价。
+  const netPromptTokens = inputTokens + cacheReadTokens;
 
   // 没经过 helix / 跳过 / silent fail → -
   if (!enabled && ratioHeader === 0 && (inputChars === 0 || outputChars === 0) && inputTokens === 0) {
@@ -93,26 +101,35 @@ export function formatLogCompressSummary(
   // 内容压缩率(chars 维度)
   const contentRatio = ratioHeader > 0 ? ratioHeader : inputChars > 0 ? 1 - outputChars / inputChars : 0;
   const contentRatioPct = (contentRatio * 100).toFixed(1);
-  const charsCompressed = inputChars > 0 && outputChars > 0 && outputChars < inputChars;
-  const isPassThrough = inputChars > 0 && outputChars === inputChars;
 
-  // cell 文本:全 token 视图(避免 chars/tokens 混用歧义)
-  //   压缩了:`~14,890→1,400 tok (91%)` — 原始 vs 压缩后 messages,真 tokenizer 算
-  //   pass-through:`未压缩 · 549 tok` — chars 没变,但 LLM 看到 N tok
-  //   只有一个:fallback
-  let text: string;
+  // cell 文本:只显示"净端到端节省"百分比。
+  //   helix 2026-10-16 修正口径:节省必须与 baseline **同域**(都只算 messages)。
+  //   baseline = 原始 messages(gpt-tokenizer);post = 压缩后 messages;
+  //   召回回填 = 模型调 history_recall 后回填进 messages 的原文 token。
+  //   saved = baseline − (post + 召回回填)。
+  //   ⚠️ 旧公式用 (input_tokens + cache_read) 当被减项是**跨域比较**:那是上游收到的全量
+  //   prompt(含 system + tools,从不被 helix 压缩),拿它减 messages 口径的 baseline 会凭空
+  //   产生等于 system+tools 的"负债",把真实节省抹成"无净节省"。system/tools 的开销由
+  //   「上下文开销」一栏单独呈现,不进节省率。
   const hasBaseline = baselineTokens > 0;
   const hasCompressed = compressedTokens > 0 && compressedTokens < baselineTokens;
-  const hasActual = inputTokens > 0;
+  const recallTokens = entry.compressionRecallTokens ?? 0;
+  const messagesAfterRecall = compressedTokens + recallTokens;
+  const e2eSaved = hasCompressed && messagesAfterRecall > 0
+    ? Math.max(0, baselineTokens - messagesAfterRecall)
+    : 0;
+  const e2eSavedPct = e2eSaved > 0 ? (e2eSaved / baselineTokens) * 100 : 0;
 
-  if (hasBaseline && hasCompressed) {
-    // 主视图:全 token 维度(K/M 缩写)
-    const saved = baselineTokens - compressedTokens;
-    const pct = (saved / baselineTokens * 100);
-    text = `${formatTokenCount(baselineTokens)}→${formatTokenCount(compressedTokens)} tok (-${pct.toFixed(1)}%)`;
+  let text: string;
+  if (e2eSaved > 0) {
+    // 净端到端节省(含召回回填的代价)
+    text = `-${e2eSavedPct.toFixed(1)}%`;
+  } else if (hasBaseline && hasCompressed) {
+    // 压缩了,但召回把原文基本捞回(messages 口径下无净节省)
+    text = "无净节省";
   } else if (hasBaseline) {
-    // baseline 有但 compressed 没拿到(老 header)
-    text = `${formatTokenCount(baselineTokens)} tok`;
+    // helix 跑了但没有可压缩内容(post == baseline)→ pass-through,未压缩
+    text = "未压缩";
   } else if (inputTokens > 0) {
     text = `${formatTokenCount(inputTokens)} tok`;
   } else if (inputChars > 0) {
@@ -120,37 +137,22 @@ export function formatLogCompressSummary(
   } else {
     text = "-";
   }
-  if (hasActual && hasBaseline) {
-    // e2e 真实节省(账单维度):actual_cost vs baseline_cost(假设全部重算)
-    //   baseline_cost = pre_tokens × P_in + output × P_out
-    //   节省 % = 1 - actual_cost / baseline_cost
-    //   缓存命中按 M3 折价(~0.1× input)算,不算免费
-    const P_IN = 0.55;       // 反推实测: $0.55/M input
-    const P_OUT = 2.76;      // 反推实测: $2.76/M output (5x input)
-    const outputTokens = entry.outputTokens ?? 0;
-    const baselineCost = (baselineTokens * P_IN + outputTokens * P_OUT) / 1_000_000;
-    const actualCost = entry.costUsd ?? 0;
-    const e2eSaved = baselineCost - actualCost;
-    const e2ePct = baselineCost > 0 ? (e2eSaved / baselineCost * 100) : 0;
-    text += ` · e2e -$${e2eSaved.toFixed(4)} (-${e2ePct.toFixed(1)}%)`;
-  } else if (hasActual) {
-    // 没 baseline(老数据),只显示 actual
-    text += ` · LLM ${formatTokenCount(inputTokens)}`;
-  }
-  // V3.2: 标注 Q&A pair 压缩占位数
-  if (qaCompressed > 0) {
-    text += ` · ${qaCompressed} QA 占位`;
-  }
 
-  // title:完整事实(全 token,chars 只作补充)
+  // title:悬停显示完整分解(点击行展开详情有同样的数字)。cell 已被砍到只剩净端到端 %。
   const titleParts: string[] = [];
   if (baselineTokens > 0) {
-    titleParts.push(`user msgs baseline ${baselineTokens.toLocaleString()} tok (gpt-tokenizer)`);
+    titleParts.push(`messages baseline ${baselineTokens.toLocaleString()} tok (gpt-tokenizer)`);
   }
-  if (compressedTokens > 0 && compressedTokens < baselineTokens) {
-    const saved = baselineTokens - compressedTokens;
-    const pct = (saved / baselineTokens * 100).toFixed(1);
-    titleParts.push(`压缩后 msgs ${compressedTokens.toLocaleString()} tok (省 ${saved.toLocaleString()}, -${pct}%)`);
+  if (e2eSaved > 0) {
+    // 净端到端节省(含召回回填的代价)
+    titleParts.push(`净端到端节省 -${e2eSavedPct.toFixed(1)}% (省 ${e2eSaved.toLocaleString()} tok)`);
+  } else if (hasBaseline && hasCompressed) {
+    titleParts.push("messages 口径无净节省(召回把原文捞回)");
+  }
+  if (compressedTokens > 0 && hasCompressed) {
+    const savedPost = baselineTokens - compressedTokens;
+    const pctPost = (savedPost / baselineTokens * 100).toFixed(1);
+    titleParts.push(`压缩后 msgs ${compressedTokens.toLocaleString()} tok (纯压缩省 ${savedPost.toLocaleString()}, -${pctPost}%)`);
   } else if (compressedTokens > 0) {
     titleParts.push(`压缩后 msgs ${compressedTokens.toLocaleString()} tok (=baseline,pass-through)`);
   }
@@ -161,10 +163,31 @@ export function formatLogCompressSummary(
       titleParts.push(`本请求新 token ${freshTokens.toLocaleString()}`);
     }
   }
+  // helix V1.4 / 2026-10-15: 净额栏(上游实收 prompt = input + cache_read)。
+  //   与"压缩后 msgs"是不同计量点:净额是真正发往 provider 的 prompt。
+  //   2026-10-16: 净额 − post 拆成「召回回填」(compressionRecallTokens 真值)+「上下文开销」
+  //   (system/tools)。注意:净额**含** system/tools,与 messages 口径的节省率不同域,
+  //   故只作展示、不参与节省率计算。
+  if (netPromptTokens > 0 && hasCompressed) {
+    const overhead = Math.max(0, netPromptTokens - compressedTokens - recallTokens);
+    const recallPart = recallTokens > 0 ? `, 召回回填 +${recallTokens.toLocaleString()}` : "";
+    const overheadPart = overhead > 0 ? `, 上下文开销(system/tools) +${overhead.toLocaleString()}` : "";
+    titleParts.push(`净额(上游实收 prompt) ${netPromptTokens.toLocaleString()} tok = input ${inputTokens.toLocaleString()} + cache_read ${cacheReadTokens.toLocaleString()}${recallPart}${overheadPart}`);
+  }
   if (inputChars > 0) {
     titleParts.push(`内容 ${inputChars.toLocaleString()}→${outputChars.toLocaleString()} chars (${contentRatioPct}%)`);
   }
+  // helix V1.4 / 2026-10-15: 主动 compact(压缩后仍超预算 → 折叠更早历史成摘要)
+  const compact = logProactiveCompact(entry);
+  if (compact) {
+    const sourceLabel = compactSourceLabel(compact.source);
+    const budgetPart = compact.budgetTokens !== undefined ? ` · 预算 ${compact.budgetTokens.toLocaleString()} tok` : "";
+    titleParts.push(
+      `主动 compact(${sourceLabel}): 折叠 ${compact.foldedCount.toLocaleString()} 条 · ${compact.preCompactTokens.toLocaleString()}→${compact.tokensAfter.toLocaleString()} tok${budgetPart}`
+    );
+  }
   if (hashCount > 0) titleParts.push(`hash 占位 ${hashCount}`);
+  if (qaCompressed > 0) titleParts.push(`Q&A 对占位 ${qaCompressed}`);
   if (scenario) titleParts.push(`场景 ${scenario}`);
   return { text, title: titleParts.join(" · ") };
 }
@@ -174,6 +197,60 @@ function readHeaderNumber(value: string | string[] | undefined): number {
   const s = Array.isArray(value) ? value[0] : value;
   const n = Number(s);
   return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * helix V1.4 / 2026-10-15: 读取主动 compact 明细。
+ * 优先 entry.compressionProactiveCompact(DB 列),fallback 到 response header。
+ * 生产落库的 request_headers 里 `x-ccr-*` 会被 sanitize 剥掉,存活的是
+ * `x-helix-compressor-compact-json`;两个 key 都读以兼容两种通道。
+ */
+export function logProactiveCompact(
+  entry: RequestLogEntry
+): CompressionProactiveCompactStat | undefined {
+  if (entry.compressionProactiveCompact) {
+    return entry.compressionProactiveCompact;
+  }
+  return parseCompactHeader(entry.responseHeaders?.["x-ccr-helix-compact-json"])
+    ?? parseCompactHeader(entry.requestHeaders?.["x-helix-compressor-compact-json"])
+    ?? parseCompactHeader(entry.requestHeaders?.["x-ccr-helix-compact-json"]);
+}
+
+function parseCompactHeader(
+  value: string | string[] | undefined
+): CompressionProactiveCompactStat | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== "string" || !raw.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isPlainRecord(parsed) || typeof parsed.source !== "string") return undefined;
+    const num = (v: unknown): number | undefined =>
+      typeof v === "number" && Number.isFinite(v) ? v : undefined;
+    const tokensAfter = num(parsed.tokensAfter);
+    const preCompactTokens = num(parsed.preCompactTokens);
+    if (tokensAfter === undefined || preCompactTokens === undefined) return undefined;
+    const summaryTokens = num(parsed.summaryTokens);
+    const budgetTokens = num(parsed.budgetTokens);
+    return {
+      coveredCount: num(parsed.coveredCount) ?? 0,
+      foldedCount: num(parsed.foldedCount) ?? 0,
+      preCompactTokens,
+      source: parsed.source,
+      ...(summaryTokens !== undefined ? { summaryTokens } : {}),
+      ...(budgetTokens !== undefined ? { budgetTokens } : {}),
+      tokensAfter
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export function compactSourceLabel(source: string): string {
+  if (source === "cache") return "缓存命中";
+  if (source === "accumulate") return "复用小摘要";
+  if (source === "incremental") return "增量合并";
+  if (source === "model") return "模型摘要";
+  return source || "未知";
 }
 
 function readHeaderString(value: string | string[] | undefined): string {

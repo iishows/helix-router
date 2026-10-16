@@ -12,6 +12,7 @@ import {
 } from "@ccr/core/models/pricing-service";
 import { createBetterSqliteDatabase, type BetterSqliteDatabase, type BetterSqliteStatement } from "@ccr/core/storage/sqlite-native";
 import { normalizeUsageInputTokens } from "@ccr/core/usage/normalization";
+import type { CompressionStat } from "@ccr/core/observability/compression-stats-store";
 import {
   createRequestLogRuntime,
   suppressRequestLogRawTraceBodies,
@@ -49,6 +50,7 @@ import type {
   AgentObservabilityErrorRow,
   AgentObservabilityRouteRow,
   AgentKind,
+  CompressionProactiveCompactStat,
   GatewayProviderProtocol,
   ProviderModelPricing,
   RequestLogBody,
@@ -119,6 +121,11 @@ export type RequestLogRecordInput = {
   bodyCapturePolicy?: "all" | "errors" | "none";
   captureBody?: boolean;
   client?: string;
+  // helix V1.2 / 2026-10-13: helix 压缩 token 统计(从 compressionStatsStore 读)
+  // helix V1.4 / 2026-10-15: 含主动 compact 明细(proactiveCompact),一并落库
+  compressionStats?: Pick<CompressionStat, "preCompressionTokens" | "postCompressionTokens" | "proactiveCompact">;
+  // helix 2026-10-16: recall(hc_recall/history_recall)回填的原文 token 数(网关 recall loop 累计)。
+  compressionRecallTokens?: number;
   completedAt?: string;
   durationMs: number;
   error?: string;
@@ -159,6 +166,8 @@ export type RequestLogRawTraceUpdateInput = {
   bundleId?: string;
   client?: string;
   completedAt?: string;
+  // helix 2026-10-16: recall 回填的原文 token 数(从网关 internal_tool_stats 反解)。
+  compressionRecallTokens?: number;
   deferBodyCaptureUntilRecord?: boolean;
   deferOutcomeUntilRecord?: boolean;
   durationMs?: number;
@@ -226,6 +235,16 @@ type StoredRequestLogEntry = {
   cacheReadTokens: number;
   cacheWriteTokens: number;
   client: string;
+  // helix V1.2 / 2026-10-13: 4 个 helix 压缩 token 统计列
+  compressionBaselineTokens?: number;
+  compressionBilledTokens?: number;
+  compressionPostTokens?: number;
+  // helix V1.4 / 2026-10-15: 主动 compact 明细
+  compressionProactiveCompact?: CompressionProactiveCompactStat;
+  // helix 2026-10-16: recall(hc_recall/history_recall)回填的原文 token 数。
+  //   用于「真实端到端节省」——上游实收 = post + 召回回填 + system/tools。
+  compressionRecallTokens?: number;
+  compressionSubmittedTokens?: number;
   completedAt: string;
   costUsd: number | undefined;
   createdAt: string;
@@ -713,6 +732,14 @@ export class RequestLogStore {
         total_tokens,
         cost_usd,
         pricing_json,
+        -- helix V1.2 / 2026-10-13: helix 压缩 token 统计(从 compressionStatsStore 读)
+        compression_baseline_tokens,
+        compression_post_tokens,
+        compression_submitted_tokens,
+        compression_billed_tokens,
+        compression_recall_tokens,
+        -- helix V1.4 / 2026-10-15: 主动 compact 明细(JSON)
+        compression_proactive_compact_json,
         request_headers,
         response_headers,
         request_body_text,
@@ -729,11 +756,36 @@ export class RequestLogStore {
         response_body_ref,
         stream_metrics_json,
         error
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     let inserted = false;
     const insert = () => {
+      // helix V1.4 / 2026-10-13: 兜底 — daemon 经 IPC 推给 worker 时 compressionStats 偶发丢失
+      // (raw-trace sync 的二次入队路径尤其明显)。在 worker 端从 headers 重新解析
+      // x-helix-compressor-baseline-tokens / -compressed-tokens,作为 input.compressionStats 的 fallback。
+      // 2026-10-15: compact 明细同理 —— 单网关模式下 headers 是唯一跨进程通道。
+      //   注意:`x-ccr-*` header 在落到 request_headers 列之前会被
+      //   sanitizeUpstreamProviderHeaders 剥掉,所以生产环境 request_headers 里能存活的是
+      //   `x-helix-compressor-compact-json`(transform 侧刻意加的同义别名)。两个都读,
+      //   优先取 requestHeaders(DB trigger 通道),fallback responseHeaders(同进程 UI)。
+      const pickHeader = (name: string): string | undefined =>
+        headerValue(requestHeaders as any, name) ?? headerValue(responseHeaders as any, name);
+      const pickCompactJson = (): string | undefined =>
+        pickHeader("x-helix-compressor-compact-json") ?? pickHeader("x-ccr-helix-compact-json");
+      let cs = input.compressionStats;
+      if (!cs) {
+        const baseline = pickHeader("x-helix-compressor-baseline-tokens");
+        const compressed = pickHeader("x-helix-compressor-compressed-tokens");
+        if (baseline || compressed) {
+          cs = {
+            preCompressionTokens: baseline ? Number(baseline) || undefined : undefined,
+            postCompressionTokens: compressed ? Number(compressed) || undefined : undefined
+          };
+        }
+      }
+      const proactiveCompact = cs?.proactiveCompact
+        ?? parseProactiveCompactJson(pickCompactJson());
       const result = statement.run(
         input.startedAt,
         input.completedAt ?? new Date().toISOString(),
@@ -767,6 +819,24 @@ export class RequestLogStore {
         totalTokens,
         cost?.amountUsd ?? null,
         input.pricing ? JSON.stringify(input.pricing) : "",
+        // helix V1.2 / 2026-10-13: 4 个 compression_* 列
+        // compression_baseline_tokens = preCompressionTokens (原始 msgs)
+        // compression_post_tokens     = postCompressionTokens (压缩后 msgs)
+        // compression_submitted_tokens = postCompressionTokens (ccr 实际提交的压缩 body)
+        //   之前写 input+cacheRead = LLM 报告的全量 prompt(含 server-side cache 累积),
+        //   跟本次 ccr 提交量无关,UI 显示"35万"让用户误以为没压缩。
+        // compression_billed_tokens   = input+cache+cacheWrite+output (provider 账单维度)
+        cs?.preCompressionTokens ?? 0,
+        cs?.postCompressionTokens ?? 0,
+        // helix V1.2 / 2026-10-13: 之前写 input+cacheRead = LLM 报告的全量 prompt(含 server-side
+        //   cache 累积),跟本次 ccr 提交量无关,UI 显示"35万"让用户误以为没压缩。改成
+        //   postCompressionTokens —— ccr 实际提交给 LLM 的就是压缩后 body,这个值就是它。
+        cs?.postCompressionTokens ?? 0,
+        (inputTokens ?? 0) + (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0) + (outputTokens ?? 0),
+        // helix 2026-10-16: recall 回填原文 token(网关 recall loop 累计)
+        normalizeCount(input.compressionRecallTokens),
+        // helix V1.4 / 2026-10-15: 主动 compact 明细(JSON)
+        proactiveCompact ? JSON.stringify(proactiveCompact) : "",
         JSON.stringify(requestHeaders),
         JSON.stringify(responseHeaders),
         requestBody.text,
@@ -924,9 +994,25 @@ export class RequestLogStore {
     }
     if (mergedRequestHeaders) {
       pushValue("request_headers", JSON.stringify(mergedRequestHeaders));
+      // helix V1.4 / 2026-10-15: DB trigger 只认固定的 x-helix-compressor-* key,
+      //   不知道新增的主动 compact 明细。这里从 request headers 显式解析并写列。
+      //   生产 request_headers 里存活的是 `x-helix-compressor-compact-json`
+      //   (`x-ccr-*` 已被 sanitize 剥掉),两个 key 都读以兼容两种通道。
+      const headerCompact = parseProactiveCompactJson(
+        headerValue(mergedRequestHeaders as any, "x-helix-compressor-compact-json")
+          ?? headerValue(mergedRequestHeaders as any, "x-ccr-helix-compact-json")
+      );
+      if (headerCompact) {
+        pushValue("compression_proactive_compact_json", JSON.stringify(headerCompact));
+      }
     }
     if (responseHeaders) {
       pushValue("response_headers", JSON.stringify(responseHeaders));
+    }
+    // helix 2026-10-16: 网关 recall loop 回填的原文 token 数(从 internal_tool_stats 反解)。
+    //   仅 >0 时写,避免覆盖已有值。
+    if (normalizeCount(input.compressionRecallTokens) > 0) {
+      pushValue("compression_recall_tokens", normalizeCount(input.compressionRecallTokens));
     }
     if (input.responseBodyText !== undefined || responseHeaders) {
       const bodyUsage = input.responseBodyText === undefined
@@ -1114,6 +1200,12 @@ export class RequestLogStore {
             cost_usd,
             request_headers,
             response_headers,
+            compression_baseline_tokens,
+            compression_post_tokens,
+            compression_submitted_tokens,
+            compression_billed_tokens,
+            compression_recall_tokens,
+            compression_proactive_compact_json,
             ${requestLogBodyMetadataSelect},
             request_body_encoding,
             request_body_content_type,
@@ -1276,6 +1368,12 @@ export class RequestLogStore {
             cost_usd,
             request_headers,
             response_headers,
+            compression_baseline_tokens,
+            compression_post_tokens,
+            compression_submitted_tokens,
+            compression_billed_tokens,
+            compression_recall_tokens,
+            compression_proactive_compact_json,
             request_body_text,
             request_body_encoding,
             request_body_content_type,
@@ -1439,6 +1537,14 @@ export class RequestLogStore {
         total_tokens INTEGER NOT NULL DEFAULT 0,
         cost_usd REAL,
         pricing_json TEXT NOT NULL DEFAULT '',
+        -- helix V1.2 / 2026-10-13: helix 压缩统计(从 compressionStatsStore 写,UI 显示用)
+        compression_baseline_tokens INTEGER NOT NULL DEFAULT 0,
+        compression_post_tokens INTEGER NOT NULL DEFAULT 0,
+        compression_recall_tokens INTEGER NOT NULL DEFAULT 0,
+        compression_submitted_tokens INTEGER NOT NULL DEFAULT 0,
+        compression_billed_tokens INTEGER NOT NULL DEFAULT 0,
+        -- helix V1.4 / 2026-10-15: 主动 compact 明细(JSON),压缩后仍超预算时折叠更早历史
+        compression_proactive_compact_json TEXT NOT NULL DEFAULT '',
         request_headers TEXT NOT NULL DEFAULT '{}',
         response_headers TEXT NOT NULL DEFAULT '{}',
         request_body_text TEXT NOT NULL DEFAULT '',
@@ -1690,6 +1796,11 @@ function standaloneRecordInputFromRawTrace(
     requestId: input.requestId,
     responseBodySizeBytes: responseBody.sizeBytes,
     responseBodyText: responseBody.text,
+    // helix 2026-10-16: recall 回填 token(从网关 internal_tool_stats 反解)。空白名单走
+    //   standalone 记录路径时,这条是唯一入口。
+    ...(normalizeCount(input.compressionRecallTokens) > 0
+      ? { compressionRecallTokens: normalizeCount(input.compressionRecallTokens) }
+      : {}),
     responseBodyTruncated: responseBody.truncated,
     responseHeaders,
     startedAt,
@@ -4490,6 +4601,15 @@ function ensureRequestLogSchema(database: SqlDatabase): void {
   addColumn("stream_metrics_json", "TEXT NOT NULL DEFAULT ''");
   addColumn("error", "TEXT NOT NULL DEFAULT ''");
 
+  // helix V1.2 / 2026-10-13: 4 个 helix 压缩 token 统计列(从 compressionStatsStore 写)
+  addColumn("compression_baseline_tokens", "INTEGER NOT NULL DEFAULT 0");
+  addColumn("compression_recall_tokens", "INTEGER NOT NULL DEFAULT 0");
+  addColumn("compression_post_tokens", "INTEGER NOT NULL DEFAULT 0");
+  addColumn("compression_submitted_tokens", "INTEGER NOT NULL DEFAULT 0");
+  addColumn("compression_billed_tokens", "INTEGER NOT NULL DEFAULT 0");
+  // helix V1.4 / 2026-10-15: 主动 compact 明细列(JSON 文本)
+  addColumn("compression_proactive_compact_json", "TEXT NOT NULL DEFAULT ''");
+
   if (needsModelSummaryMigration) {
     migrateRequestLogModelSummaries(database);
   }
@@ -5087,6 +5207,11 @@ function readRequestLogById(database: SqlDatabase, id: number): StoredRequestLog
         response_body_size_bytes,
         response_body_truncated,
         response_body_ref,
+        compression_baseline_tokens,
+        compression_post_tokens,
+        compression_submitted_tokens,
+        compression_billed_tokens,
+        compression_proactive_compact_json,
         error
       FROM request_logs
       WHERE rowid = ?
@@ -5099,6 +5224,7 @@ function readRequestLogById(database: SqlDatabase, id: number): StoredRequestLog
 
 function toRequestLogEntry(row: Record<string, SqlValue>): StoredRequestLogEntry {
   const costUsd = asFloat(row.cost_usd);
+  const proactiveCompact = parseProactiveCompactRow(row.compression_proactive_compact_json);
   const outputTokens = normalizeCount(row.output_tokens);
   const streamMetrics = parseStoredStreamMetrics(row.stream_metrics_json);
   const outputTokensPerSecond = streamMetrics?.sampleStatus === "complete" &&
@@ -5122,6 +5248,13 @@ function toRequestLogEntry(row: Record<string, SqlValue>): StoredRequestLogEntry
     cacheReadTokens: normalizeCount(row.cache_read_tokens),
     cacheWriteTokens: normalizeCount(row.cache_write_tokens),
     client: normalizeLabel(String(row.client ?? ""), "unknown"),
+    // helix V1.2 / 2026-10-13: 4 个 helix 压缩 token 统计
+    ...(normalizeCount(row.compression_baseline_tokens) > 0 ? { compressionBaselineTokens: normalizeCount(row.compression_baseline_tokens) } : {}),
+    ...(normalizeCount(row.compression_post_tokens) > 0 ? { compressionPostTokens: normalizeCount(row.compression_post_tokens) } : {}),
+    ...(proactiveCompact ? { compressionProactiveCompact: proactiveCompact } : {}),
+    ...(normalizeCount(row.compression_recall_tokens) > 0 ? { compressionRecallTokens: normalizeCount(row.compression_recall_tokens) } : {}),
+    ...(normalizeCount(row.compression_submitted_tokens) > 0 ? { compressionSubmittedTokens: normalizeCount(row.compression_submitted_tokens) } : {}),
+    ...(normalizeCount(row.compression_billed_tokens) > 0 ? { compressionBilledTokens: normalizeCount(row.compression_billed_tokens) } : {}),
     completedAt: String(row.completed_at ?? ""),
     costUsd,
     createdAt: String(row.created_at ?? ""),
@@ -5982,7 +6115,7 @@ function sanitizeHeaders(headers: HeaderRecord): Record<string, string | string[
   return result;
 }
 
-function headersToRecord(headers: Headers | HeaderRecord | undefined): HeaderRecord {
+export function headersToRecord(headers: Headers | HeaderRecord | undefined): HeaderRecord {
   if (!headers) {
     return {};
   }
@@ -5999,6 +6132,41 @@ function headersToRecord(headers: Headers | HeaderRecord | undefined): HeaderRec
 function headerValue(headers: Record<string, string | string[]>, name: string): string | undefined {
   const value = headers[name.toLowerCase()];
   return Array.isArray(value) ? value[0] : value;
+}
+
+/**
+ * helix V1.4 / 2026-10-15: 解析主动 compact 明细。
+ * 来源二选一:response header `x-ccr-helix-compact-json`(跨进程通道)或 DB 列 JSON 文本。
+ * 非法/缺字段 → undefined(UI 按"无 compact"处理)。
+ */
+export function parseProactiveCompactJson(raw: string | undefined): CompressionProactiveCompactStat | undefined {
+  if (!raw) return undefined;
+  const parsed = parseJson(raw);
+  if (!isRecord(parsed) || typeof parsed.source !== "string") {
+    return undefined;
+  }
+  const num = (value: unknown): number | undefined =>
+    typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  const tokensAfter = num(parsed.tokensAfter);
+  const preCompactTokens = num(parsed.preCompactTokens);
+  if (tokensAfter === undefined || preCompactTokens === undefined) {
+    return undefined;
+  }
+  const summaryTokens = num(parsed.summaryTokens);
+  const budgetTokens = num(parsed.budgetTokens);
+  return {
+    coveredCount: num(parsed.coveredCount) ?? 0,
+    foldedCount: num(parsed.foldedCount) ?? 0,
+    preCompactTokens,
+    source: parsed.source,
+    ...(summaryTokens !== undefined ? { summaryTokens } : {}),
+    ...(budgetTokens !== undefined ? { budgetTokens } : {}),
+    tokensAfter
+  };
+}
+
+function parseProactiveCompactRow(raw: SqlValue): CompressionProactiveCompactStat | undefined {
+  return typeof raw === "string" ? parseProactiveCompactJson(raw) : undefined;
 }
 
 function batchNeedsUsagePricing(

@@ -31,6 +31,9 @@ export const REQUEST_LOG_BODIES_DIR = path.join(DATADIR, "request-log-bodies");
 export const CONTEXT_ARCHIVE_DB_FILE = path.join(DATADIR, "context-archive.sqlite");
 export const RAW_TRACE_SPOOL_DIR = path.join(DATADIR, "raw-trace-spool");
 export const USAGE_DB_FILE = path.join(DATADIR, "usage.sqlite");
+// 本地召回缓存目录(append-only JSONL)。压缩端(gateway 进程)与召回端(MCP 子进程)
+// 通过该环境变量共享同一文件,见 docs/issue-reviews/2026-10-14-local-closed-loop-recall-design.md §5。
+export const HELIX_RECALL_DIR = path.join(DATADIR, "helix-recall");
 
 if (process.platform === "win32") {
   copyMissingDirectoryContents(LEGACY_WINDOWS_CONFIGDIR, CONFIGDIR, "Windows app data directory");

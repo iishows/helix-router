@@ -3,6 +3,13 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 import { encode as gptEncode } from "gpt-tokenizer";
 import type { ApiKeyConfig, AppConfig, GatewayProviderConfig, GatewayProviderProtocol, ProfileConfig, RouterRule } from "@ccr/core/contracts/app";
+import { HELIX_RECALL_MODEL_PREFIX } from "@ccr/core/contracts/app";
+import {
+  getCompressionStat,
+  setCompressionStat,
+  compressionStatsStore,
+  type ProactiveCompactStat
+} from "@ccr/core/observability/compression-stats-store";
 import {
   claudeCodeWifTokenPath,
   exchangeClaudeCodeWifToken,
@@ -72,6 +79,10 @@ import {
   helixCompressorTransform,
   helixCompressorRequestTransformKey
 } from "@ccr/core/plugins/built-ins/helix-compressor";
+import {
+  applyHelixProactiveCompact,
+  readProactiveCompactSettingsFromConfig
+} from "@ccr/core/gateway/features/helix-proactive-compact";
 import type {
   GatewayPluginRequestTransformContext,
   GatewayPluginRequestTransformInput as CcrGatewayPluginRequestTransformInput
@@ -196,32 +207,9 @@ type GatewayRouteResolution = {
 };
 
 // V3.2:request transform 写压缩 stat,response hook 读 + 推 x-helix-compressor-* header 到客户端
-// keyed by upstreamRequestId(同一 id 在 transform/hook 间是稳定标识)
-// 模块级 Map(单 gateway 实例就够,容量上限保护避免内存泄漏)
-type CompressionStat = {
-  inputChars: number;
-  compressedChars: number;
-  ratio: number;
-  compressedCount: number;
-  hashMapSize: number;
-  model?: string;
-  scenario?: string;
-  durationMs?: number;
-  qMediaStored?: boolean;
-};
-const compressionStatsStore = (() => {
-  const store = new Map<string, CompressionStat>();
-  const origSet = store.set.bind(store);
-  const MAX_ENTRIES = 1000;
-  store.set = (key: string, value: CompressionStat) => {
-    if (store.size >= MAX_ENTRIES && !store.has(key)) {
-      const firstKey = store.keys().next().value;
-      if (firstKey !== undefined) store.delete(firstKey);
-    }
-    return origSet(key, value);
-  };
-  return store;
-})();
+// helix V1.2 / 2026-10-13:CompressionStat + compressionStatsStore 已提取到独立模块
+// `packages/core/src/observability/compression-stats-store.ts`,让 request-log worker
+// 也能用同一份类型定义。import 路径见下。
 
 export async function createGatewayPlugin(input: GatewayPluginFactoryInput = {}) {
   const config = readAppConfig(input.plugin?.config);
@@ -478,8 +466,15 @@ export async function createGatewayPlugin(input: GatewayPluginFactoryInput = {})
       transform: (requestInput: GatewayRequestTransformInput) =>
         applyCodexBridgeRequestTransform(config, requestInput)
     }, {
+      // helix V1.4 / 2026-10-15: stage 必须是 "beforeRouting"(不是 "beforeUpstream")。
+      //   外部网关的非流式转换路径(anthropic source → openai_chat target)在上游 body 构建时
+      //   只读 transform 返回的 standardRequest: `buildRequestFromStandard({standardRequest: xe})`,
+      //   而 helix transform 只返回 requestBody(不返回 standardRequest)→ 压缩结果被静默丢弃。
+      //   beforeRouting 阶段改 requestBody 会写回 e.body,之后网关从 e.body 重建 standardRequest
+      //   (`if(!Q){Q=s.toStandardRequest(l)}`, l.body=u)→ 压缩真正生效。
+      //   该 transform 排在 router transform 之后(requestTransforms 数组顺序),拿到的是已路由的 body。
       key: helixCompressorRequestTransformKey,
-      stage: "beforeUpstream",
+      stage: "beforeRouting",
       transform: (requestInput: GatewayRequestTransformInput) =>
         applyHelixCompressorTransform(requestInput, config)
     }],
@@ -989,6 +984,7 @@ async function applyHelixCompressorTransform(
   config: AppConfig
 ): Promise<{
   headers?: Record<string, string | number | boolean | null | undefined>;
+  model?: string;
   responseHeaders?: Record<string, string | number | boolean | null | undefined>;
   requestBody?: Record<string, unknown>;
 } | undefined> {
@@ -1066,12 +1062,93 @@ async function applyHelixCompressorTransform(
   // post_tokens:压缩后给 LLM 实际看到的 token 数(helix-compressor 内部用 gpt-tokenizer 算过)
   // x-helix-compressor-compressed-tokens = 压缩后 messages 的 token 数
   // x-helix-compressor-baseline-tokens = 原始 messages 的 token 数(== preCompressionTokens,用于双径校验)
-  const postCompressionTokens = numOf("x-helix-compressor-compressed-tokens");
+  //   注意:主动 compact 可能进一步折叠(见下方),命中后此值会被修正为 compact 后的真实提交量。
+  let postCompressionTokens = numOf("x-helix-compressor-compressed-tokens");
+
+  // helix V1.11 / 2026-10-15: 若 transform 决定把 model 改写成 `ccr-helix-recall/<真 model>`
+  //   (即 body 真的含可召回占位符时),透传给网关 beforeRouting 的 `model` 字段。网关在
+  //   handler.ts:383 用它覆盖 requestedModelSelector → 命中 virtualModelProfile 的 internal
+  //   tool 循环(支持流式)→ 兑现 history_recall。无占位符时不返回 model → 不命中 → 保持
+  //   live 直通(零 TTFB 回归)。
+  let finalBody = result.body;
+  const responseHeadersOut: Record<string, string> = {
+    ...(result.responseHeaders ? cleanStringHeaders(result.responseHeaders) ?? {} : {})
+  };
+  // helix V1.4 / 2026-10-15: request headers 也是压缩统计的跨进程通道 ——
+  //   DB trigger(request_logs_compression_extract)从 request_headers 反解
+  //   x-helix-compressor-* 写进 compression_* 列。所以 compact 明细 + 修正后的
+  //   token 头必须同时落 request headers,否则 worker 侧 DB 列拿不到。
+  const requestHeadersOut: Record<string, string> = {
+    ...(result.headers ? cleanStringHeaders(result.headers) ?? {} : {})
+  };
+
+  // 主动 compact:压缩后仍超 token 预算时,折叠更早历史成一个摘要再转发。
+  //   只做「丢前缀 + 改 system」,不动 role 序列 → 不会触发 role 交替 400。
+  //   任何失败都静默降级(不返回 compacted,原 body 照常转发)。
+  let proactiveCompact: ProactiveCompactStat | undefined;
+  if (isRecord(finalBody)) {
+    try {
+      const compacted = await applyHelixProactiveCompact({
+        body: finalBody as Record<string, unknown>,
+        config,
+        headers: stringHeaders(headers),
+        model: stripRecallModelPrefix(resolveModel()),
+        postCompressionTokens,
+        settings: readProactiveCompactSettingsFromConfig(helixPlugin.config)
+      });
+      if (compacted) {
+        const preCompactTokens = postCompressionTokens;
+        finalBody = compacted.requestBody;
+        // 修正 post 为 compact 后的真实提交量(kept 区),并落 structured 统计。
+        postCompressionTokens = compacted.tokensAfter > 0 ? compacted.tokensAfter : postCompressionTokens;
+        proactiveCompact = {
+          coveredCount: compacted.coveredCount,
+          foldedCount: compacted.foldedCount,
+          preCompactTokens,
+          source: compacted.source,
+          ...(compacted.summaryTokens !== undefined ? { summaryTokens: compacted.summaryTokens } : {}),
+          ...(compacted.budgetTokens !== undefined ? { budgetTokens: compacted.budgetTokens } : {}),
+          tokensAfter: compacted.tokensAfter
+        };
+        const compactJson = JSON.stringify({
+          coveredCount: compacted.coveredCount,
+          foldedCount: compacted.foldedCount,
+          preCompactTokens,
+          source: compacted.source,
+          ...(compacted.summaryTokens !== undefined ? { summaryTokens: compacted.summaryTokens } : {}),
+          ...(compacted.budgetTokens !== undefined ? { budgetTokens: compacted.budgetTokens } : {}),
+          tokensAfter: compacted.tokensAfter
+        });
+        // 跨进程通道必须是 `x-helix-compressor-*` 命名空间 —— 落到上游 provider 边界的
+        //   header 会被 sanitizeUpstreamProviderHeaders 剥掉所有 `x-ccr-*`(见
+        //   upstream-header-sanitizer.ts),而落进 request_headers 列(=worker/DB trigger 读的
+        //   那份)的正是这层 sanitize 之后的 header。所以 compact 明细若只挂 `x-ccr-*`,DB
+        //   永远拿不到(request_headers 实测 0 条含 x-ccr)。故同时用 `x-helix-compressor-*` 落一份,
+        //   并把 `x-ccr-*` 留给 response headers(客户端/同进程 UI 即时可见,不被 sanitize)。
+        const diagnostic = compacted.diagnostic;
+        for (const out of [requestHeadersOut, responseHeadersOut]) {
+          out["x-ccr-helix-proactive-compact"] = diagnostic;
+          out["x-ccr-helix-compact-json"] = compactJson;
+          // 修正后的 compressed/submitted-tokens 覆盖 helix 原值,让 DB/UI 的
+          //   「压缩后」「提交给 LLM」口径 = compact 后的真实提交量。
+          out["x-helix-compressor-compressed-tokens"] = String(postCompressionTokens);
+          out["x-helix-compressor-submitted-tokens"] = String(postCompressionTokens);
+        }
+        // 只在 request headers 侧额外落 `x-helix-compressor-*` 别名(生产 sanitize 通道)。
+        requestHeadersOut["x-helix-compressor-proactive-compact"] = diagnostic;
+        requestHeadersOut["x-helix-compressor-compact-json"] = compactJson;
+      }
+    } catch {
+      // best-effort:主动 compact 失败不影响转发
+    }
+  }
+
+  // V3.2:把压缩 stat 存到模块级 store,response hook 推 x-helix-compressor-* 到客户端响应。
+  //   移到 compact 之后:postCompressionTokens / proactiveCompact 均已定稿(含 compact 修正)。
   const savedPct = preCompressionTokens > 0 && postCompressionTokens > 0
     ? Math.round((1 - postCompressionTokens / preCompressionTokens) * 10000) / 100
     : 0;
-
-  compressionStatsStore.set(statKey, {
+  setCompressionStat(statKey, {
     model: resolveModel(),
     scenario: strOf("x-helix-compressor-scenario"),
     inputChars: numOf("x-helix-compressor-input-chars"),
@@ -1079,11 +1156,17 @@ async function applyHelixCompressorTransform(
     ratio: numOf("x-helix-compressor-ratio"),
     compressedCount: numOf("x-helix-compressor-qa-compressed"),
     hashMapSize: numOf("x-helix-compressor-hash-count"),
-    qMediaStored: false
+    qMediaStored: false,
+    // helix V1.2 / 2026-10-13: pre/post tokens 之前没存到 store(只有 chars),现在存了,
+    //   让 request-log worker 能读到并写进 request_logs.compression_baseline_tokens/post_tokens 列
+    preCompressionTokens: preCompressionTokens > 0 ? preCompressionTokens : undefined,
+    postCompressionTokens: postCompressionTokens > 0 ? postCompressionTokens : undefined,
+    ...(proactiveCompact ? { proactiveCompact } : {})
   });
 
   // V3.2:sidecar log 持久化压缩前/后 tokens + 节省百分百(用户 UI 看不到 x-helix-* 头时也能看)
   // Helix Router 的 request_logs.response_headers 字段是空,这条 sidecar 补上缺失
+  // 2026-10-15:移到 compact 之后,post_tokens/saved_pct 反映最终提交量;命中 compact 时带 compact 对象。
   try {
     const fs = require("node:fs") as typeof import("node:fs");
     const pathMod = require("node:path") as typeof import("node:path");
@@ -1100,26 +1183,53 @@ async function applyHelixCompressorTransform(
       post_tokens: postCompressionTokens,
       saved_pct: savedPct,
       qa_compressed: numOf("x-helix-compressor-qa-compressed"),
-      ratio: numOf("x-helix-compressor-ratio")
+      ratio: numOf("x-helix-compressor-ratio"),
+      ...(proactiveCompact ? { compact: proactiveCompact } : {})
     });
     fs.appendFileSync(pathMod.join(logDir, "compression-stats.jsonl"), line + "\n", "utf8");
   } catch {
     // sidecar 写失败不影响主流程
   }
 
+  // helix recall 虚拟 model 改写必须**同步写回路由 header**（2026-10-16 修 clobber）:
+  //   CCR 路由解析器（resolveCcrGatewayRoute）在 beforeRouting transform **之后**运行,
+  //   它优先读 `x-ccr-routed-model` header、否则从 body.model 反解,再经注册表解析出**普通**
+  //   model 返回。handler 用该返回值**无条件覆盖** requestedModelSelector
+  //   （tools/_gwsrc handler.ts:473 `if ('model' in routeResolution)`）→ 把 transform 写下的
+  //   `ccr-helix-recall/<真 model>` 抹回普通 model → resolveVirtualModelRequest 命中不到
+  //   recall profile → 内部 tool 循环永不启动（真实流量 route_hop_count 恒 0、recall 恒 0）。
+  //   修法:把改写后的 model 也写进 `x-ccr-routed-model`。解析器读到该 header 后用它反解,
+  //   前缀 `ccr-helix-recall/` 不在 provider 注册表里 → resolve 返回 undefined → 解析器整体
+  //   返回 undefined → handler 不再覆盖 → transform 的 model 生效。与 router transform
+  //   （line 407 `if (readHeader(...ccrRoutedModelHeader)) return undefined`，避免二次改写）
+  //   对称:两者都以该 header 作为"路由已决定"的信号。
+  if (result.routedModel) {
+    requestHeadersOut[ccrRoutedModelHeader] = result.routedModel;
+  }
+
+  // helix V1.3 / 2026-10-13: 字段名必须是 requestBody(跟 router transform line 453 /
+  //   codex bridge line 719 一致)。之前写 body,ai-gateway 运行时只读 requestBody,
+  //   导致压缩结果被静默丢弃,LLM 收到的是未压缩的原始 body。
   return {
-    ...(result.body ? { body: result.body } : {}),
-    ...(result.headers ? { headers: cleanStringHeaders(result.headers) } : {}),
-    ...(result.responseHeaders ? { responseHeaders: cleanStringHeaders(result.responseHeaders) } : {})
+    ...(result.routedModel ? { model: result.routedModel } : {}),
+    ...(finalBody ? { requestBody: finalBody } : {}),
+    ...(Object.keys(requestHeadersOut).length > 0 ? { headers: requestHeadersOut } : {}),
+    ...(Object.keys(responseHeadersOut).length > 0 ? { responseHeaders: responseHeadersOut } : {})
   };
+}
+
+/** 剥掉 helix recall 虚拟 model 前缀(摘要请求不得命中 recall virtual-profile)。 */
+function stripRecallModelPrefix(model: string): string {
+  return model.startsWith(HELIX_RECALL_MODEL_PREFIX) ? model.slice(HELIX_RECALL_MODEL_PREFIX.length) : model;
 }
 
 /**
  * V3.2 response hook: 从模块级 store 查压缩 stat,推 x-helix-compressor-* 头到客户端响应
+ * helix V1.2 / 2026-10-13: 改成用 consumeCompressionStat 一次性消费;同时推 baseline-tokens
+ *   和 compressed-tokens 头(之前漏推,导致 UI 走 responseHeaders 永远拿不到)。
  */
 const helixCompressorResponseHeadersHook: (responseInput: any) => { headers?: Record<string, string | number | boolean> } | undefined =
   (responseInput: any) => {
-    const stats = compressionStatsStore;
     // 多种 ID 策略兜底,适应不同网关层的 request id 字段
     const upstreamReq = (responseInput.upstreamRequest as any) ?? null;
     const requestLike = (responseInput.request as any) ?? null;
@@ -1130,15 +1240,18 @@ const helixCompressorResponseHeadersHook: (responseInput: any) => { headers?: Re
       requestLike?.id ??
       "";
     let key: string | undefined = upstreamReqId ? upstreamReqId : undefined;
-    if (!key && stats.size > 0) {
+    if (!key) {
       // fallback:对仅剩 1 个 key 的情况,极可能是它;否则放弃
-      const keys = Array.from(stats.keys());
+      const keys = Array.from(compressionStatsStore.keys());
       key = keys.length === 1 ? keys[0] : undefined;
     }
     if (!key) return undefined;
-    const stat = stats.get(key);
+    // helix V1.4 / 2026-10-13: 只读不删。之前这里 consume(读完即删),但 response hook 比
+    //   pipeline 的 writeRequestLog 先执行,删掉后 pipeline 的 getCompressionStat(requestId)
+    //   拿到 undefined,DB 4 个 compression_* 列全写 0。改成 get,删除交给 pipeline 在读完
+    //   并传给 request-log worker 之后做(consumeCompressionStat)。
+    const stat = getCompressionStat(key);
     if (!stat) return undefined;
-    stats.delete(key); // 一次性消费即删
 
     return {
       headers: {
@@ -1149,7 +1262,10 @@ const helixCompressorResponseHeadersHook: (responseInput: any) => { headers?: Re
         "x-helix-compressor-hash-count": String(stat.hashMapSize ?? 0),
         "x-helix-compressor-model": stat.model ?? "",
         "x-helix-compressor-scenario": stat.scenario ?? "",
-        "x-helix-compressor-stored-media": stat.qMediaStored ? "1" : "0"
+        "x-helix-compressor-stored-media": stat.qMediaStored ? "1" : "0",
+        // helix V1.2 / 2026-10-13: 新增 — UI 显示"原始 msgs / 压缩后 msgs"需要的真 token 数
+        "x-helix-compressor-baseline-tokens": String(stat.preCompressionTokens ?? 0),
+        "x-helix-compressor-compressed-tokens": String(stat.postCompressionTokens ?? 0)
       }
     };
   };

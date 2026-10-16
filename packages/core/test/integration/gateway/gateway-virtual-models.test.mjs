@@ -359,6 +359,58 @@ test("gateway config passes proxy preload to Fusion built-in MCP runtimes", asyn
   assert.equal(server.env.TAVILY_API_KEY, "tavily-key");
 });
 
+test("gateway config mounts the helix recall MCP server when a profile enables matchRecall", async () => {
+  const profiles = [
+    {
+      displayName: "Helix Recall",
+      enabled: true,
+      execution: { clientToolsPolicy: "allow", matchRecall: true, mode: "tool_loop", streamMode: "optimistic" },
+      id: "helix-recall",
+      key: "helix-recall",
+      match: { exactAliases: ["helix-recall"], prefixes: [], suffixes: [] },
+      materialization: { enabled: true, includeInGatewayModels: true },
+      tools: [{ name: "hc_recall", visibility: "internal" }, { name: "history_recall", visibility: "internal" }]
+    },
+    {
+      displayName: "No Recall",
+      enabled: true,
+      execution: { clientToolsPolicy: "allow", mode: "tool_loop", streamMode: "optimistic" },
+      id: "no-recall",
+      key: "no-recall",
+      match: { exactAliases: ["no-recall"], prefixes: [], suffixes: [] },
+      materialization: { enabled: true, includeInGatewayModels: true },
+      tools: []
+    }
+  ];
+
+  const artifacts = await fusionBuiltinToolArtifactsForTest(profiles, "http://127.0.0.1:3457", "core-token");
+  const recallServers = artifacts.mcpServers.filter((item) => item.name === "ccr-helix-recall");
+
+  assert.equal(recallServers.length, 1, "recall MCP server should be mounted exactly once");
+  const server = recallServers[0];
+  assert.equal(server.command, process.execPath);
+  assert.equal(server.env.ELECTRON_RUN_AS_NODE, "1");
+  assert.equal(server.args.some((arg) => arg.endsWith("helix-recall-mcp.js")), true);
+});
+
+test("gateway config does not mount the helix recall MCP server without matchRecall", async () => {
+  const profiles = [
+    {
+      displayName: "No Recall",
+      enabled: true,
+      execution: { clientToolsPolicy: "allow", mode: "tool_loop", streamMode: "optimistic" },
+      id: "no-recall",
+      key: "no-recall",
+      match: { exactAliases: ["no-recall"], prefixes: [], suffixes: [] },
+      materialization: { enabled: true, includeInGatewayModels: true },
+      tools: [{ name: "hc_recall", visibility: "internal" }]
+    }
+  ];
+
+  const artifacts = await fusionBuiltinToolArtifactsForTest(profiles, "http://127.0.0.1:3457", "core-token");
+  assert.equal(artifacts.mcpServers.some((item) => item.name === "ccr-helix-recall"), false);
+});
+
 test("gateway ignores non-Gemini capabilities on Gemini preset providers", () => {
   const providerName = "Google Gemini";
   const config = {

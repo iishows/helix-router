@@ -3,7 +3,10 @@
  */
 
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { beforeEach } from "node:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   helixCompressorResponseHook,
   HC_RECALL_TOOL_SCHEMA,
@@ -15,9 +18,28 @@ import {
   hasHCPlaceholder,
   injectRecallInstruction
 } from "@ccr/core/plugins/built-ins/helix-compressor.ts";
+import {
+  configureCacheDir,
+  putBatch as seedRecallCache,
+  _resetIndexForTest,
+  _clearCacheForTest
+} from "@ccr/core/observability/helix-recall-local-store";
 
-const HELIX_API = "https://api.helix-compressor.com";
-const HELIX_KEY = "hk_test_xxx";
+// P2(2026-10-15):recall 读本地 store,不打任何云端。测试改为预置本地 JSONL。
+configureCacheDir(mkdtempSync(join(tmpdir(), "helix-recall-test-")));
+
+/** 预置本地缓存中的若干 hash → 原文条目。 */
+function seedRecallEntries(entries) {
+  _clearCacheForTest();
+  _resetIndexForTest();
+  seedRecallCache(entries);
+  _resetIndexForTest();
+}
+
+beforeEach(() => {
+  _clearCacheForTest();
+  _resetIndexForTest();
+});
 
 function mockContext(overrides = {}) {
   return {
@@ -30,14 +52,7 @@ function mockContext(overrides = {}) {
     },
     paths: { configDir: "", dataDir: "", pluginDataDir: "" },
     permissions: [],
-    pluginConfig: {
-      helixApiUrl: HELIX_API,
-      helixApiKey: HELIX_KEY,
-      evaluatorApiUrl: "https://api.openai.com",
-      evaluatorApiKey: "sk-test",
-      evaluatorModel: "gpt-4o-mini",
-      timeoutMs: 5000
-    },
+    pluginConfig: {},
     pluginId: "helix-compressor",
     openSqliteStore: async () => { throw new Error("not implemented"); },
     ...overrides
@@ -222,11 +237,7 @@ test("response hook: rejects invalid hash_id format", async () => {
 });
 
 test("response hook: limits recall to MAX_RECALL_PER_REQUEST", async () => {
-  const originalFetch = global.fetch;
-  global.fetch = async () => ({
-    ok: true,
-    json: async () => ({ results: [] })
-  });
+  seedRecallEntries([]);
 
   const response = {
     choices: [{
@@ -253,16 +264,10 @@ test("response hook: limits recall to MAX_RECALL_PER_REQUEST", async () => {
 
   assert.equal(result.continueLoop, true);
   assert.equal(result.messagesToAppend?.length, 3);
-
-  global.fetch = originalFetch;
 });
 
 test("response hook: handles batch recall success", async () => {
-  const originalFetch = global.fetch;
-  global.fetch = async () => ({
-    ok: true,
-    json: async () => ({ results: [{ hash: "abc123def456", original: "The original content" }] })
-  });
+  seedRecallEntries([["abc123def456", { q: "The original content", a: "" }]]);
 
   const result = await helixCompressorResponseHook(
     {
@@ -278,16 +283,10 @@ test("response hook: handles batch recall success", async () => {
   assert.equal(result.messagesToAppend[0].role, "tool");
   assert.equal(result.messagesToAppend[0].tool_call_id, "call_1");
   assert.equal(result.messagesToAppend[0].content, "The original content");
-
-  global.fetch = originalFetch;
 });
 
 test("response hook: handles hash miss gracefully", async () => {
-  const originalFetch = global.fetch;
-  global.fetch = async () => ({
-    ok: true,
-    json: async () => ({ results: [] })
-  });
+  seedRecallEntries([]);
 
   const result = await helixCompressorResponseHook(
     {
@@ -300,16 +299,10 @@ test("response hook: handles hash miss gracefully", async () => {
 
   assert.equal(result.continueLoop, true);
   assert.ok(result.messagesToAppend[0].content.includes("not found"));
-
-  global.fetch = originalFetch;
 });
 
 test("response hook: Anthropic protocol returns user+tool_result", async () => {
-  const originalFetch = global.fetch;
-  global.fetch = async () => ({
-    ok: true,
-    json: async () => ({ results: [{ hash: "abc123def456", original: "Original" }] })
-  });
+  seedRecallEntries([["abc123def456", { q: "Original", a: "" }]]);
 
   const response = {
     content: [{
@@ -333,8 +326,6 @@ test("response hook: Anthropic protocol returns user+tool_result", async () => {
   assert.ok(Array.isArray(result.messagesToAppend[0].content));
   assert.equal(result.messagesToAppend[0].content[0].type, "tool_result");
   assert.equal(result.messagesToAppend[0].content[0].tool_use_id, "toolu_1");
-
-  global.fetch = originalFetch;
 });
 
 // ============= H2 修复验证: Anthropic 格式 schema =============

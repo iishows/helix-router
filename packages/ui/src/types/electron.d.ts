@@ -71,6 +71,8 @@ import type {
   ProxyCertificateStatus,
   ProxyNetworkSnapshot,
   ProxyStatus,
+  RecallModelDetectionRequest,
+  RecallModelDetectionResult,
   RequestLogDetailRequest,
   RequestLogBodyChunk,
   RequestLogBodyChunkRequest,
@@ -100,6 +102,7 @@ declare global {
       clearProxyNetworkCaptures: () => Promise<ProxyNetworkSnapshot>;
       closeTray: () => Promise<void>;
       detectProviderIcon: (request: ProviderIconDetectionRequest) => Promise<ProviderIconDetectionResult>;
+      detectRecallModels: (request?: RecallModelDetectionRequest) => Promise<RecallModelDetectionResult>;
       exportData: () => Promise<AppDataExportResult>;
       fetchProviderManifest: (request: ProviderManifestFetchRequest) => Promise<ProviderManifestFetchResult>;
       getAgentAnalysis: (filter?: AgentAnalysisFilter) => Promise<AgentAnalysisSnapshot>;

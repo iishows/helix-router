@@ -1,25 +1,19 @@
 /**
- * Helix Compressor — Claude Code Router Built-in Plugin (v1.1 评估边界重构)
+ * Helix Compressor — Claude Code Router Built-in Plugin（本地闭环）
  *
  * ⚠️ 基于 CCR 真实接口（musistudio/claude-code-router, @ccr/core v1）：
  *   - GatewayPluginRequestTransformHandler / Input / Result / Context
  *   - 文件位置：packages/core/src/plugins/built-ins/helix-compressor.ts
  *   - 在 packages/core/src/gateway/core-runtime/router-plugin.ts 里 import + 注册
  *
- * 对应 helix-compressor 云端 API：
- *   - POST /v1/compress           — 压缩 messages
- *   - POST /v1/quality/feedback   — 上报客户端评估的评分
- *
- * 设计原则（v1.1）：
- *   - 抽样决策：客户端插件（hash % sample_mod）
- *   - LLM 评估：客户端（用 evaluator_api_* 配置）
- *   - 评分上报：客户端 → 云端 POST /v1/quality/feedback
- *   - 云端：不参与评估，只记账
+ * 全部压缩在本机进程内完成（`hc-local.ts` 的 compressV3x）:占位符替换后的原文落
+ * 本地召回缓存({DATADIR}/helix-recall),由 recall response hook + MCP 工具兑现。
+ * 云端 /v1/compress、LLM 质量评估、/v1/quality/feedback 上报已整体移除。
  *
  * 集成步骤见 docs/PLUGIN_INTEGRATION.md 附录 A
  */
 
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { encode as gptEncode } from "gpt-tokenizer";
 import type {
   GatewayPluginRequestTransformHandler,
@@ -28,6 +22,76 @@ import type {
   GatewayPluginResponseHookResult
 } from "@ccr/core/plugins/service";
 import { helixCompressorRecallToolName, helixCompressorMaxRecallPerRequest, helixCompressorLoopTimeoutMs } from "@ccr/core/gateway/core-runtime/router-plugin-contract";
+import { compressV3x, type LocalCompressMessage } from "@ccr/core/plugins/built-ins/helix-compressor/hc-local";
+import {
+  putBatch as putRecallCacheBatch,
+  batchGet as batchGetRecallCache,
+  type RecallCacheEntry
+} from "@ccr/core/observability/helix-recall-local-store";
+import { HELIX_RECALL_DIR } from "@ccr/core/config/constants";
+import type { AppConfig } from "@ccr/core/contracts/app";
+import { HELIX_RECALL_MODEL_PREFIX } from "@ccr/core/contracts/app";
+
+/**
+ * helix 本地召回(recall)是否启用。
+ *
+ * 判定:helix-compressor 插件存在且未禁用。本地压缩把原文落本地 JSONL,
+ * helix-recall MCP(hc_recall / history_recall)才有数据可召回。
+ *
+ * gateway 侧(透明工具执行)与客户端侧(Claude Code MCP 注入)共用同一判据,避免两处漂移。
+ */
+export function helixLocalRecallEnabled(config: AppConfig | undefined): boolean {
+  const helixPlugin = (config?.plugins ?? []).find((plugin) => plugin.id === "helix-compressor");
+  return Boolean(helixPlugin && helixPlugin.enabled !== false);
+}
+
+/**
+ * glob → 正则:仅 `*` 是通配符(任意串),其余字符全部转义。大小写不敏感。
+ * 例:`MiniMax-*` → /^MiniMax-.*$/i;`MiniMax-M3` → /^MiniMax\-M3$/i(等价精确匹配)。
+ */
+function globToRegExp(pattern: string): RegExp {
+  const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, (ch) => (ch === "*" ? "\u0000" : `\\${ch}`));
+  const body = escaped.split("\u0000").join(".*");
+  return new RegExp(`^${body}$`, "i");
+}
+
+/** 模型名对单条 glob 是否命中:匹配完整名,也匹配最后一个 `/` 之后的段(剥 provider 前缀)。 */
+function modelMatchesGlob(model: string, pattern: string): boolean {
+  const re = globToRegExp(pattern);
+  if (re.test(model)) {
+    return true;
+  }
+  const lastSlash = model.lastIndexOf("/");
+  return lastSlash >= 0 && re.test(model.slice(lastSlash + 1));
+}
+
+/**
+ * 模型是否支持本地 recall 压缩(⟦QA:⟧/⟦HC:⟧ 占位符 + 落缓存 + model 改写)。
+ *
+ * - `recallModelPatterns` 为空/未配 → true(所有模型都支持,向后兼容)。
+ * - 命中任一 include 且**不**命中任一 exclude → true;否则 false。
+ * - 未命中的模型跳过占位符压缩(不产生不可还原的 ⟦QA:⟧),后续只走主动 compact。
+ *
+ * 与 `helixLocalRecallEnabled`(全局总开关)正交:本判据只在本地压缩路径的模型维度收窄。
+ */
+export function recallModelSupported(model: string, config: HelixCompressorConfig): boolean {
+  const patterns = config.recallModelPatterns ?? [];
+  const excludes = config.recallModelExcludePatterns ?? [];
+  const name = typeof model === "string" ? model.trim() : "";
+  // 空白名单语义:
+  //   - 未检测(recallModelDetected !== true):空 = 全部纳入(向后兼容);
+  //   - 已检测(recallModelDetected === true):空 = 真的没有模型支持,不回退「全部」。
+  const included = patterns.length === 0
+    ? config.recallModelDetected !== true
+    : (name.length > 0
+      && patterns.some((pattern) => typeof pattern === "string" && pattern.length > 0 && modelMatchesGlob(name, pattern)));
+  if (!included) {
+    return false;
+  }
+  // exclude 在 include 之后收窄(空白名单 + 非空 exclude = 全部支持但排除命中项)。
+  return !(name.length > 0
+    && excludes.some((pattern) => typeof pattern === "string" && pattern.length > 0 && modelMatchesGlob(name, pattern)));
+}
 
 // ============= 类型定义 =============
 
@@ -35,26 +99,6 @@ import { helixCompressorRecallToolName, helixCompressorMaxRecallPerRequest, heli
  * Helix Compressor 用户配置（写在 CCR AppConfig.plugins[].config）
  */
 export interface HelixCompressorConfig {
-  /** 云端 API 地址 */
-  helixApiUrl: string;
-  /** 云端 API Key */
-  helixApiKey: string;
-  /** 评估 LLM 地址（OpenAI 兼容） */
-  evaluatorApiUrl: string;
-  /** 评估模型名 */
-  evaluatorModel: string;
-  /** 评估 LLM Key */
-  evaluatorApiKey: string;
-  /** 抽样率（1/N），默认 20 = 5% */
-  sampleMod?: number;
-  /** 评估超时（ms），默认 30000 */
-  timeoutMs?: number;
-  /** 上报失败是否静默（默认 true） */
-  reportFailuresSilent?: boolean;
-  /** 跳过的 HTTP 错误码（默认 [400, 401, 403]） */
-  skipOnErrorStatusCodes?: number[];
-  /** 自定义 header 名（用于传递 request_id 等） */
-  requestIdHeader?: string;
   /**
    * V3.2:是否在压缩时同时存原 media bytes(image / video / doc / audio)
    * 默认 false —— A 文本已包含 LLM 对媒体的文字描述,占位符召回 q+a 文本即可
@@ -74,6 +118,79 @@ export interface HelixCompressorConfig {
    * 设为 0 走原 V3.2 Q&A pair 压缩,>0 额外压缩任意 role 的大文本块
    */
   blockThresholdChars?: number;
+  /**
+   * V3.4 媒体块压缩开关(默认 true):image/image_url/document/video/audio 块有即压,
+   * 独立于 `blockThresholdChars`(threshold 只管文本块)。
+   * 被压的媒体块落本地缓存,`history_recall with_media=true` 可召回原图。
+   * 设 false = 完全不压媒体块。
+   */
+  compressMedia?: boolean;
+  /**
+   * V1.12 tool_result 压缩开关(默认 true):工具输出 ≥ `toolResultThresholdChars` 即压成
+   * ⟦QA:hash⟧(保留 tool_use_id 与原 block,只换 content)。独立于 `blockThresholdChars`。
+   * 真实 agent 会话的主要节省来源(实测工具输出占 body 53%)。设 false = 完全不压。
+   */
+  compressToolResults?: boolean;
+  /** tool_result 输出 ≥ 该字符数才压(默认 1000)。 */
+  toolResultThresholdChars?: number;
+  /** 最近 N 条 tool_result 永不压缩(默认 2)。 */
+  keepRecentToolResults?: number;
+  /** 单请求 tool_result 压缩条数上限(默认 20)。 */
+  maxCompressToolResults?: number;
+  /**
+   * 主动 compact(2026-10-15):helix 压缩后提交 token 数 > 该预算时,网关折叠更早历史
+   * 成一个摘要再转发(只保留最近 `keepRecentTurns` 个新用户轮原文)。默认 100000。
+   * 设 0 = 关闭主动 compact。
+   */
+  tokenBudget?: number;
+  /** 主动 compact 时保留最近 N 个「新用户轮」原文(默认 2)。 */
+  keepRecentTurns?: number;
+  /** 主动 compact 摘要调用超时(ms,默认 60000)。 */
+  proactiveCompactTimeoutMs?: number;
+  /** 主动 compact 摘要模型覆盖(默认空 = 用当前路由模型)。 */
+  proactiveCompactModel?: string;
+  /** 主动 compact 摘要缓存 TTL(ms,默认 3 天)。 */
+  proactiveCompactCacheTtlMs?: number;
+  /**
+   * 主动 compact「积攒」阈值(默认 100):已有前缀摘要时,只有当**未覆盖的新历史**
+   * 条数 ≥ 该值才重新(增量)摘要;否则复用旧摘要、中间段留原文(零上游调用)。
+   * 设 0 = 关闭积攒(每轮边界变化都重摘)。
+   */
+  proactiveCompactMinNewMessages?: number;
+  /**
+   * recall 支持模型的 glob 白名单(2026-10-16):只有命中的模型才做本地 recall 占位符
+   * 压缩(⟦QA:⟧/⟦HC:⟧ + 落召回缓存 + model 改写成 ccr-helix-recall/<model>)。
+   * 未命中的模型跳过占位符压缩,只保留安全预清理,后续仅走主动 compact。
+   *
+   * - `*` 是唯一通配符(任意串);无 `*` 的模式即精确匹配。大小写不敏感。
+   * - 匹配对象是真实模型名(如 `MiniMax-M3` 或 `MiniMax (China) 2/MiniMax-M3`):
+   *   同时匹配完整名与最后一个 `/` 之后的段,兼容 provider 前缀差异。
+   * - **空/未配 → 所有模型都支持**(向后兼容,行为不变)。
+   */
+  recallModelPatterns?: string[];
+  /**
+   * recall 白名单的排除表(2026-10-16):即使命中 `recallModelPatterns` 也不做 recall 压缩。
+   * 空/未配 → 不排除。匹配规则同 `recallModelPatterns`。
+   */
+  recallModelExcludePatterns?: string[];
+  /**
+   * recall 白名单是否来自「自动检测」(2026-10-16):自动探测模型 tool-calling 能力后写白名单时置 true。
+   * 置 true 后 `recallModelPatterns` 为空 = **真的没有模型支持**(不再回退「空=全部」),
+   * 避免「检测出 0 个支持」被误当成「未配置 → 全部支持」。默认 false(未检测,空=全部,向后兼容)。
+   */
+  recallModelDetected?: boolean;
+  /**
+   * 主动 compact 预算按上下文长度百分比驱动(2026-10-16):
+   * `budget = min(ceiling, max(floor, floor(有效上下文长度 × percent/100)))`。
+   * 0/未设 = 关闭 percent 路径,回退绝对 `tokenBudget`(向后兼容)。
+   */
+  compactBudgetPercent?: number;
+  /** percent 预算下限(默认 48000)。 */
+  compactBudgetFloorTokens?: number;
+  /** percent 预算上限 / 硬顶(默认 120000)。 */
+  compactBudgetCeilingTokens?: number;
+  /** 按真实 model 名覆盖 percent(优先于全局 `compactBudgetPercent`)。 */
+  compactBudgetPercentOverrides?: Record<string, number>;
 }
 
 /**
@@ -85,7 +202,7 @@ type LLMMessage = {
 };
 
 /**
- * /v1/compress 响应
+ * 压缩结果(本地 compressV3x 产出)
  */
 interface CompressResponse {
   compressed: LLMMessage[];
@@ -97,40 +214,34 @@ interface CompressResponse {
     compressedCount: number;
     duration_ms?: number;
   };
-  feedback_endpoint: string;
-}
-
-/**
- * LLM 评分结构
- */
-interface QualityScore {
-  information_loss: number;
-  coherence: number;
-  accuracy: number;
-  reason: string;
-  evaluator_model: string;
-  evaluator_response?: Record<string, unknown>;
 }
 
 // ============= 默认配置 =============
 
 export const HELIX_COMPRESSOR_DEFAULTS: HelixCompressorConfig = {
-  helixApiUrl: "https://api.helix-compressor.com",
-  helixApiKey: "",
-  evaluatorApiUrl: "https://api.minimaxi.com/v1",
-  evaluatorModel: "MiniMax-M3",
-  evaluatorApiKey: "",
-  sampleMod: 20,
-  timeoutMs: 30000,
-  reportFailuresSilent: true,
-  skipOnErrorStatusCodes: [400, 401, 403],
-  requestIdHeader: "x-helix-request-id"
+  compressMedia: true,
+  compressToolResults: true,
+  toolResultThresholdChars: 1000,
+  keepRecentToolResults: 2,
+  maxCompressToolResults: 20,
+  keepRecentTurns: 2,
+  proactiveCompactCacheTtlMs: 259200000,
+  proactiveCompactMinNewMessages: 100,
+  proactiveCompactModel: "",
+  proactiveCompactTimeoutMs: 60000,
+  tokenBudget: 100000,
+  recallModelPatterns: [],
+  recallModelExcludePatterns: [],
+  recallModelDetected: false,
+  compactBudgetPercent: 0,
+  compactBudgetFloorTokens: 48000,
+  compactBudgetCeilingTokens: 120000,
+  compactBudgetPercentOverrides: {}
 };
 
 // ============= Plugin Key 常量（用于 CCR 注册） =============
 
 export const helixCompressorRequestTransformKey = "helix-compressor-request-transform";
-export const helixCompressorResponseHookKey = "helix-compressor-quality-feedback";
 export const helixCompressorModelHeader = "x-helix-compressor-model";
 export const helixCompressorRatioHeader = "x-helix-compressor-ratio";
 export const helixCompressorRequestIdHeader = "x-helix-compressor-request-id";
@@ -147,172 +258,10 @@ export const helixCompressorEnabledHeader = "x-helix-compressor-enabled";
 export const helixCompressorBaselineTokensHeader = "x-helix-compressor-baseline-tokens";
 // v1.5：压缩后 messages 的 tokens(真 tokenizer 算)—— UI 用来显示 "~X→Y tok" 全 token 视图
 export const helixCompressorCompressedTokensHeader = "x-helix-compressor-compressed-tokens";
-
-// ============= Few-shot Prompt =============
-
-const EVAL_SYSTEM_PROMPT = `你是 AI 上下文压缩质量评估专家。客户使用上下文压缩服务，请客观评估压缩前后质量变化。
-
-【关键】返回纯 JSON，不含 markdown 包装或解释文字。
-
-## 评分维度（1-5，5=最佳）
-
-1. **information_loss（信息保留度）** — 压缩后是否丢失关键信息？
-2. **coherence（连贯性）** — 压缩后对话是否连贯？
-3. **accuracy（准确性）** — 关键数据/事实是否保留？
-
-## Few-shot 示例
-
-### 示例 1：高质量压缩
-原始：[50字符的订单详情 "订单号#12345，价格$99"]
-压缩：[⟦HC:abc123⟧]
-评分：{"information_loss": 5, "coherence": 5, "accuracy": 5, "reason": "订单关键信息全部保留"}
-
-### 示例 2：低质量压缩（代码被压）
-原始：[详细代码+注释+日志 "def calculate(x): ...# 注释...print(x)"]
-压缩：[⟦HC:xyz789⟧]
-评分：{"information_loss": 2, "coherence": 4, "accuracy": 2, "reason": "代码注释被压缩，关键逻辑丢失"}
-
-### 示例 3：低质量压缩（思考过程被压）
-原始：[思考过程 "让我分析...首先X，然后Y..."]
-压缩：[⟦HC:thinking⟧]
-评分：{"information_loss": 2, "coherence": 3, "accuracy": 2, "reason": "推理步骤被压缩，影响思考质量"}
-
-## 输出格式
-
-严格 JSON：
-{
-  "information_loss": 1-5,
-  "coherence": 1-5,
-  "accuracy": 1-5,
-  "reason": "中文/英文评估理由"
-}`;
-
-// ============= 抽样决策 =============
-
-/**
- * 判断本次请求是否需要评估
- *
- * @param requestId  CCR 框架提供的 requestId
- * @param sampleMod  抽样率（1/N）
- */
-export function shouldSample(requestId: string, sampleMod: number = HELIX_COMPRESSOR_DEFAULTS.sampleMod!): boolean {
-  if (!requestId) return false;
-  const hashHex = createHash("sha256").update(String(requestId)).digest("hex").slice(0, 8);
-  const hashInt = parseInt(hashHex, 16);
-  return hashInt % sampleMod === 0;
-}
-
-// ============= LLM 评估 =============
-
-/**
- * 调用 LLM 评估压缩质量（失败返回 null，不抛异常）
- */
-export async function evaluateCompression(
-  originalMessages: LLMMessage[],
-  compressedMessages: LLMMessage[],
-  subjectModel: string,
-  config: HelixCompressorConfig
-): Promise<QualityScore | null> {
-  if (!config.evaluatorApiKey || !config.evaluatorApiUrl || !config.evaluatorModel) {
-    return null;
-  }
-
-  const timeoutMs = config.timeoutMs ?? HELIX_COMPRESSOR_DEFAULTS.timeoutMs!;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const userPrompt = formatEvalPayload(originalMessages, compressedMessages, subjectModel);
-
-    const resp = await fetch(`${config.evaluatorApiUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${config.evaluatorApiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: config.evaluatorModel,
-        messages: [
-          { role: "system", content: EVAL_SYSTEM_PROMPT },
-          { role: "user", content: userPrompt }
-        ],
-        response_format: { type: "json_object" },
-        temperature: 0.1,
-        max_tokens: 500
-      }),
-      signal: controller.signal
-    });
-
-    if (!resp.ok) {
-      console.warn(`[helix-compressor] evaluator ${resp.status}: ${await resp.text().catch(() => "")}`);
-      return null;
-    }
-
-    const data = await resp.json();
-    const content = data.choices?.[0]?.message?.content;
-    if (!content) return null;
-
-    const parsed = robustParseJson(content);
-    if (!parsed) return null;
-
-    return {
-      information_loss: clamp(parsed.information_loss),
-      coherence: clamp(parsed.coherence),
-      accuracy: clamp(parsed.accuracy),
-      reason: typeof parsed.reason === "string" ? parsed.reason : "",
-      evaluator_model: config.evaluatorModel,
-      evaluator_response: { raw: parsed, source: "ccr_plugin" }
-    };
-  } catch (err) {
-    if (err instanceof Error && err.name === "AbortError") {
-      console.warn(`[helix-compressor] evaluator timeout after ${timeoutMs}ms`);
-    } else {
-      console.warn(`[helix-compressor] evaluator failed: ${(err as Error).message}`);
-    }
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// ============= 上报云端 =============
-
-/**
- * 上报评分到云端（失败不抛异常）
- */
-export async function reportFeedback(
-  requestId: string,
-  quality: QualityScore,
-  config: HelixCompressorConfig
-): Promise<boolean> {
-  if (!requestId || !quality) return false;
-
-  try {
-    const resp = await fetch(`${config.helixApiUrl}/v1/quality/feedback`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${config.helixApiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ request_id: requestId, quality })
-    });
-
-    if (!resp.ok) {
-      const silent = config.reportFailuresSilent ?? HELIX_COMPRESSOR_DEFAULTS.reportFailuresSilent!;
-      if (!silent) {
-        console.warn(`[helix-compressor] report failed: ${resp.status}`);
-      }
-      return false;
-    }
-    return true;
-  } catch (err) {
-    const silent = config.reportFailuresSilent ?? HELIX_COMPRESSOR_DEFAULTS.reportFailuresSilent!;
-    if (!silent) {
-      console.warn(`[helix-compressor] report error: ${(err as Error).message}`);
-    }
-    return false;
-  }
-}
+// v1.6：ccr 实际提交给 LLM 的 messages token 数(= 压缩后)。request_logs 的
+//   compression_submitted_tokens 列由 DB trigger(request_logs_compression_extract/_update)
+//   从 request_headers 的此 key 解析,插件不 emit 则该列永远为 0。
+export const helixCompressorSubmittedTokensHeader = "x-helix-compressor-submitted-tokens";
 
 // ============= 主 Transform =============
 
@@ -327,11 +276,10 @@ export async function reportFeedback(
  *   - context.pluginConfig: 用户配置
  *
  * 流程：
- *   1. 调云端 POST /v1/compress 拿压缩结果
- *   2. 客户端抽样（hash % sample_mod）
- *   3. 被抽样时调 LLM 评估（用 evaluator_api_* 配置）
- *   4. 评估成功时上报云端（POST /v1/quality/feedback，异步）
- *   5. 返回替换 messages 的 body
+ *   1. 安全预清理(空消息/skills 索引)
+ *   2. 命中 recall 白名单 → 本地 compressV3x 压缩并落本地召回缓存;
+ *      未命中 → 原样透传(scenario=skip-recall)
+ *   3. 返回替换 messages 的 body
  *
  * 失败处理：compress 失败返回 undefined（CCR 跳过该 transform，原 body 不变）
  */
@@ -351,9 +299,8 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
 
   if (!Array.isArray(messages) || typeof model !== "string") return undefined;
 
-  // 决定传给云端的 request_id。
-  // Fastify 默认 req.id 是 "req-<letter>"，太短会被 helix 记成单字符；
-  // 客户端若有完整 ID（>=8 字符）就用它，否则用 randomUUID() 生成稳定的 nanoid。
+  // 归一化 request_id：Fastify 默认 req.id 是 "req-<letter>"，太短无法用于日志关联；
+  // 客户端若有完整 ID（>=8 字符）就用它，否则用 randomUUID()。
   const upstreamRequestId = input.requestId && input.requestId.length >= 8
     ? input.requestId
     : randomUUID();
@@ -372,60 +319,67 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
     messages = clientCompactSkills(messages);
   }
 
-  // 1. 调云端压缩
+  // 1. 本地压缩:只有命中 recall 白名单的模型才做占位符压缩,否则原样透传。
   let compressed: CompressResponse;
-  try {
-    const resp = await fetch(`${config.helixApiUrl}/v1/compress`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${config.helixApiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        request_id: upstreamRequestId,
-        messages,
-        model,
-        thinking_mode: extractThinkingMode(body),
-        // V3.2: 默认不存原 media bytes。LLM 真要看像素级细节时手动开启
-        store_media: config.storeWithMedia === true,
-        // 严格压缩:只保留最新 1 对 Q&A(默认 1),anchor + 历史消息(含图片/PDF)都替成 ⟦QA:⟧
-        keep_recent_pairs: config.keepRecentPairs ?? 1,
-        // V3.3 block 级压缩:任意 role 的 text 块 ≥ 阈值字符即纳入候选
-        // 默认 0 = 关闭(向后兼容);设为 >0 启用
-        block_threshold_chars: config.blockThresholdChars ?? 0
-      })
-    });
-
-    if (!resp.ok) {
-      const skipCodes = config.skipOnErrorStatusCodes ?? HELIX_COMPRESSOR_DEFAULTS.skipOnErrorStatusCodes!;
-      if (skipCodes.includes(resp.status)) {
-        context.logger.warn(`[helix-compressor] compress ${resp.status}, skip`);
-        return undefined;
-      }
-      throw new Error(`compress ${resp.status}: ${await resp.text().catch(() => "")}`);
-    }
-
-    compressed = (await resp.json()) as CompressResponse;
-  } catch (err) {
-    context.logger.warn(`[helix-compressor] compress failed: ${(err as Error).message}, skip`);
-    return undefined;
-  }
-
-  // 2. 抽样
-  if (shouldSample(upstreamRequestId, config.sampleMod)) {
-    // 3. 评估
-    const quality = await evaluateCompression(messages, compressed.compressed, model, config);
-
-    // 4. 上报（异步，不阻塞 transform 返回）
-    if (quality) {
-      void reportFeedback(upstreamRequestId, quality, config).catch((err) => {
-        context.logger.warn(`[helix-compressor] report error: ${(err as Error).message}`);
+  // 按模型门控 recall(2026-10-16):只有命中 recall 白名单的模型才做本地占位符压缩。
+  //   未命中的模型 → 跳过 compressV3x(不产 ⟦QA:⟧/⟦HC:⟧、不落召回缓存、model 不改写),
+  //   仅保留上面的安全预清理,后续只走主动 compact。空白名单 = 支持全部(向后兼容)。
+  const recallSupported = recallModelSupported(model, config);
+  if (recallSupported) {
+    // 本地确定性 V3.x:移植自 helix-compressor/src/compress/hc.js,与其逐字节 parity。
+    // 被替换的原文写入本地召回缓存(供 hc_recall/history_recall 工具读取)。
+    try {
+      const local = compressV3x(messages as LocalCompressMessage[], {
+        keepRecentPairs: config.keepRecentPairs ?? 1,
+        storeMedia: config.storeWithMedia === true,
+        blockThresholdChars: config.blockThresholdChars ?? 0,
+        compressMedia: config.compressMedia !== false,
+        compressToolResults: config.compressToolResults !== false,
+        toolResultThresholdChars: config.toolResultThresholdChars,
+        keepRecentToolResults: config.keepRecentToolResults,
+        maxCompressToolResults: config.maxCompressToolResults
       });
+      const cacheEntries = Object.entries(local.hashMap);
+      if (cacheEntries.length > 0) {
+        try {
+          // 缓存目录默认 {DATADIR}/helix-recall;若外部已通过环境变量指定则由 store 读取该值。
+          ensureLocalRecallCacheDir();
+          putRecallCacheBatch(cacheEntries as Array<[string, RecallCacheEntry]>);
+        } catch (cacheErr) {
+          context.logger.warn(`[helix-compressor] local cache write failed: ${(cacheErr as Error).message}`);
+        }
+      }
+      compressed = {
+        compressed: local.messages as unknown as LLMMessage[],
+        scenario: "local",
+        stats: {
+          originalChars: countChars(messages),
+          compressedChars: countChars(local.messages as unknown as LLMMessage[]),
+          ratio: local.stats.ratio,
+          compressedCount: local.stats.compressedCount
+        }
+      };
+    } catch (err) {
+      context.logger.warn(`[helix-compressor] local compress failed: ${(err as Error).message}, skip`);
+      return undefined;
     }
+  } else {
+    // 模型不在 recall 白名单:跳过本地占位符压缩,原样透传(预清理后的)messages。
+    //   不产生 ⟦QA:⟧/⟦HC:⟧ → hasHC/hasQA 恒 false → model 不改写 → 不命中 recall profile。
+    //   scenario="skip-recall" 便于 UI/日志区分该请求未做 recall 压缩。
+    compressed = {
+      compressed: messages,
+      scenario: "skip-recall",
+      stats: {
+        originalChars: countChars(messages),
+        compressedChars: countChars(messages),
+        ratio: 0,
+        compressedCount: 0
+      }
+    };
   }
 
-  // 5. 返回替换 messages 的 body
-  // 如果有 ⟦HC:hash⟧ 或 ⟦QA:hash⟧ 占位符，注入对应召回工具 + 教学 prompt
+  // 2. 返回替换 messages 的 body
   let outputMessages = compressed.compressed as LLMMessage[];
   const outputBody: Record<string, unknown> = {
     ...body,
@@ -435,49 +389,31 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
   const hasHC = hasHCPlaceholder(outputMessages);
   const hasQA = hasQAPlaceholder(outputMessages);
 
+  // helix V1.11 / 2026-10-15: 不再注入**裸** recall 工具。
+  //   旧做法往 body.tools push `history_recall` / `hc_recall`,它与客户端已注入的
+  //   MCP 命名空间工具(`mcp__ccr-helix-recall__history_recall`)或网关 virtualModel
+  //   profile 的 internal 工具同名 → 网关 buildVirtualTooling 直接 400
+  //   (`Client tool "history_recall" conflicts with virtual model tool.`)。
+  //   改为:只要 body 里仍有可召回占位符,就把 model 改写成 `ccr-helix-recall/<真 model>`,
+  //   网关据此命中 helix virtualModelProfile → internal tool 循环(支持流式)兑现 recall。
+  //   无占位符 → 不改写 → 不命中 profile → 保持原 live 直通(零 TTFB 回归,对齐 headroom #3071)。
+  const recallNeeded = (hasHC || hasQA) && model.length > 0;
+  const routedModel = recallNeeded ? `${HELIX_RECALL_MODEL_PREFIX}${model}` : undefined;
+
+  // 教学 prompt:告诉模型占位符的含义与何时调用 recall 工具。
+  //   工具定义本身由 profile 提供(见 config-compiler 的 helixRecallVirtualModelProfile),
+  //   这里只负责 prompt 侧的"何时调/怎么调"。两个 marker 段独立 prepend,互不覆盖。
   if (hasHC) {
-    // 注入 hc_recall 工具定义（去重）。协议分发: Anthropic 用 input_schema, OpenAI 用 parameters
-    const existingTools = Array.isArray(body.tools) ? body.tools : [];
-    const format = inferRequestFormat(body);
-    const recallName = helixCompressorRecallToolName;
-    const hasRecall = existingTools.some((t: unknown) => {
-      if (!isRecord(t)) return false;
-      // 兼容两种格式的查重
-      const fnName = (t.function as Record<string, unknown> | undefined)?.name;
-      return t.name === recallName || fnName === recallName;
-    });
-    if (!hasRecall) {
-      const schema = format === "anthropic"
-        ? HC_RECALL_TOOL_SCHEMA_ANTHROPIC
-        : HC_RECALL_TOOL_SCHEMA;
-      outputBody.tools = [...existingTools, schema];
-    }
-
-    // 注入教学 prompt
-    outputBody.messages = injectRecallInstruction(outputMessages);
+    outputMessages = injectRecallInstruction(outputMessages);
+    outputBody.messages = outputMessages;
   }
-
-  // V3.2: ⟦QA:hash⟧ 占位符(history_recall 工具)。同样按协议分发
   if (hasQA) {
-    const existingTools = Array.isArray(outputBody.tools) ? outputBody.tools : [];
-    const format = inferRequestFormat(body);
-    const historyName = HISTORY_RECALL_TOOL_NAME;
-    const hasHistoryRecall = existingTools.some((t: unknown) => {
-      if (!isRecord(t)) return false;
-      const fnName = (t.function as Record<string, unknown> | undefined)?.name;
-      return t.name === historyName || fnName === historyName;
-    });
-    if (!hasHistoryRecall) {
-      const schema = format === "anthropic"
-        ? HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC
-        : HISTORY_RECALL_TOOL_SCHEMA;
-      outputBody.tools = [...existingTools, schema];
-    }
-    // 注入教学 prompt(QA 版本)
-    outputBody.messages = injectHistoryRecallInstruction(outputMessages);
+    outputMessages = injectHistoryRecallInstruction(outputMessages);
+    outputBody.messages = outputMessages;
   }
 
   return {
+    ...(routedModel ? { routedModel } : {}),
     body: outputBody,
     headers: {
       [helixCompressorRequestIdHeader]: upstreamRequestId,
@@ -498,7 +434,10 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
       [helixCompressorBaselineTokensHeader]: String(tokenizeMessages(messages)),
       // v1.5: 压缩后 messages 的 token 数。UI 显示 "X→Y tok (Z%)" 时用,
       //   全 token 视图避免 chars/tokens 混用的歧义。
-      [helixCompressorCompressedTokensHeader]: String(tokenizeMessages(outputMessages))
+      [helixCompressorCompressedTokensHeader]: String(tokenizeMessages(outputMessages)),
+      // v1.6: ccr 实际提交给 LLM 的 token 数(= 压缩后 body)。DB trigger 读这个 key
+      //   填 request_logs.compression_submitted_tokens,不 emit 则 s 列恒为 0。
+      [helixCompressorSubmittedTokensHeader]: String(tokenizeMessages(outputMessages))
     },
     responseHeaders: {
       [helixCompressorRequestIdHeader]: upstreamRequestId,
@@ -510,7 +449,8 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
       [helixCompressorRatioHeader]: String(compressed.stats?.ratio ?? 0),
       [helixCompressorEnabledHeader]: "1",
       [helixCompressorBaselineTokensHeader]: String(tokenizeMessages(messages)),
-      [helixCompressorCompressedTokensHeader]: String(tokenizeMessages(outputMessages))
+      [helixCompressorCompressedTokensHeader]: String(tokenizeMessages(outputMessages)),
+      [helixCompressorSubmittedTokensHeader]: String(tokenizeMessages(outputMessages))
     }
   };
 };
@@ -521,68 +461,39 @@ function parseConfig(value: unknown): HelixCompressorConfig {
   if (!isRecord(value)) return HELIX_COMPRESSOR_DEFAULTS;
   return {
     ...HELIX_COMPRESSOR_DEFAULTS,
-    ...(typeof value.helixApiUrl === "string" ? { helixApiUrl: value.helixApiUrl } : {}),
-    ...(typeof value.helixApiKey === "string" ? { helixApiKey: value.helixApiKey } : {}),
-    ...(typeof value.evaluatorApiUrl === "string" ? { evaluatorApiUrl: value.evaluatorApiUrl } : {}),
-    ...(typeof value.evaluatorModel === "string" ? { evaluatorModel: value.evaluatorModel } : {}),
-    ...(typeof value.evaluatorApiKey === "string" ? { evaluatorApiKey: value.evaluatorApiKey } : {}),
-    ...(typeof value.sampleMod === "number" ? { sampleMod: value.sampleMod } : {}),
-    ...(typeof value.timeoutMs === "number" ? { timeoutMs: value.timeoutMs } : {}),
-    ...(typeof value.reportFailuresSilent === "boolean" ? { reportFailuresSilent: value.reportFailuresSilent } : {}),
-    ...(Array.isArray(value.skipOnErrorStatusCodes) ? { skipOnErrorStatusCodes: value.skipOnErrorStatusCodes as number[] } : {}),
     ...(typeof value.storeWithMedia === "boolean" ? { storeWithMedia: value.storeWithMedia } : {}),
     ...(typeof value.keepRecentPairs === "number" ? { keepRecentPairs: value.keepRecentPairs } : {}),
-    ...(typeof value.blockThresholdChars === "number" ? { blockThresholdChars: value.blockThresholdChars } : {})
+    ...(typeof value.blockThresholdChars === "number" ? { blockThresholdChars: value.blockThresholdChars } : {}),
+    ...(typeof value.compressMedia === "boolean" ? { compressMedia: value.compressMedia } : {}),
+    ...(typeof value.compressToolResults === "boolean" ? { compressToolResults: value.compressToolResults } : {}),
+    ...(typeof value.toolResultThresholdChars === "number" ? { toolResultThresholdChars: value.toolResultThresholdChars } : {}),
+    ...(typeof value.keepRecentToolResults === "number" ? { keepRecentToolResults: value.keepRecentToolResults } : {}),
+    ...(typeof value.maxCompressToolResults === "number" ? { maxCompressToolResults: value.maxCompressToolResults } : {}),
+    ...(typeof value.tokenBudget === "number" ? { tokenBudget: value.tokenBudget } : {}),
+    ...(typeof value.keepRecentTurns === "number" ? { keepRecentTurns: value.keepRecentTurns } : {}),
+    ...(typeof value.proactiveCompactTimeoutMs === "number" ? { proactiveCompactTimeoutMs: value.proactiveCompactTimeoutMs } : {}),
+    ...(typeof value.proactiveCompactModel === "string" ? { proactiveCompactModel: value.proactiveCompactModel } : {}),
+    ...(typeof value.proactiveCompactCacheTtlMs === "number" ? { proactiveCompactCacheTtlMs: value.proactiveCompactCacheTtlMs } : {}),
+    ...(typeof value.proactiveCompactMinNewMessages === "number" ? { proactiveCompactMinNewMessages: value.proactiveCompactMinNewMessages } : {}),
+    ...(Array.isArray(value.recallModelPatterns)
+      ? { recallModelPatterns: value.recallModelPatterns.filter((p): p is string => typeof p === "string") }
+      : {}),
+    ...(Array.isArray(value.recallModelExcludePatterns)
+      ? { recallModelExcludePatterns: value.recallModelExcludePatterns.filter((p): p is string => typeof p === "string") }
+      : {}),
+    ...(typeof value.recallModelDetected === "boolean" ? { recallModelDetected: value.recallModelDetected } : {}),
+    ...(typeof value.compactBudgetPercent === "number" ? { compactBudgetPercent: value.compactBudgetPercent } : {}),
+    ...(typeof value.compactBudgetFloorTokens === "number" ? { compactBudgetFloorTokens: value.compactBudgetFloorTokens } : {}),
+    ...(typeof value.compactBudgetCeilingTokens === "number" ? { compactBudgetCeilingTokens: value.compactBudgetCeilingTokens } : {}),
+    ...(isRecord(value.compactBudgetPercentOverrides)
+      ? {
+          compactBudgetPercentOverrides: Object.fromEntries(
+            Object.entries(value.compactBudgetPercentOverrides as Record<string, unknown>)
+              .filter((entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1]))
+          )
+        }
+      : {})
   };
-}
-
-function extractThinkingMode(body: Record<string, unknown>): boolean {
-  if (typeof body.thinking_mode === "boolean") return body.thinking_mode;
-  if (typeof body.thinkingMode === "boolean") return body.thinkingMode;
-  return false;
-}
-
-function clamp(v: unknown): number {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return 0;
-  return Math.max(1, Math.min(5, Math.round(n * 100) / 100));
-}
-
-/**
- * 鲁棒 JSON 解析：剥 <think> / 剥 markdown / 抽 {...}
- */
-function robustParseJson(content: string): Record<string, unknown> | null {
-  let text = content.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-
-  const mdMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (mdMatch) text = mdMatch[1].trim();
-
-  if (!text.startsWith("{")) {
-    const objMatch = text.match(/\{[\s\S]*\}/);
-    if (objMatch) text = objMatch[0];
-  }
-
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-function formatEvalPayload(
-  original: LLMMessage[],
-  compressed: LLMMessage[],
-  subjectModel: string
-): string {
-  return `## 待评估（被评模型：${subjectModel}）
-
-【原始】（${countChars(original)}字符）:
-${JSON.stringify(original).slice(0, 6000)}
-
-【压缩后】（${countChars(compressed)}字符）:
-${JSON.stringify(compressed).slice(0, 6000)}
-
-只返回 JSON。`;
 }
 
 function countChars(messages: LLMMessage[]): number {
@@ -625,14 +536,6 @@ function tokenizeMessages(messages: LLMMessage[]): number {
     // fallback:chars 估算
     return Math.round((countChars(messages) / 3) * 1.05);
   }
-}
-
-/**
- * 脱敏 API Key 用于日志
- */
-export function maskApiKey(key: string): string {
-  if (!key || key.length <= 8) return "***";
-  return `${key.slice(0, 8)}***${key.slice(-4)}`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -720,22 +623,6 @@ const HC_RECALL_INSTRUCTION = `${HC_RECALL_INSTRUCTION_MARKER}
 
 // hash_id 格式校验：8-128 位 hex
 const HASH_PATTERN = /^[0-9a-f]{8,128}$/;
-
-/**
- * 检测请求 body 的工具 schema 协议
- * - Anthropic: 工具用 {name, description, input_schema}
- * - OpenAI:    工具用 {type:"function", function:{...}}
- * 不存在或无法识别时默认 "OpenAI"（向后兼容原行为）
- */
-function inferRequestFormat(body: unknown): "anthropic" | "openai" {
-  if (!isRecord(body)) return "openai";
-  const tools = (body as Record<string, unknown>).tools;
-  if (!Array.isArray(tools) || tools.length === 0) return "openai";
-  const sample = tools[0];
-  if (!isRecord(sample)) return "openai";
-  if ("input_schema" in sample) return "anthropic";
-  return "openai";
-}
 
 // ============= PR-1: 客户端 preprocess(空消息 + task-notif 死信) =============
 
@@ -949,14 +836,18 @@ const HISTORY_RECALL_INSTRUCTION_MARKER = "<<HISTORY_RECALL_INSTRUCTION_v1>>";
 const HISTORY_RECALL_INSTRUCTION = `${HISTORY_RECALL_INSTRUCTION_MARKER}
 ## ⚠️ 历史 Q&A 召回机制
 
-对话中形如 \`⟦QA:abc123def4567890⟧\` 的标记是 **已被压缩的历史 Q&A 对**(原用户问题 + 原助手回答)。
-**这条占位符本身只携带"曾讨论过"信号**,不含具体细节 —— 看 hash 名不会让你知道那对 Q&A 说了什么。
+对话中形如 \`⟦QA:abc123def4567890⟧\` 的标记是 **被压缩掉的历史内容**,可能是:
+- **历史的 Q&A 对**(原用户问题 + 原助手回答),或
+- **被折叠的工具输出**(旧的 tool_result,如超大文件读取 / 命令输出 —— 为省 token 已折叠成占位符)。
+
+**这条占位符本身只携带"曾存在过"信号**,不含具体细节 —— 看 hash 名不会让你知道被压的是什么。
 
 ### 🎯 必须调用 \`${HISTORY_RECALL_TOOL_NAME}\` 的场景
 1. 当前任务需要某个历史 Q&A 里的 **具体数字 / 名称 / 代码 / 原文片段**
 2. 用户提问明确指向历史:"刚才/之前/我们前面聊过的 X 是什么"
 3. 比较/引用:**"对比之前那张图"**、"**用前面那份 PDF** 里的某段"
 4. 上下文依赖:**不调回历史内容,当前任务就无法正确完成**
+5. 需要某段**已折叠的工具输出原文**(之前 Read/Bash/Grep 的完整结果被折叠成 ⟦QA:⟧ 了)
 
 ### ✅ 通常**不需要**调用的场景
 - 只关心"我们讨论过 X"的方向感,不需要细节
@@ -966,7 +857,7 @@ const HISTORY_RECALL_INSTRUCTION = `${HISTORY_RECALL_INSTRUCTION_MARKER}
 - 占位符: \`⟦QA:abc123def4567890⟧\`
 - \`hash_id\` = 中间 16 位 hex(去掉 \`⟦QA:\` 前缀和 \`⟧\` 后缀):**\`abc123def4567890\`**
 - 默认 \`with_media=false\`,只返回 Q+A 文本 —— **A 已包含助手对图片/视频/文档内容的文字描述**,绝大多数情况已够用
-- 仅当 Q 中含**图片/视频/原文档**且你需要**像素级细节**或**原文某段引用**时,才设 \`with_media=true\`
+- 仅当历史 Q 中含**图片**(image)且你需要**像素级细节**时,才设 \`with_media=true\` —— 此时会返回**可直接查看的原图**,你能真正看到它
 
 ### 调用示例
 \`\`\`
@@ -983,8 +874,20 @@ ${HISTORY_RECALL_TOOL_NAME}(hash_id="abc123def4567890", with_media=true, reason=
 /** 检测 ⟦QA:hash⟧ 占位符(V3.2 Q&A pair 压缩) */
 export function hasQAPlaceholder(messages: LLMMessage[]): boolean {
   if (!Array.isArray(messages)) return false;
-  for (const m of messages) {
-    if (typeof m.content === "string" && m.content.includes("⟦QA:")) return true;
+  // 必须同时处理字符串 content 与**数组块** content —— 真实 Claude Code 的
+  //   content 恒为 [{type:"text",text:"⟦QA:hash⟧"}] 数组形状,只检查字符串会永远漏检
+  //   → history_recall 工具与教学 prompt 从不注入(与 hasHCPlaceholder 对齐)。
+  for (const msg of messages) {
+    if (!msg) continue;
+    const content = msg.content;
+    if (typeof content === "string" && content.includes("⟦QA:")) return true;
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block && typeof block === "object" && typeof block.text === "string" && block.text.includes("⟦QA:")) {
+          return true;
+        }
+      }
+    }
   }
   return false;
 }
@@ -1069,7 +972,6 @@ export const helixCompressorResponseHook: GatewayPluginResponseHookHandler = asy
   input,
   context
 ): Promise<GatewayPluginResponseHookResult> => {
-  const config = parseConfig(context.pluginConfig);
   const response = input.responsePayload;
 
   if (!isRecord(response)) {
@@ -1106,8 +1008,8 @@ export const helixCompressorResponseHook: GatewayPluginResponseHookHandler = asy
   // V3.2: history_recall 调用带 with_media,LLM 决定是否回原图
   const hcHashes = validHcCalls.map(c => c.hash_id);
   const [hcResults, historyResults] = await Promise.all([
-    hcHashes.length > 0 ? fetchRecallBatch(hcHashes, config) : Promise.resolve([]),
-    validHistoryCalls.length > 0 ? fetchHistoryRecallBatch(validHistoryCalls, config) : Promise.resolve([])
+    hcHashes.length > 0 ? fetchRecallBatch(hcHashes) : Promise.resolve([]),
+    validHistoryCalls.length > 0 ? fetchHistoryRecallBatch(validHistoryCalls) : Promise.resolve([])
   ]);
 
   // 构造 tool result messages(V2 + V3.2 合并)
@@ -1126,15 +1028,28 @@ export const helixCompressorResponseHook: GatewayPluginResponseHookHandler = asy
       return makeToolResultMessage(input.protocol, call.tool_call_id, `[helix-compressor] Q&A pair not found: ${call.hash_id}`, true);
     }
     // V3.2: history_recall 返回 q + a 两段;LLM 传 with_media=true 时附带 q_media(原图/原文档字节)
-    const content = JSON.stringify({
+    const images = result.pair.qMedia ? normalizeMediaImages(result.pair.qMedia) : [];
+    const textContent = JSON.stringify({
       q: result.pair.q,
       a: result.pair.a,
-      ...(result.pair.qMedia ? { q_media: result.pair.qMedia } : {})
+      ...(result.pair.qMedia && images.length === 0 ? { q_media: result.pair.qMedia } : {})
     }, null, 2);
-    return makeToolResultMessage(input.protocol, call.tool_call_id, content, false);
+    // V3.4: 图片以真实 image 内容块返回(anthropic tool_result 支持块数组),
+    //   模型可直接查看;非 anthropic 协议或无图片时保持纯文本。
+    if (images.length > 0 && input.protocol === "anthropic") {
+      return makeToolResultMessageBlocks(call.tool_call_id, textContent, images);
+    }
+    return makeToolResultMessage(input.protocol, call.tool_call_id, textContent, false);
   });
 
   const messagesToAppend: LLMMessage[] = [...hcMessages, ...historyMessages];
+
+  // 2026-10-16: 统计本次回填的召回原文 token 数 —— 「真实端到端节省」要把这部分
+  //   从 post(压缩后 messages)口径里扣掉(上游实收 = post + 召回回填 + system/tools)。
+  //   用与 baseline 相同的 gpt-tokenizer(cl100k_base)口径,保证和 post 可比。
+  const recallTokens = messagesToAppend.length > 0
+    ? gptEncode(JSON.stringify(messagesToAppend)).length
+    : 0;
 
   // 审计日志(V2 hc_recall + V3.2 history_recall 合并统计)
   // 旧版此处引用 V2 时代的 `recallResults`/`validCalls`(V3.2 已拆分),
@@ -1151,7 +1066,8 @@ export const helixCompressorResponseHook: GatewayPluginResponseHookHandler = asy
 
   return {
     continueLoop: true,
-    messagesToAppend
+    messagesToAppend,
+    recallTokens
   };
 };
 
@@ -1219,106 +1135,66 @@ export function extractAnthropicHcrecallCalls(response: Record<string, unknown>)
   return calls;
 }
 
-// 并发批量召回
-async function fetchRecallBatch(
-  hashes: string[],
-  config: HelixCompressorConfig
-): Promise<Array<{ hash: string; original: string | null }>> {
-  // 优先 batch API
-  try {
-    const resp = await fetch(`${config.helixApiUrl}/v1/recall/batch`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${config.helixApiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ hashes }),
-      signal: AbortSignal.timeout(config.timeoutMs ?? 10000)
-    });
+// ============= Recall 读取（本地 store） =============
+//
+// 2026-10-15 P2：占位符原文只存在于本地 JSONL 缓存（压缩 transform 落盘），
+// 召回不调任何云端 API。设计见
+// docs/issue-reviews/2026-10-14-local-closed-loop-recall-design.md §7。
+// 云端压缩 / 召回路径已整体移除——原文一律由本地 store 持有。
 
-    if (resp.ok) {
-      const data = await resp.json();
-      const raw = data.results || {};
-      // 兼容两种格式：
-      // 1. { hash: "content" } 对象（当前云端实现）
-      // 2. [{ hash, original }] 数组（未来可能改）
-      const items = Array.isArray(raw)
-        ? raw
-        : Object.entries(raw).map(([hash, original]) => ({
-            hash,
-            original: typeof original === "string" ? original : null
-          }));
-      return items.map((r: { hash: string; original?: string | null }) => ({
-        hash: r.hash,
-        original: r.original ?? null
-      }));
-    }
-  } catch {
-    // Fallback 到并发单接口
+/** 兜底配置缓存目录：transform 路径已设置；无压缩发生的进程回退到默认 DATADIR 目录。 */
+function ensureLocalRecallCacheDir(): void {
+  if (!process.env.HELIX_RECALL_CACHE_DIR) {
+    process.env.HELIX_RECALL_CACHE_DIR = HELIX_RECALL_DIR;
   }
-
-  // Fallback：并发调用
-  return Promise.all(
-    hashes.map(async (hash) => {
-      try {
-        const resp = await fetch(`${config.helixApiUrl}/v1/recall`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${config.helixApiKey}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({ hash }),
-          signal: AbortSignal.timeout(5000)
-        });
-        if (!resp.ok) return { hash, original: null };
-        const data = await resp.json();
-        return { hash, original: data.original ?? null };
-      } catch {
-        return { hash, original: null };
-      }
-    })
-  );
 }
 
-// V3.2: history_recall 批量召回(Q&A pair,含 q + a,可按 LLM 选择回原图)
-// 参数:calls[].with_media → 告诉服务端是否回原图(默认 false = 只文本)
+/** 批量召回 hc_recall(block/文本块):hash → 原文(q 字段)。未命中 → null。 */
+async function fetchRecallBatch(
+  hashes: string[]
+): Promise<Array<{ hash: string; original: string | null }>> {
+  if (hashes.length === 0) return [];
+  ensureLocalRecallCacheDir();
+  let entries: Record<string, RecallCacheEntry>;
+  try {
+    entries = batchGetRecallCache(hashes);
+  } catch {
+    return hashes.map((hash) => ({ hash, original: null }));
+  }
+  return hashes.map((hash) => {
+    const entry = entries[hash];
+    return { hash, original: typeof entry?.q === "string" ? entry.q : null };
+  });
+}
+
+// V3.2: history_recall 批量召回(Q&A pair,含 q + a;with_media 时附带 qMedia 原媒体块)
 async function fetchHistoryRecallBatch(
-  calls: Array<{ hash_id: string; with_media?: boolean }>,
-  config: HelixCompressorConfig
+  calls: Array<{ hash_id: string; with_media?: boolean }>
 ): Promise<Array<{
   hash: string;
   pair: { q: string; a: string; qMedia?: unknown[] } | null;
 }>> {
-  return Promise.all(
-    calls.map(async ({ hash_id: hash, with_media = false }) => {
-      try {
-        const resp = await fetch(`${config.helixApiUrl}/v1/history/recall`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${config.helixApiKey}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({ hash_id: hash, with_media }),
-          signal: AbortSignal.timeout(5000)
-        });
-        if (!resp.ok) return { hash, pair: null };
-        const data = await resp.json();
-        if (data && data.q !== undefined) {
-          return {
-            hash,
-            pair: {
-              q: data.q || "",
-              a: data.a || "",
-              ...(Array.isArray(data.q_media) && data.q_media.length > 0 ? { qMedia: data.q_media } : {})
-            }
-          };
-        }
-        return { hash, pair: null };
-      } catch {
-        return { hash, pair: null };
-      }
-    })
-  );
+  if (calls.length === 0) return [];
+  ensureLocalRecallCacheDir();
+  const hashes = calls.map((c) => c.hash_id);
+  let entries: Record<string, RecallCacheEntry>;
+  try {
+    entries = batchGetRecallCache(hashes);
+  } catch {
+    return calls.map((c) => ({ hash: c.hash_id, pair: null }));
+  }
+  return calls.map(({ hash_id: hash, with_media = false }) => {
+    const entry = entries[hash];
+    if (!entry) return { hash, pair: null };
+    const pair: { q: string; a: string; qMedia?: unknown[] } = {
+      q: typeof entry.q === "string" ? entry.q : "",
+      a: typeof entry.a === "string" ? entry.a : ""
+    };
+    if (with_media && Array.isArray(entry.qMedia) && entry.qMedia.length > 0) {
+      pair.qMedia = entry.qMedia;
+    }
+    return { hash, pair };
+  });
 }
 
 // V3.2: 构造 tool result message(anthropic + openai 两种协议共用)
@@ -1344,6 +1220,55 @@ function makeToolResultMessage(
     tool_call_id: toolCallId,
     content
   } as unknown as LLMMessage;
+}
+
+/**
+ * V3.4: anthropic tool_result 用**块数组**承载文本 + 真实 image 块,
+ * 使模型可直接查看召回的原图(而非把 base64 当文本读)。
+ */
+function makeToolResultMessageBlocks(
+  toolCallId: string,
+  text: string,
+  images: Array<{ data: string; mimeType: string }>
+): LLMMessage {
+  return {
+    role: "user",
+    content: [{
+      type: "tool_result",
+      tool_use_id: toolCallId,
+      content: [
+        { type: "text", text },
+        ...images.map((img) => ({
+          type: "image",
+          source: { type: "base64", media_type: img.mimeType, data: img.data }
+        }))
+      ],
+      is_error: false
+    }]
+  } as unknown as LLMMessage;
+}
+
+/**
+ * 归一化 qMedia 的两种形状为可渲染图片:
+ *   ① pair 路径 `{type:"image", mime, data}`(extractMediaBlocks 归一化产物)
+ *   ② 媒体候选原块 `{type:"image", source:{type:"base64", media_type, data}}`
+ * 非图片(document/video/audio/url)忽略,保持文本承载。
+ */
+function normalizeMediaImages(qMedia: unknown[]): Array<{ data: string; mimeType: string }> {
+  const out: Array<{ data: string; mimeType: string }> = [];
+  for (const item of qMedia) {
+    if (!isRecord(item)) continue;
+    if (item.type !== "image" && item.type !== "image_url") continue;
+    const src = isRecord(item.source) ? item.source : undefined;
+    const data = typeof item.data === "string"
+      ? item.data
+      : src && typeof src.data === "string" ? src.data : undefined;
+    const mimeType =
+      (src && typeof src.media_type === "string" ? src.media_type : undefined) ??
+      (typeof item.mime === "string" ? item.mime : "image/png");
+    if (data) out.push({ data, mimeType });
+  }
+  return out;
 }
 
 // V3.2: history_recall 调用提取
@@ -1372,8 +1297,8 @@ export function extractAnthropicHistoryRecallCalls(response: Record<string, unkn
   return calls;
 }
 
-export function extractOpenAIHistoryRecallCalls(response: Record<string, unknown>): Array<{ hash_id: string; tool_call_id: string }> {
-  const calls: Array<{ hash_id: string; tool_call_id: string }> = [];
+export function extractOpenAIHistoryRecallCalls(response: Record<string, unknown>): Array<{ hash_id: string; tool_call_id: string; with_media?: boolean }> {
+  const calls: Array<{ hash_id: string; tool_call_id: string; with_media?: boolean }> = [];
   const choices = response.choices;
   if (!Array.isArray(choices)) return calls;
   for (const choice of choices) {

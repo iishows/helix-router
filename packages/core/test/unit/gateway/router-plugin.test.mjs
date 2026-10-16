@@ -20,6 +20,7 @@ import {
   ccrRouterRouteResolverKey,
   ccrRouterRequestTransformKey
 } from "@ccr/core/gateway/core-runtime/router-plugin-contract.ts";
+import { helixCompressorRequestTransformKey } from "@ccr/core/plugins/built-ins/helix-compressor.ts";
 import { coalesceAnthropicReasoningResponse } from "@ccr/core/gateway/features/anthropic-reasoning-response.ts";
 import { coreGatewayAuthHeader } from "@ccr/core/gateway/internal/shared.ts";
 import { ccrRemoteControlPathPrefix } from "@ccr/core/gateway/remote-control-service.ts";
@@ -86,6 +87,30 @@ test("CCR router core plugin exposes route endpoint and beforeRouting transform"
   assert.equal(resolved.targetProviderName, providerRuntimeId(config.Providers[1]));
   assert.equal(resolved.model, "beta");
   assert.equal(resolved.requestBody.model, "beta");
+});
+
+// helix V1.4 / 2026-10-15:回归锁 — helix-compressor 的 request transform 必须注册在
+// "beforeRouting" 阶段,不能退回 "beforeUpstream"。
+//   外部网关(ai-gateway)的转换路径(anthropic source → openai_chat target)在构建上游
+//   body 时只读 transform 返回的 standardRequest(`buildRequestFromStandard({standardRequest})`);
+//   若 transform 返回 requestBody(helix 的实现)且注册在 beforeUpstream,压缩结果会被静默丢弃,
+//   端到端压缩率=0%(mock upstream 实测:修复前 25 条原始消息/无占位符,修复后 14 条/14 占位符)。
+//   beforeRouting 阶段改 requestBody 会写回 e.body,之后网关从 e.body 重建 standardRequest。
+test("helix-compressor request transform is registered at beforeRouting stage (body must reach upstream)", async () => {
+  const config = createDefaultAppConfig();
+  config.Providers = [{ models: ["alpha"], name: "Primary", type: "openai_chat_completions" }];
+  config.plugins = [{
+    config: {},
+    enabled: true,
+    id: "helix-compressor"
+  }];
+
+  const plugin = await createGatewayPlugin({ plugin: { config: { appConfig: config } } });
+  const transform = plugin.requestTransforms.find(
+    (item) => item.key === helixCompressorRequestTransformKey
+  );
+  assert.ok(transform, "helix-compressor request transform must be registered");
+  assert.equal(transform.stage, "beforeRouting");
 });
 
 test("CCR router core plugin publishes live token rate snapshots from the single runtime", async () => {

@@ -881,6 +881,352 @@ function requestForProtocol(protocol: GatewayProviderCapabilityProtocol, model: 
   };
 }
 
+// ============= recall 能力探测 =============
+//
+// 判据:模型能否走通 tool-calling 往返(helix recall 依赖模型按教学 prompt 调用 hc_recall 工具)。
+//   depth="tools"  → 带 tools 声明的握手里真的回了 tool_use(最强,recall 透明还原可用)。
+//   depth="offline"→ 无视 tools 但能从 prompt 作答(弱,但仍算可 recall)。
+//   depth="none"   → 两者都不行。
+// 401/403 视为「未知」(skipped) —— 不清零白名单、不落缓存。
+
+export type ModelRecallSupportProbe = {
+  model: string;
+  protocol: GatewayProviderProtocol;
+  depth: "none" | "offline" | "tools";
+  recallCapable: boolean;
+  /** 凭据/权限问题导致无法判定(不落缓存、不进白名单)。 */
+  skipped?: boolean;
+  status?: number;
+  message: string;
+};
+
+const RECALL_PROBE_TOOL_NAME = "recall_probe";
+
+const RECALL_PROBE_TOOL_INSTRUCTION = `Call the ${RECALL_PROBE_TOOL_NAME} tool with value=1.`;
+const RECALL_PROBE_TOOL_DESCRIPTION = "Echo the value back.";
+const RECALL_PROBE_TEXT_INSTRUCTION = "Answer with the single word: ok.";
+
+/** JSON Schema(下划线风格,openai 家族用)。 */
+const RECALL_PROBE_TOOL_PARAMETERS = {
+  properties: { value: { type: "integer" } },
+  required: ["value"],
+  type: "object"
+};
+
+/** Gemini 用大写 proto 枚举类型。 */
+const RECALL_PROBE_GEMINI_PARAMETERS = {
+  properties: { value: { type: "INTEGER" } },
+  required: ["value"],
+  type: "OBJECT"
+};
+
+/**
+ * 构造一个强制调用 `recall_probe` 工具的最小请求(仅 tools 探测用)。
+ *
+ * 五种上游协议的 tools / tool_choice 形状各不相同,这里逐协议构造:
+ *   - openai_chat_completions:`tools[].function` + `tool_choice:{type:"function",function:{name}}`
+ *   - openai_responses:`tools[]:{type:"function",name,parameters}` + `tool_choice:{type:"function",name}` + `input`
+ *   - anthropic_messages:`tools[]:{name,input_schema}` + `tool_choice:{type:"tool",name}`
+ *   - gemini_generate_content:`tools:[{functionDeclarations}]` + `toolConfig.functionCallingConfig{ANY}`
+ *   - gemini_interactions:`tools[]:{type:"function",name}` + `tool_choice:{allowed_tools:{mode:"any",tools:[name]}}`
+ */
+function recallProbeToolBody(protocol: GatewayProviderProtocol, model: string): Record<string, unknown> {
+  if (protocol === "anthropic_messages") {
+    return {
+      max_tokens: 64,
+      messages: [{ content: RECALL_PROBE_TOOL_INSTRUCTION, role: "user" }],
+      model,
+      stream: false,
+      tool_choice: { name: RECALL_PROBE_TOOL_NAME, type: "tool" },
+      tools: [{ description: RECALL_PROBE_TOOL_DESCRIPTION, input_schema: RECALL_PROBE_TOOL_PARAMETERS, name: RECALL_PROBE_TOOL_NAME }]
+    };
+  }
+  if (protocol === "openai_responses") {
+    return {
+      input: RECALL_PROBE_TOOL_INSTRUCTION,
+      max_output_tokens: 64,
+      model,
+      stream: false,
+      tool_choice: { name: RECALL_PROBE_TOOL_NAME, type: "function" },
+      tools: [{ description: RECALL_PROBE_TOOL_DESCRIPTION, name: RECALL_PROBE_TOOL_NAME, parameters: RECALL_PROBE_TOOL_PARAMETERS, type: "function" }]
+    };
+  }
+  if (protocol === "gemini_generate_content") {
+    return {
+      contents: [{ parts: [{ text: RECALL_PROBE_TOOL_INSTRUCTION }], role: "user" }],
+      generationConfig: { maxOutputTokens: 64 },
+      model,
+      toolConfig: { functionCallingConfig: { allowedFunctionNames: [RECALL_PROBE_TOOL_NAME], mode: "ANY" } },
+      tools: [{ functionDeclarations: [{ description: RECALL_PROBE_TOOL_DESCRIPTION, name: RECALL_PROBE_TOOL_NAME, parameters: RECALL_PROBE_GEMINI_PARAMETERS }] }]
+    };
+  }
+  if (protocol === "gemini_interactions") {
+    return {
+      generation_config: { max_output_tokens: 64 },
+      input: RECALL_PROBE_TOOL_INSTRUCTION,
+      model,
+      store: false,
+      tool_choice: { allowed_tools: { mode: "any", tools: [RECALL_PROBE_TOOL_NAME] } },
+      tools: [{ description: RECALL_PROBE_TOOL_DESCRIPTION, name: RECALL_PROBE_TOOL_NAME, parameters: RECALL_PROBE_TOOL_PARAMETERS, type: "function" }]
+    };
+  }
+  return {
+    max_tokens: 64,
+    messages: [{ content: RECALL_PROBE_TOOL_INSTRUCTION, role: "user" }],
+    model,
+    stream: false,
+    tool_choice: { function: { name: RECALL_PROBE_TOOL_NAME }, type: "function" },
+    tools: [{ function: { description: RECALL_PROBE_TOOL_DESCRIPTION, name: RECALL_PROBE_TOOL_NAME, parameters: RECALL_PROBE_TOOL_PARAMETERS }, type: "function" }]
+  };
+}
+
+/** 最简「能否作答」请求(offline 探测用,不带 tools)。 */
+function recallProbeTextBody(protocol: GatewayProviderProtocol, model: string): Record<string, unknown> {
+  if (protocol === "gemini_generate_content") {
+    return {
+      contents: [{ parts: [{ text: RECALL_PROBE_TEXT_INSTRUCTION }], role: "user" }],
+      generationConfig: { maxOutputTokens: 16 },
+      model
+    };
+  }
+  if (protocol === "gemini_interactions") {
+    return { generation_config: { max_output_tokens: 16 }, input: RECALL_PROBE_TEXT_INSTRUCTION, model, store: false };
+  }
+  if (protocol === "openai_responses") {
+    return { input: RECALL_PROBE_TEXT_INSTRUCTION, max_output_tokens: 16, model, stream: false };
+  }
+  return { max_tokens: 16, messages: [{ content: RECALL_PROBE_TEXT_INSTRUCTION, role: "user" }], model, stream: false };
+}
+
+/** 请求体 + 鉴权头(按协议)。 */
+function recallProbeRequestInit(protocol: GatewayProviderProtocol, body: Record<string, unknown>, apiKey: string | undefined): RequestInit {
+  return {
+    body: JSON.stringify(body),
+    headers: {
+      "content-type": "application/json",
+      ...headersForProtocol(protocol, apiKey)
+    },
+    method: "POST"
+  };
+}
+
+/** 响应里是否含名为 recall_probe 的工具调用块(逐协议)。 */
+function recallProbeHasToolCall(payload: unknown, protocol: GatewayProviderProtocol): boolean {
+  if (!isRecord(payload)) {
+    return false;
+  }
+  if (protocol === "anthropic_messages") {
+    const blocks = Array.isArray(payload.content) ? payload.content : [];
+    return blocks.some((block) =>
+      isRecord(block) && block.type === "tool_use" && block.name === RECALL_PROBE_TOOL_NAME
+    );
+  }
+  if (protocol === "openai_responses") {
+    const output = Array.isArray(payload.output) ? payload.output : [];
+    return output.some((item) => {
+      if (!isRecord(item) || item.type !== "function_call") {
+        return false;
+      }
+      const functionPayload = isRecord(item.function) ? item.function : undefined;
+      return item.name === RECALL_PROBE_TOOL_NAME || functionPayload?.name === RECALL_PROBE_TOOL_NAME;
+    });
+  }
+  if (protocol === "gemini_generate_content" || protocol === "gemini_interactions") {
+    return geminiRecallProbeParts(payload).some((part) => {
+      // generate_content:part.functionCall.name;interactions:step 直接是 {type:"function_call",name}。
+      const call = isRecord(part.functionCall) ? part.functionCall : isRecord(part.function_call) ? part.function_call : undefined;
+      if (call?.name === RECALL_PROBE_TOOL_NAME) {
+        return true;
+      }
+      return part.type === "function_call" && part.name === RECALL_PROBE_TOOL_NAME;
+    });
+  }
+  const choices = Array.isArray(payload.choices) ? payload.choices : [];
+  return choices.some((choice) => {
+    if (!isRecord(choice) || !isRecord(choice.message)) {
+      return false;
+    }
+    const calls = Array.isArray(choice.message.tool_calls) ? choice.message.tool_calls : [];
+    return calls.some((call) => isRecord(call) && isRecord(call.function) && call.function.name === RECALL_PROBE_TOOL_NAME);
+  });
+}
+
+/**
+ * gemini 两种协议的响应「内容部件」扁平化:
+ *   - generate_content:candidates[].content.parts[]
+ *   - interactions:steps[].content[] 与顶层 steps[] 本身(function_call 直接挂 step 上)
+ */
+function geminiRecallProbeParts(payload: Record<string, unknown>): Array<Record<string, unknown>> {
+  if (payload.object === "interaction" || Array.isArray(payload.steps)) {
+    const steps = Array.isArray(payload.steps) ? payload.steps : [];
+    const parts: Array<Record<string, unknown>> = [];
+    for (const step of steps) {
+      if (!isRecord(step)) {
+        continue;
+      }
+      parts.push(step);
+      const content = Array.isArray(step.content) ? step.content : [];
+      for (const item of content) {
+        if (isRecord(item)) {
+          parts.push(item);
+        }
+      }
+    }
+    return parts;
+  }
+  const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
+  const parts: Array<Record<string, unknown>> = [];
+  for (const candidate of candidates) {
+    const content = isRecord(candidate) && isRecord(candidate.content) ? candidate.content : undefined;
+    const candidateParts = content && Array.isArray(content.parts) ? content.parts : [];
+    for (const part of candidateParts) {
+      if (isRecord(part)) {
+        parts.push(part);
+      }
+    }
+  }
+  return parts;
+}
+
+/** 响应里是否有非空 assistant 文本(offline 判据,逐协议)。 */
+function recallProbeHasText(payload: unknown, protocol: GatewayProviderProtocol): boolean {
+  if (!isRecord(payload)) {
+    return false;
+  }
+  if (protocol === "anthropic_messages") {
+    const blocks = Array.isArray(payload.content) ? payload.content : [];
+    return blocks.some((block) => isRecord(block) && block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0);
+  }
+  if (protocol === "openai_responses") {
+    // Responses API 常带顶层 `output_text` 便利字段;否则回退解析 output[] 里的文本块。
+    if (typeof payload.output_text === "string" && payload.output_text.trim().length > 0) {
+      return true;
+    }
+    const output = Array.isArray(payload.output) ? payload.output : [];
+    return output.some((item) => {
+      if (!isRecord(item)) {
+        return false;
+      }
+      const content = Array.isArray(item.content) ? item.content : [item];
+      return content.some((block) => isRecord(block) && typeof block.text === "string" && block.text.trim().length > 0);
+    });
+  }
+  if (protocol === "gemini_generate_content" || protocol === "gemini_interactions") {
+    return geminiRecallProbeParts(payload).some(
+      (part) => part.thought !== true && typeof part.text === "string" && part.text.trim().length > 0
+    );
+  }
+  const choices = Array.isArray(payload.choices) ? payload.choices : [];
+  return choices.some((choice) => {
+    if (!isRecord(choice) || !isRecord(choice.message)) {
+      return false;
+    }
+    const content = choice.message.content;
+    if (typeof content === "string") {
+      return content.trim().length > 0;
+    }
+    return Array.isArray(content) && content.some((block) => isRecord(block) && typeof block.text === "string" && block.text.trim().length > 0);
+  });
+}
+
+/**
+ * 探测单个模型是否支持 recall(tool-calling 往返)。
+ * 两段式:先 tools 握手,失败再试 offline 文本作答。首个通过即返回。
+ */
+export async function probeModelRecallSupport(
+  provider: { api_base_url?: string; baseUrl?: string; baseurl?: string; api_key?: string; apiKey?: string; apikey?: string; type?: string; name?: string },
+  model: string,
+  protocol: GatewayProviderProtocol,
+  providerPlugins: unknown[] = []
+): Promise<ModelRecallSupportProbe> {
+  const baseUrl = provider.baseurl || provider.baseUrl || provider.api_base_url || "";
+  const apiKey = provider.api_key || provider.apiKey || provider.apikey;
+  const base: ModelRecallSupportProbe = {
+    depth: "none",
+    message: "No probe performed.",
+    model,
+    protocol,
+    recallCapable: false
+  };
+  if (!baseUrl.trim() || !model.trim()) {
+    return base;
+  }
+  const parsed = parseProviderUrl(baseUrl);
+  const endpoints = endpointsForProtocol(parsed, protocol, model);
+  if (endpoints.length === 0) {
+    return { ...base, message: "No endpoint candidates available." };
+  }
+
+  // 1) tools 握手
+  let firstToolResult: { status?: number; message: string } | undefined;
+  // 只要任一候选端点返回过 HTTP 状态,就说明「链路可达」——此时的否定结果才是可信判定。
+  // 全程拿不到状态(超时 / DNS / 连接被拒)= 无法判定,须标 skipped,不得谎报 none(否则会被缓存)。
+  let observedStatus: number | undefined;
+  for (const candidate of endpoints) {
+    const request = await providerProbeAuthRequest(
+      candidate.endpoint,
+      recallProbeRequestInit(protocol, recallProbeToolBody(protocol, model), apiKey),
+      providerPlugins,
+      apiKey,
+      { model }
+    );
+    const result = await requestJson(request.url, request.init);
+    const message = readResponseMessage(result);
+    if (result.status !== undefined) {
+      observedStatus = result.status;
+    }
+    if (recallProbeHasToolCall(result.payload, protocol)) {
+      return { ...base, depth: "tools", message, recallCapable: true, status: result.status };
+    }
+    // 鉴权问题 → 无法判定,标记 skipped,不再往下探。
+    if (result.status === 401 || result.status === 403) {
+      return { ...base, message, skipped: true, status: result.status };
+    }
+    firstToolResult ??= { message, status: result.status };
+    // 明确「不支持工具」的 400/422:不必再试其他 baseUrl,直接进 offline 段。
+    if (result.status === 400 || result.status === 422) {
+      break;
+    }
+  }
+
+  // 2) offline 文本作答
+  for (const candidate of endpoints) {
+    const request = await providerProbeAuthRequest(
+      candidate.endpoint,
+      recallProbeRequestInit(protocol, recallProbeTextBody(protocol, model), apiKey),
+      providerPlugins,
+      apiKey,
+      { model }
+    );
+    const result = await requestJson(request.url, request.init);
+    const message = readResponseMessage(result);
+    if (result.status !== undefined) {
+      observedStatus = result.status;
+    }
+    if (result.status === 401 || result.status === 403) {
+      return { ...base, message, skipped: true, status: result.status };
+    }
+    if (result.status !== undefined && result.status >= 200 && result.status < 300 && recallProbeHasText(result.payload, protocol)) {
+      return { ...base, depth: "offline", message, recallCapable: true, status: result.status };
+    }
+  }
+
+  // 全程无可达端点 → 未知,不落白名单/缓存(下次重探)。
+  if (observedStatus === undefined) {
+    return {
+      ...base,
+      message: firstToolResult?.message ?? "Recall probe could not reach the provider.",
+      skipped: true
+    };
+  }
+
+  return {
+    ...base,
+    message: firstToolResult?.message ?? "Model did not call tools nor answer from prompt.",
+    status: firstToolResult?.status ?? observedStatus
+  };
+}
+
 function requestForProtocolSupport(protocol: GatewayProviderCapabilityProtocol, apiKey: string | undefined): RequestInit {
   return {
     body: JSON.stringify(mediaProbeBody(protocol)),

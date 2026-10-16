@@ -4,9 +4,12 @@ import { Readable } from "node:stream";
 import type { ApiKeyConfig, AppConfig, ProfileConfig, RequestRouteTraceChange, RequestStreamMetrics, RouterFallbackConfig } from "@ccr/core/contracts/app";
 import {
   createSseErrorDetector,
+  headersToRecord,
   markGatewayRequestLogDropped,
+  parseProactiveCompactJson,
   recordGatewayRequestLog
 } from "@ccr/core/observability/request-log-store";
+import { consumeCompressionStat } from "@ccr/core/observability/compression-stats-store";
 import { requestLogRequestedModel, requestLogResponseModel } from "@ccr/core/observability/request-log-model";
 import { recordGatewayUsageCapture, type UsageCaptureInput } from "@ccr/core/usage/store";
 import { ClaudeCodeRouterPlugin, type ClaudeCodeRouteDecision } from "@ccr/core/gateway/claude-code-router-plugin";
@@ -84,6 +87,8 @@ type HelixCompressorRecallLoopInput = {
 type HelixCompressorRecallLoopResult = {
   upstreamResult: UpstreamFetchResult;
   body: Buffer;
+  /** 本次请求所有 recall 轮次回填的原文 token 数累计(2026-10-16)。 */
+  recallTokens: number;
 };
 
 /**
@@ -107,6 +112,7 @@ async function runHelixCompressorRecallLoop(
 ): Promise<HelixCompressorRecallLoopResult> {
   let currentResult = input.initialResult;
   let currentBody: Buffer = input.initialBody;
+  let recallTokens = 0;
   const loopStartedAt = Date.now();
   const LOOP_TIMEOUT_MS = 60000;
 
@@ -150,12 +156,15 @@ async function runHelixCompressorRecallLoop(
       });
       return {
         upstreamResult: { ...currentResult, response: newResponse },
-        body: currentBody
+        body: currentBody,
+        recallTokens
       };
     }
 
     // 不需要继续 loop
     if (!hookResult.continueLoop || !hookResult.messagesToAppend?.length) break;
+    // 累计本轮回填的召回原文 token(多轮 recall 相加)。
+    if (hookResult.recallTokens) recallTokens += hookResult.recallTokens;
 
     // 构造新 body（追加 messages）
     let bodyJson: Record<string, unknown>;
@@ -192,7 +201,7 @@ async function runHelixCompressorRecallLoop(
     currentResult = nextResult;
   }
 
-  return { upstreamResult: currentResult, body: currentBody };
+  return { upstreamResult: currentResult, body: currentBody, recallTokens };
 }
 
 export type GatewayRequestPipelineDependencies = {
@@ -264,6 +273,8 @@ export class GatewayRequestPipeline {
       const startedAt = Date.now();
       const startedAtIso = new Date(startedAt).toISOString();
       const requestId = randomUUID();
+      // 2026-10-16: recall loop 回填的原文 token 累计,供 request log 的「真实端到端节省」口径。
+      let recallTokens = 0;
       const requestBody = await readRequestBody(request);
       const requestedModel = requestLogRequestedModel(requestBody, path);
       const requestUrl = new URL(request.url || path, this.status.endpoint || "http://127.0.0.1").toString();
@@ -438,9 +449,32 @@ export class GatewayRequestPipeline {
         }
         const bodyCapture = config.observability.requestLogBodyCapture ?? "all";
         const captureBody = bodyCapture === "all" || (bodyCapture === "errors" && !successful);
+        // helix V1.4 / 2026-10-13: 真实架构是两个进程 —
+        //   gateway 子进程(next-ai-gateway.js + router-plugin.js)里 transform 写 store Map,
+        //   但 pipeline 的 writeRequestLog 跑在 CLI 进程(cli.js)里,读的是 cli.js 内联的另一份
+        //   store,跨进程永远是空 Map → DB 4 个 compression_* 列全 0。
+        //   但 gateway 的 response hook 已经把 pre/post tokens 推进了上游响应头
+        //   (x-helix-compressor-baseline-tokens / -compressed-tokens),响应头能跨进程。
+        //   所以这里优先从 responseHeaders 构建 compressionStats,store 只作同进程 fallback。
+        const baselineHeader = responseHeaders.get("x-helix-compressor-baseline-tokens");
+        const compressedHeader = responseHeaders.get("x-helix-compressor-compressed-tokens");
+        // helix V1.4 / 2026-10-15: 主动 compact 明细也走 response header 跨进程。
+        const proactiveCompact = parseProactiveCompactJson(
+          responseHeaders.get("x-ccr-helix-compact-json") ?? undefined
+        );
+        let compressionStats =
+          baselineHeader || compressedHeader
+            ? {
+                preCompressionTokens: baselineHeader ? Number(baselineHeader) || undefined : undefined,
+                postCompressionTokens: compressedHeader ? Number(compressedHeader) || undefined : undefined,
+                ...(proactiveCompact ? { proactiveCompact } : {})
+              }
+            : consumeCompressionStat(requestId);
         recordGatewayRequestLog({
           bodyCapturePolicy: bodyCapture,
           captureBody,
+          compressionStats,
+          ...(recallTokens > 0 ? { compressionRecallTokens: recallTokens } : {}),
           client,
           completedAt: new Date().toISOString(),
           durationMs: Date.now() - startedAt,
@@ -467,7 +501,8 @@ export class GatewayRequestPipeline {
           responseBodyText,
           responseBodySizeBytes,
           responseBodyTruncated,
-          responseHeaders,
+          // helix V1.4 / 2026-10-14: 转 dict — Headers 对象跨 worker_threads postMessage 边界会丢 entries
+          responseHeaders: headersToRecord(responseHeaders),
           responseModel: requestLogResponseModel(responseBodyText),
           startedAt: startedAtIso,
           statusCode,
@@ -933,6 +968,7 @@ export class GatewayRequestPipeline {
           });
           upstreamResult = loopResult.upstreamResult;
           bodyToForward = loopResult.body;
+          recallTokens = loopResult.recallTokens;
         }
       } catch (error) {
         finalizeOpenRouterDiscountSelection(false);

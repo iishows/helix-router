@@ -7,6 +7,8 @@ The runtime dependency needs source changes as well as the CCR changes in this b
 - Reviewable patch: `0001-fix-tool-ids-and-fusion-traces.patch`, including regression tests.
 - Follow-up after reproducing the original issues: `0002-complete-native-replay-and-response-status.patch`. This repairs old invalid tool IDs on the native Anthropic passthrough path and retains the final upstream HTTP status/headers for ordinary converted responses, including transparent tool turns and parse retries.
 - The patch sanitizes Anthropic tool IDs consistently in JSON, SSE and replayed call/result pairs, captures completed optimistic Fusion streams with billing enabled or disabled, and retains real upstream status/headers for buffered Fusion responses.
+- Follow-up (2026-10-16): `0003-virtual-model-raw-trace-status.patch`. The virtual-model buffered response path (`sendVirtualModelResponse`, used by Helix recall / Fusion tool loops) built its raw-trace capture without an upstream response status, so `request_logs.status_code` stayed `0` for those turns even though the client got HTTP 200 — the request log rendered successful recall turns as unknown/failed. The patch threads the last upstream status into `sendVirtualModelResponse` and attaches it to both the non-streaming and streaming captures.
+- Follow-up (2026-10-16): `0004-report-internal-tool-injection.patch`. The virtual-model tool loop injects original text back into the prompt when the model calls an internal recall tool (`hc_recall` / `history_recall`); that injected text is the cost of recalling compressed history but was never reported, so `request_logs.compression_recall_tokens` stayed `0` and the UI had nothing to show. The patch accumulates injected content length (chars) per internal call name and publishes a new `internal_tool_stats` raw-trace part; CCR tokenizes it and writes the recall token column.
 
 ## Build from source
 
@@ -15,6 +17,8 @@ In a gateway source checkout at the base commit, apply both patches in order, in
 ```sh
 git am /absolute/path/to/0001-fix-tool-ids-and-fusion-traces.patch
 git apply /absolute/path/to/0002-complete-native-replay-and-response-status.patch
+git apply /absolute/path/to/0003-virtual-model-raw-trace-status.patch
+git apply /absolute/path/to/0004-report-internal-tool-injection.patch
 npm run typecheck
 npm run build
 ```

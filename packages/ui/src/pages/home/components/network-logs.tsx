@@ -6,11 +6,12 @@ import {
   AnimatedIconSwap, Check, ChevronDown, ChevronLeft,
   ChevronRight, clampNumber, clientInitial, cn, Copy, copyTextToClipboard,
   createLogBodyPreviewText, Database, Dialog, DialogBody, DialogContent, DialogHeader, DialogTitle, formatBytes, formatCompactNumber, formatDuration,
+  compactSourceLabel,
   formatLogDateTime, formatLogCompressSummary, formatLogTokenSummary, formatNetworkRequestRaw, formatNetworkResponseRaw, formatRouteTracePath, formatUsdCost,
   FormattedLogBody,
   isJsonContainer, isLargeLogBody, jsonChildPath, logRequestModel,
   LogBodyFormatMode, logBodyLargeTextThreshold, logBodyPreviewTextLimit, LogBodyWorkerResponse,
-  logResolvedRouteModel, logSelectOptions, motion, MoveRight, Network, networkCodeLabel,
+  logProactiveCompact, logResolvedRouteModel, logSelectOptions, motion, MoveRight, Network, networkCodeLabel,
   networkExchangeMatchesQuery, networkHeaderRows, networkLifecycleLabel, networkQueryRows, networkRowId, networkSummaryRows,
   Pause, Play, ProxyNetworkBody, ProxyNetworkExchange, ProxyNetworkSnapshot, ProxyStatus,
   ReactNode, ReactPointerEvent, RefreshCw, RequestLogBody, RequestLogBodyChunk, RequestLogEntry, RequestLogListFilter,
@@ -44,7 +45,7 @@ const baseLogTableColumns: LogTableColumn[] = [
   { id: "stream", minWidth: 108 },
   { id: "model", minWidth: 180 },
   { id: "tokens", minWidth: 140 },
-  { id: "compress", minWidth: 200 },
+  { id: "compress", minWidth: 112 },
   { id: "duration", minWidth: 92 }
 ];
 const credentialLogTableColumn: LogTableColumn = { id: "credential", minWidth: 128 };
@@ -388,8 +389,8 @@ export function LogsView({
     page.items.some(logHasCredentialInfo);
   const visibleLogColumns = useMemo(() => getLogTableColumns(hasAnyCredentialInfo), [hasAnyCredentialInfo]);
   const logTableGridClass = hasAnyCredentialInfo
-    ? "grid-cols-[minmax(0,0.8fr)_minmax(92px,0.38fr)_minmax(98px,0.4fr)_minmax(0,0.78fr)_minmax(120px,0.42fr)_minmax(0,0.68fr)_minmax(180px,0.7fr)_82px]"
-    : "grid-cols-[minmax(0,0.8fr)_minmax(92px,0.38fr)_minmax(98px,0.4fr)_minmax(0,0.9fr)_minmax(0,0.74fr)_minmax(180px,0.7fr)_82px]";
+    ? "grid-cols-[minmax(0,0.8fr)_minmax(92px,0.38fr)_minmax(98px,0.4fr)_minmax(0,0.78fr)_minmax(120px,0.42fr)_minmax(104px,0.5fr)_minmax(180px,0.7fr)_82px]"
+    : "grid-cols-[minmax(0,0.8fr)_minmax(92px,0.38fr)_minmax(98px,0.4fr)_minmax(0,0.9fr)_minmax(0,0.74fr)_minmax(104px,0.5fr)_82px]";
   const logTableGridStyle = useMemo(
     () => createLogTableGridStyle(visibleLogColumns, logColumnWidths),
     [logColumnWidths, visibleLogColumns]
@@ -941,7 +942,13 @@ const LogRow = memo(function LogRow({
         <LogModelRouteCell entry={item} />
         {hasCredentialInfo ? <LogCredentialCell entry={item} /> : null}
         <div className="network-row-secondary truncate px-2" title={tokenSummary}>{tokenSummary}</div>
-        <div className="network-row-secondary truncate px-2 font-mono" title={compressSummary.title}>{compressSummary.text}</div>
+        <div
+          className="network-row-secondary flex min-w-0 items-center gap-0.5 px-2 font-mono"
+          title={`${compressSummary.title} · ${t("点击查看压缩详情")}`}
+        >
+          <span className="truncate">{compressSummary.text}</span>
+          <ChevronDown className={cn("h-3 w-3 shrink-0 opacity-50 transition-transform", expanded && "rotate-180")} aria-hidden="true" />
+        </div>
         <div className="network-row-secondary truncate px-2">{formatDuration(item.durationMs)}</div>
       </button>
       {expanded ? <LogExpandedDetails detailError={detailError} detailLoading={detailLoading} entry={item} /> : null}
@@ -1391,9 +1398,9 @@ function LogRetryAttempts({ attempts }: { attempts: RequestLogEntry["retryAttemp
   );
 }
 
-function LogMetric({ label, value }: { label: string; value: string }) {
+function LogMetric({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
-    <div className="min-w-0">
+    <div className="min-w-0" title={hint}>
       <div className="network-muted truncate text-[11px]">{label}</div>
       <div className="truncate font-mono text-[12px] font-semibold">{value}</div>
     </div>
@@ -1401,102 +1408,175 @@ function LogMetric({ label, value }: { label: string; value: string }) {
 }
 
 /**
- * 压缩详情块：在展开详情里展示"原始 chars / 压缩后 chars / 压缩率 / 场景 / hash 数"。
- * 若没有 helix 响应头则不渲染。
+ * 压缩详情块：在展开详情里展示 baseline → post → 净额(上游实收 prompt) 的 token 分解，
+ * 以及净节省(含召回回填) / 召回回填 / 提交给 LLM / 计费 等计量点。
+ * 未压缩(pass-through,post == baseline)时不显示"召回回填",改显示"上下文开销(system/tools)"。
+ * 若该请求没有 helix 压缩信息则不渲染。
  */
 function LogCompressDetails({ entry }: { entry: RequestLogEntry }) {
   const t = useAppText();
   const headers = entry.responseHeaders ?? {};
   const enabled = headers["x-helix-compressor-enabled"];
-  if (!enabled) return null;
+  // helix V1.4 / 2026-10-15: 除了 response header,也认 entry 的 compression_* 字段
+  //   (cli serve 模式下 response_headers 可能为空,但 DB 列有值)。
+  const hasEntryCompression = (entry.compressionBaselineTokens ?? 0) > 0 || (entry.compressionPostTokens ?? 0) > 0;
+  if (!enabled && !hasEntryCompression) return null;
 
-  const inputChars = Number(headers["x-helix-compressor-input-chars"] ?? 0);
-  const outputChars = Number(headers["x-helix-compressor-output-chars"] ?? 0);
-  const ratioHeader = Number(headers["x-helix-compressor-ratio"] ?? 0);
-  const baselineTokens = Number(headers["x-helix-compressor-baseline-tokens"] ?? 0);
-  const compressedTokens = Number(headers["x-helix-compressor-compressed-tokens"] ?? 0);
-  const scenario = headers["x-helix-compressor-scenario"];
-  const hashCount = Number(headers["x-helix-compressor-hash-count"] ?? 0);
-  // V4.5 字段(V3.x 路径下 strategy='v3x', budget/target/under-budget 都为 0)
-  const strategy = headers["x-helix-compressor-strategy"] ?? "v3x";
-  const budget = Number(headers["x-helix-compressor-budget"] ?? 0);
-  const target = Number(headers["x-helix-compressor-target"] ?? 0);
-  const underBudgetHeader = headers["x-helix-compressor-under-budget"];
-  const underBudget = underBudgetHeader === "1" ? true : underBudgetHeader === "0" ? false : null;
-  const durationMs = Number(headers["x-helix-compressor-duration-ms"] ?? 0);
+  // helix V1.2 / 2026-10-13: 优先用 entry 字段(DB 写入的),fallback 到 responseHeaders(老数据)
+  const baselineTokens = entry.compressionBaselineTokens
+    ?? Number(headers["x-helix-compressor-baseline-tokens"] ?? 0);
+  const compressedTokens = entry.compressionPostTokens
+    ?? Number(headers["x-helix-compressor-compressed-tokens"] ?? 0);
+  // helix V1.3: submitted = ccr 实际提交的压缩后 body (= post,不再用 input+cacheRead)
+  //   老 DB 数据 compressionSubmittedTokens 写的是 input+cacheRead(LLM 全量 prompt,
+  //   含 server-side session cache),会让用户误以为"提交了35万"。新数据 = post。
+  const submittedTokens = entry.compressionSubmittedTokens ?? compressedTokens;
+  const billedTokens = entry.compressionBilledTokens ?? 0;
   const inputTokens = typeof entry.inputTokens === "number" ? entry.inputTokens : 0;
   const cacheReadTokens = typeof entry.cacheReadTokens === "number" ? entry.cacheReadTokens : 0;
-  const freshTokens = Math.max(0, inputTokens - cacheReadTokens);
+  // helix V1.4 / 2026-10-15: "净额" = 上游实际收到的 prompt token 总量 = input + cache_read。
+  //   与"压缩后 (post)"是两个不同计量点:post 是 transform 出口的 messages(纯压缩);
+  //   净额是真正发往 provider 的 prompt —— 含模型调用 history_recall 后**回填进来的原文**。
+  //   两者之差 = 召回回填的代价。这是"实际省了多少"的真相,post 只代表"压缩那一刻"。
+  const netPromptTokens = inputTokens + cacheReadTokens;
 
-  if (inputChars === 0 && outputChars === 0 && inputTokens === 0 && baselineTokens === 0) return null;
+  // helix V1.4 / 2026-10-15: 主动 compact 明细(独立于 4 个 token 列,单独渲染一段)
+  const compact = logProactiveCompact(entry);
 
-  const contentRatio = ratioHeader > 0 ? ratioHeader : inputChars > 0 ? 1 - outputChars / inputChars : 0;
-  const contentRatioPct = (contentRatio * 100).toFixed(1);
-  const savedChars = Math.max(0, inputChars - outputChars);
-  const charsCompressed = inputChars > 0 && outputChars > 0 && outputChars < inputChars;
-  const isPassThrough = inputChars > 0 && outputChars === inputChars;
-  const isV45 = strategy === "budget_greedy";
+  // 没数据就不渲染
+  if (baselineTokens === 0 && compressedTokens === 0 && submittedTokens === 0 && billedTokens === 0 && !compact) return null;
+
+  // 是否真的压缩过(baseline → post 下降)。pass-through 时 post == baseline,没有任何 token 被替换。
+  const compressed = baselineTokens > 0 && compressedTokens > 0 && compressedTokens < baselineTokens;
+  const saved = compressed ? baselineTokens - compressedTokens : 0;
+  const savedPct = baselineTokens > 0 && saved > 0 ? (saved / baselineTokens * 100) : 0;
+  // 召回回填 = 网关 recall loop 实际回填的原文 token(compressionRecallTokens 列)。
+  //   2026-10-16: 之前此处把「净额(上游实收)− post」整体标成"召回回填",但那段差值
+  //   主要是 **system prompt / tools**(从不被 helix 压缩),并非召回。真实流量里
+  //   history_recall 调用数常为 0 → 真正的召回回填 = 0,却被误显示成数万 token。
+  //   现在召回回填只认 compression_* 列里累计的真实值。
+  const recallTokens = entry.compressionRecallTokens ?? 0;
+  // 净节省(messages 同域口径,含召回回填代价)= baseline − (post + 召回回填)。
+  //   ⚠️ 不能用 netPrompt(上游实收 = input+cache_read)当被减项:它含 system+tools,
+  //   是 messages 口径之外的开销,跨域相减会把真实节省抹成"无净节省"。system/tools
+  //   由「上下文开销」单独呈现。
+  const netSaved = compressed ? Math.max(0, baselineTokens - compressedTokens - recallTokens) : 0;
+  const netSavedPct = baselineTokens > 0 && netSaved > 0 ? (netSaved / baselineTokens * 100) : 0;
+  // 上下文开销 = 净额(上游实收 prompt)− post(压缩后 messages)− 召回回填。
+  //   = system prompt / tools / cache 等本就不在 messages 压缩口径内的部分。
+  const contextOverhead = netPromptTokens > 0
+    ? Math.max(0, netPromptTokens - compressedTokens - recallTokens)
+    : 0;
 
   return (
     <>
-      <LogMetric
-        label={t("策略 / Strategy")}
-        value={strategy === "budget_greedy" ? "V4.5 budget_greedy" : strategy === "v3x" ? "V3.x threshold" : String(strategy)}
-      />
-      {isV45 ? (
-        <>
-          <LogMetric
-            label={t("budget 上限")}
-            value={budget > 0 ? `${budget.toLocaleString()} tok` : "—"}
-          />
-          <LogMetric
-            label={t("实际 target")}
-            value={target > 0 ? `${target.toLocaleString()} tok` : "—"}
-          />
-          <LogMetric
-            label={t("under budget")}
-            value={underBudget === true ? t("✓ 命中") : underBudget === false ? t("✗ 未达(尽力压缩)") : "—"}
-          />
-        </>
-      ) : null}
-      <LogMetric
-        label={t("baseline (原始 msgs)")}
-        value={baselineTokens > 0
-          ? isV45
-            ? `${baselineTokens.toLocaleString()} tok (gpt-tokenizer)`
-            : `~${baselineTokens.toLocaleString()} tok (chars/4 估算)`
-          : "—"}
-      />
-      <LogMetric
-        label={t("压缩后 msgs")}
-        value={compressedTokens > 0 ? `${compressedTokens.toLocaleString()} tok` : "—"}
-      />
-      {baselineTokens > 0 && compressedTokens > 0 && compressedTokens < baselineTokens ? (
+      {/* helix V1.4 / 2026-10-15: 计量点分开显示 —— "压缩后"与"净额"是两个不同口径。
+          baseline(原始 msgs) → post(压缩后 msgs,transform 出口)
+                               → 净额(上游实收 prompt = input+cache_read,含召回回填)
+          关键: post 只代表"压缩那一刻";模型调用 history_recall 后原文被回填,
+          净额才是真正发往 provider、也是真正计费参考的量。 */}
+      {baselineTokens > 0 ? (
         <LogMetric
-          label={t("msg 压缩率")}
-          value={`-${((baselineTokens - compressedTokens) / baselineTokens * 100).toFixed(1)}% (-${(baselineTokens - compressedTokens).toLocaleString()} tok)`}
+          label={t("原始请求 (baseline)")}
+          value={`${baselineTokens.toLocaleString()} tok`}
+          hint={t("只统计会被压缩的 messages(user/assistant);system prompt 与 tools 不计入")}
         />
       ) : null}
-      <LogMetric
-        label={t("实际 LLM input")}
-        value={inputTokens > 0
-          ? `${inputTokens.toLocaleString()} tok${cacheReadTokens > 0 ? ` (缓存 ${cacheReadTokens.toLocaleString()})` : ""}`
-          : "—"}
-      />
-      {freshTokens > 0 && freshTokens !== inputTokens ? (
-        <LogMetric label={t("本请求新 token")} value={`${freshTokens.toLocaleString()} tok`} />
+      {compressedTokens > 0 ? (
+        <LogMetric
+          label={t("压缩后 (post)")}
+          value={`${compressedTokens.toLocaleString()} tok`}
+          hint={compressed
+            ? t("压缩后 messages 的 token 数(transform 出口)")
+            : t("本次没有可压缩内容 —— 与 baseline 相同,即未压缩(pass-through)")}
+        />
       ) : null}
-      <LogMetric
-        label={t("内容 chars 压缩率")}
-        value={charsCompressed
-          ? `${contentRatioPct}% (-${savedChars.toLocaleString()} chars)`
-          : isPassThrough
-            ? t("未压缩(pass-through)")
-            : "—"}
-      />
-      {scenario ? <LogMetric label={t("压缩场景")} value={String(scenario)} /> : null}
-      {hashCount > 0 ? <LogMetric label={t("hash 占位")} value={String(hashCount)} /> : null}
-      {durationMs > 0 ? <LogMetric label={t("压缩耗时")} value={`${durationMs} ms`} /> : null}
+      {saved > 0 ? (
+        <LogMetric
+          label={t("压缩节省 (post)")}
+          value={`${saved.toLocaleString()} tok (-${savedPct.toFixed(1)}%)`}
+        />
+      ) : null}
+      {netSaved > 0 ? (
+        <LogMetric
+          label={t("净节省 (含召回)")}
+          value={`${netSaved.toLocaleString()} tok (-${netSavedPct.toFixed(1)}%)`}
+          hint={t("messages 口径:baseline − (压缩后 + 召回回填)。与下方「上游实收」不同域")}
+        />
+      ) : null}
+      {netPromptTokens > 0 ? (
+        <LogMetric
+          label={t("上游实收 prompt")}
+          value={`${netPromptTokens.toLocaleString()} tok`}
+          hint={t("= LLM input + cache_read,含 system/tools(不被压缩)—— 与 messages 口径的节省率不同域,仅供参考")}
+        />
+      ) : null}
+      {recallTokens > 0 ? (
+        <LogMetric
+          label={t("召回回填")}
+          value={`+${recallTokens.toLocaleString()} tok`}
+          hint={t("模型调用 history_recall / hc_recall 后回填进来的原文 token 数")}
+        />
+      ) : null}
+      {contextOverhead > 0 ? (
+        <LogMetric
+          label={t("上下文开销 (system/tools)")}
+          value={`+${contextOverhead.toLocaleString()} tok`}
+          hint={t("净额 − 压缩后 messages:system prompt / 工具定义 / cache 等未被压缩的上下文。非召回回填")}
+        />
+      ) : null}
+      {submittedTokens > 0 ? (
+        <LogMetric
+          label={t("提交给 LLM (= post)")}
+          value={`${submittedTokens.toLocaleString()} tok`}
+        />
+      ) : null}
+      {billedTokens > 0 ? (
+        <LogMetric
+          label={t("LLM 账单 (billed)")}
+          value={`${billedTokens.toLocaleString()} tok`}
+        />
+      ) : null}
+      {inputTokens > 0 || cacheReadTokens > 0 ? (
+        <LogMetric
+          label={t("LLM input (含 cache)")}
+          value={`${inputTokens.toLocaleString()} tok (cache ${cacheReadTokens.toLocaleString()})`}
+        />
+      ) : null}
+      {typeof entry.outputTokens === "number" && entry.outputTokens > 0 ? (
+        <LogMetric label={t("LLM output")} value={`${entry.outputTokens.toLocaleString()} tok`} />
+      ) : null}
+      {typeof entry.totalTokens === "number" && entry.totalTokens > 0 ? (
+        <LogMetric label={t("LLM total")} value={`${entry.totalTokens.toLocaleString()} tok`} />
+      ) : null}
+      {/* helix V1.4 / 2026-10-15: 主动 compact —— 压缩后仍超预算时,折叠更早历史成摘要再转发 */}
+      {compact ? (
+        <LogMetric
+          label={t("主动 compact")}
+          value={`-${Math.max(0, compact.preCompactTokens - compact.tokensAfter).toLocaleString()} tok`}
+          hint={t("压缩后仍超 token 预算,网关折叠更早历史成一个摘要、只保留最近几轮原文再转发")}
+        />
+      ) : null}
+      {compact ? (
+        <LogMetric
+          label={t("compact 摘要来源")}
+          value={t(compactSourceLabel(compact.source))}
+          hint={t("缓存命中 = 同会话前缀未变,零额外调用;增量合并 = 只摘要新增段;模型摘要 = 整段新生成")}
+        />
+      ) : null}
+      {compact ? (
+        <LogMetric
+          label={t("compact 折叠条数")}
+          value={`${compact.foldedCount.toLocaleString()} 条`}
+          hint={t("累计覆盖 ${covered} 条历史").replace("${covered}", compact.coveredCount.toLocaleString())}
+        />
+      ) : null}
+      {compact && compact.summaryTokens !== undefined ? (
+        <LogMetric
+          label={t("compact 摘要 token")}
+          value={`${compact.summaryTokens.toLocaleString()} tok`}
+        />
+      ) : null}
     </>
   );
 }

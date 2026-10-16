@@ -2,7 +2,7 @@ import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readlinkSync
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY_ENV, NO_AVAILABLE_GATEWAY_MODELS_MESSAGE, availableGatewayModelIds, enforceSingleEnabledGlobalProfilePerAgent, hasAvailableGatewayModels, isGatewayProviderEnabled, type AppConfig, type ProfileApplyResult, type ProfileClientApplyStatus, type ProfileClientKind, type ProfileConfig } from "@ccr/core/contracts/app";
+import { CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY_ENV, HELIX_RECALL_MCP_SERVER_NAME, NO_AVAILABLE_GATEWAY_MODELS_MESSAGE, availableGatewayModelIds, enforceSingleEnabledGlobalProfilePerAgent, hasAvailableGatewayModels, isGatewayProviderEnabled, type AppConfig, type ProfileApplyResult, type ProfileClientApplyStatus, type ProfileClientKind, type ProfileConfig } from "@ccr/core/contracts/app";
 import { CLAUDE_CODE_AUTH_MODE_ENV, resolveClaudeCodeGatewayAuthMode, type ClaudeCodeGatewayAuthMode } from "@ccr/core/agents/claude-code/auth-mode";
 import { updatePersistedApiKeys } from "@ccr/core/config/config-repository";
 import { botGatewayProfileEnv } from "@ccr/core/agents/bot-gateway/env";
@@ -58,6 +58,7 @@ import {
   type ClaudeCodeMcpServerConfig,
   type ToolHubMcpRuntimeConfig
 } from "@ccr/core/mcp/toolhub-config";
+import { claudeCodeHelixRecallMcpConfig } from "@ccr/core/mcp/helix-recall-client-config";
 import { getProviderCatalogModels } from "@ccr/core/providers/model-catalog";
 import { resolveUsageModelAttribution } from "@ccr/core/usage/model-attribution";
 
@@ -982,8 +983,13 @@ function writeClaudeCodeToolHubMcpConfig(config: AppConfig, profile: ProfileConf
     }
   });
   const contextArchiveMcpConfig = claudeCodeContextArchiveMcpConfig(config, profile, token);
+  // helix 本地召回:注入客户端 MCP(独立于 toolHub)。流式下模型发出的 hc_recall /
+  // history_recall 由 Claude Code 客户端原生执行 —— 网关的透明工具执行被 !streaming 门控,
+  // 流式请求走不到(见 helix-recall-client-config.ts 注释)。
+  const helixRecallMcpConfig = claudeCodeHelixRecallMcpConfig(config);
   const mcpServers = {
     ...(toolHubMcpConfig?.mcpServers ?? {}),
+    ...(helixRecallMcpConfig ? { [HELIX_RECALL_MCP_SERVER_NAME]: helixRecallMcpConfig } : {}),
     ...(contextArchiveMcpConfig ? { [CONTEXT_ARCHIVE_MCP_SERVER_NAME]: contextArchiveMcpConfig } : {})
   };
   const mcpConfig = Object.keys(mcpServers).length > 0 ? { mcpServers } : undefined;

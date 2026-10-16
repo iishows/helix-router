@@ -1,0 +1,80 @@
+Subject: [PATCH] Retain upstream status for buffered virtual-model raw trace
+
+The virtual-model (Helix recall / Fusion) buffered response path builds its raw
+trace capture in sendVirtualModelResponse without an upstream response status.
+Every other capture site supplies one, so request_logs.status_code stays 0 for
+those turns even though the client received HTTP 200, which makes the request
+log render them as failed/unknown.
+
+Thread the last upstream response status through handleVirtualModelRequest into
+sendVirtualModelResponse and attach it to both the non-streaming and streaming
+raw trace captures.
+
+--- a/src/gateway/handler.ts
++++ b/src/gateway/handler.ts
+@@ -2846,6 +2846,7 @@
+       const internalResultsRun: StandardRequestInputContent[] = [];
+     let internalToolCalls = 0;
+     let lastUpstreamRequest: UpstreamRequest | undefined;
++    let lastUpstreamResponseStatus: number | undefined;
+     let lastResponse: StandardResponse | undefined;
+     let lastAttemptSequence = 0;
+     let loopExhausted = true;
+@@ -2935,6 +2936,7 @@
+ 
+       const { upstreamRequest, upstreamResponse } = upstreamDispatchResult;
+       lastUpstreamRequest = upstreamRequest;
++      lastUpstreamResponseStatus = upstreamResponse.status;
+       upstreamAttemptSequence += 1;
+       lastAttemptSequence = upstreamAttemptSequence;
+ 
+@@ -3218,7 +3220,8 @@
+         isStreaming,
+         model,
+         rewrittenBaseRequest,
+-        lastUpstreamRequest
++        lastUpstreamRequest,
++        lastUpstreamResponseStatus
+       );
+       }
+ 
+@@ -3277,7 +3280,8 @@
+         isStreaming,
+         model,
+         rewrittenBaseRequest,
+-        lastUpstreamRequest
++        lastUpstreamRequest,
++        lastUpstreamResponseStatus
+       );
+       }
+ 
+@@ -4831,7 +4835,8 @@
+   streaming: boolean,
+   model: string,
+   standardRequest?: StandardRequest,
+-  upstreamRequest?: UpstreamRequest
++  upstreamRequest?: UpstreamRequest,
++  upstreamResponseStatus?: number
+ ) {
+   attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, fallbackAttempts, targetProviderConfig);
+ 
+@@ -4864,7 +4869,8 @@
+       }),
+       {
+         upstreamRequest,
+-        upstreamResponseBody: sourcePayload
++        upstreamResponseBody: sourcePayload,
++        upstreamResponseStatus
+       }
+     );
+     return reply.code(200).send(sourcePayload);
+@@ -4889,7 +4895,8 @@
+     }),
+     {
+       upstreamRequest,
+-      upstreamResponseBody: sourceStandardResponse
++      upstreamResponseBody: sourceStandardResponse,
++      upstreamResponseStatus
+     }
+   );
+   return relayConvertedStreamFromStandardResponse(reply, source, sourceStandardResponse);

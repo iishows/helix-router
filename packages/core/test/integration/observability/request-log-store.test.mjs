@@ -1192,6 +1192,126 @@ test("RequestLogStore applies raw trace updates to existing request logs", async
   }
 });
 
+test("raw trace update writes proactive compact column from request headers", async () => {
+  // 生产单网关模式:transform 把 compact 明细落 request headers,raw-trace sync 把
+  //   requestHeaders 带到 worker。worker 必须显式解析并写 compression_proactive_compact_json
+  //   列(DB trigger 不认这个新 key)。
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-log-compact-rawtrace-"));
+  let store;
+  try {
+    store = new RequestLogStore(path.join(dir, "logs.sqlite"));
+    const startedAt = new Date().toISOString();
+    await store.record({
+      completedAt: startedAt,
+      durationMs: 20,
+      method: "POST",
+      path: "/v1/messages",
+      requestBody: Buffer.from("{}"),
+      requestHeaders: { "content-type": "application/json" },
+      requestId: "rawtrace-compact",
+      responseBodyText: "{}",
+      responseHeaders: { "content-type": "application/json" },
+      startedAt,
+      statusCode: 200,
+      url: "http://127.0.0.1:3456/v1/messages"
+    });
+
+    const applied = await store.updateFromRawTrace({
+      requestHeaders: {
+        "x-ccr-helix-compact-json": JSON.stringify({
+          coveredCount: 5, foldedCount: 4, preCompactTokens: 9000, source: "incremental", tokensAfter: 1500
+        }),
+        "x-helix-compressor-baseline-tokens": "20000",
+        "x-helix-compressor-compressed-tokens": "1500"
+      },
+      requestId: "rawtrace-compact",
+      responseHeaders: { "content-type": "application/json" },
+      statusCode: 200
+    });
+    assert.equal(applied, true);
+
+    const page = await store.list({ pageSize: 25 });
+    const compact = page.items[0].compressionProactiveCompact;
+    assert.ok(compact, "raw trace update 必须写 compact 列");
+    assert.equal(compact.source, "incremental");
+    assert.equal(compact.foldedCount, 4);
+    assert.equal(compact.tokensAfter, 1500);
+  } finally {
+    await store?.close();
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("insert and raw trace read proactive compact from x-helix-compressor-compact-json alias", async () => {
+  // 生产单网关模式:compact 明细挂 `x-helix-compressor-compact-json` 别名才会存活到
+  //   request_headers(sanitizeUpstreamProviderHeaders 剥掉所有 `x-ccr-*`)。insert 与
+  //   raw-trace update 两条写入路径都必须从这个别名解析出 compressionProactiveCompact。
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-log-compact-alias-"));
+  let store;
+  try {
+    store = new RequestLogStore(path.join(dir, "logs.sqlite"));
+    const startedAt = new Date().toISOString();
+    const compactJson = JSON.stringify({
+      coveredCount: 12, foldedCount: 10, preCompactTokens: 80000, source: "model", summaryTokens: 400, tokensAfter: 3000
+    });
+
+    // insert 路径:record 时 requestHeaders 只带 x-helix-compressor-* 别名。
+    await store.record({
+      completedAt: startedAt,
+      durationMs: 20,
+      method: "POST",
+      path: "/v1/messages",
+      requestBody: Buffer.from("{}"),
+      requestHeaders: {
+        "content-type": "application/json",
+        "x-helix-compressor-compact-json": compactJson
+      },
+      requestId: "compact-alias-insert",
+      responseBodyText: "{}",
+      responseHeaders: { "content-type": "application/json" },
+      startedAt,
+      statusCode: 200,
+      url: "http://127.0.0.1:3456/v1/messages"
+    });
+
+    // raw-trace 路径:同样只带别名。
+    await store.record({
+      completedAt: startedAt,
+      durationMs: 20,
+      method: "POST",
+      path: "/v1/messages",
+      requestBody: Buffer.from("{}"),
+      requestHeaders: { "content-type": "application/json" },
+      requestId: "compact-alias-rawtrace",
+      responseBodyText: "{}",
+      responseHeaders: { "content-type": "application/json" },
+      startedAt,
+      statusCode: 200,
+      url: "http://127.0.0.1:3456/v1/messages"
+    });
+    const applied = await store.updateFromRawTrace({
+      requestHeaders: { "x-helix-compressor-compact-json": compactJson },
+      requestId: "compact-alias-rawtrace",
+      responseHeaders: { "content-type": "application/json" },
+      statusCode: 200
+    });
+    assert.equal(applied, true);
+
+    const page = await store.list({ pageSize: 25 });
+    const rows = new Map(page.items.map((row) => [row.requestId, row]));
+    for (const id of ["compact-alias-insert", "compact-alias-rawtrace"]) {
+      const compact = rows.get(id)?.compressionProactiveCompact;
+      assert.ok(compact, `${id} 必须从 x-helix-compressor-compact-json 别名解析出 compact`);
+      assert.equal(compact.source, "model");
+      assert.equal(compact.foldedCount, 10);
+      assert.equal(compact.tokensAfter, 3000);
+    }
+  } finally {
+    await store?.close();
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("RequestLogStore analyzes agent sessions and exposes trace payloads", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ccr-request-log-agent-test-"));
   let store;
@@ -2151,4 +2271,120 @@ test("#1801 unknown raw trace status is neutral while transport and HTTP errors 
     assert.equal(analysis.totals.errorCount, 2);
     assert.equal(analysis.totals.successRate, 1 / 3);
   } finally { await store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("list rows and detail rows both expose helix compression token stats", async () => {
+  // 回归:list 的 SELECT 之前漏了 compression_* 四列,导致 UI 展开详情拿不到
+  // compressionBaselineTokens / compressionPostTokens,压缩详情块整个不渲染。
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-log-compress-cols-"));
+  const store = new RequestLogStore(path.join(dir, "logs.sqlite"));
+  try {
+    const now = new Date().toISOString();
+    await store.record({
+      completedAt: now,
+      startedAt: now,
+      durationMs: 5,
+      method: "POST",
+      path: "/v1/messages",
+      requestId: "compress-cols",
+      statusCode: 200,
+      url: "https://api.example.com/v1/messages",
+      requestHeaders: {},
+      responseHeaders: { "content-type": "application/json" },
+      requestBody: Buffer.from("{}"),
+      responseBodyText: "{}",
+      compressionStats: { preCompressionTokens: 3461, postCompressionTokens: 274 },
+      inputTokens: 56,
+      cacheReadTokens: 1132
+    });
+
+    const page = await store.list({ pageSize: 25 });
+    assert.equal(page.items.length, 1);
+    assert.equal(page.items[0].compressionBaselineTokens, 3461);
+    assert.equal(page.items[0].compressionPostTokens, 274);
+
+    const detail = await store.getDetail({ id: page.items[0].id });
+    assert.ok(detail);
+    assert.equal(detail.compressionBaselineTokens, 3461);
+    assert.equal(detail.compressionPostTokens, 274);
+  } finally {
+    await store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("list rows and detail rows expose helix proactive compact detail", async () => {
+  // 回归:主动 compact 明细随 response header x-ccr-helix-compact-json 跨进程落到
+  //   compression_proactive_compact_json 列,list/detail 都要能读回,UI 才拿得到。
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-log-compact-json-"));
+  const store = new RequestLogStore(path.join(dir, "logs.sqlite"));
+  try {
+    const now = new Date().toISOString();
+    await store.record({
+      completedAt: now,
+      startedAt: now,
+      durationMs: 5,
+      method: "POST",
+      path: "/v1/messages",
+      requestId: "compact-json-1",
+      statusCode: 200,
+      url: "https://api.example.com/v1/messages",
+      requestHeaders: {},
+      // 只给 header(模拟单网关模式:compressionStats 在 worker 缺失,靠 header 兜底)
+      responseHeaders: {
+        "content-type": "application/json",
+        "x-ccr-helix-compact-json": JSON.stringify({
+          coveredCount: 8,
+          foldedCount: 6,
+          preCompactTokens: 120000,
+          source: "model",
+          summaryTokens: 900,
+          tokensAfter: 12000
+        }),
+        "x-helix-compressor-baseline-tokens": "300000",
+        "x-helix-compressor-compressed-tokens": "12000"
+      },
+      requestBody: Buffer.from("{}"),
+      responseBodyText: "{}"
+    });
+
+    const page = await store.list({ pageSize: 25 });
+    assert.equal(page.items.length, 1);
+    assert.equal(page.items[0].compressionBaselineTokens, 300000);
+    assert.equal(page.items[0].compressionPostTokens, 12000);
+    const compact = page.items[0].compressionProactiveCompact;
+    assert.ok(compact, "list 必须暴露 compressionProactiveCompact");
+    assert.equal(compact.source, "model");
+    assert.equal(compact.foldedCount, 6);
+    assert.equal(compact.coveredCount, 8);
+    assert.equal(compact.preCompactTokens, 120000);
+    assert.equal(compact.tokensAfter, 12000);
+    assert.equal(compact.summaryTokens, 900);
+
+    const detail = await store.getDetail({ id: page.items[0].id });
+    assert.ok(detail);
+    assert.deepEqual(detail.compressionProactiveCompact, compact);
+  } finally {
+    await store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("parseProactiveCompactJson: 非法/缺字段返回 undefined", async () => {
+  const { parseProactiveCompactJson } = await import("@ccr/core/observability/request-log-store.ts");
+  assert.equal(parseProactiveCompactJson(undefined), undefined);
+  assert.equal(parseProactiveCompactJson(""), undefined);
+  assert.equal(parseProactiveCompactJson("{not json"), undefined);
+  assert.equal(parseProactiveCompactJson("{}"), undefined);
+  assert.equal(parseProactiveCompactJson(JSON.stringify({ source: "model" })), undefined);
+  assert.equal(
+    parseProactiveCompactJson(JSON.stringify({ foldCount: 1, source: "model", tokensAfter: 5 })) ,
+    undefined,
+    "缺 preCompactTokens → 非法"
+  );
+  // 合法:缺 coveredCount/foldedCount 时回落 0
+  assert.deepEqual(
+    parseProactiveCompactJson(JSON.stringify({ preCompactTokens: 100, source: "cache", tokensAfter: 10 })),
+    { coveredCount: 0, foldedCount: 0, preCompactTokens: 100, source: "cache", tokensAfter: 10 }
+  );
 });

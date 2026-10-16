@@ -33,7 +33,8 @@ test("clientPreprocess: 过滤 content 是 [{text:''}] 形态的 assistant 空�
   ];
   const out = clientPreprocess(input);
   assert.equal(out.length, 2);
-  assert.equal(out[1].content, "real answer");
+  // clientPreprocess 只过滤,不规范化 content;保留的数组 content 原样返回
+  assert.equal(out[1].content[0].text, "real answer");
 });
 
 test("clientPreprocess: 过滤 content 是空数组 [] 的消息", () => {
@@ -168,8 +169,8 @@ test("clientCompactSkills: 本会话调用过 Skill tool 时不替换", () => {
     }
   ];
   const out = clientCompactSkills(input);
-  // Skill 调用存在 → 不应替换
-  assert.equal(out[1].content, skillsReminder, "有 Skill 调用时保留原文");
+  // Skill 调用存在 → 不应替换(reminder 在 index 0)
+  assert.equal(out[0].content, skillsReminder, "有 Skill 调用时保留原文");
 });
 
 test("clientCompactSkills: 处理 content 是 array 形态的 skills reminder", () => {

@@ -107,6 +107,17 @@ export type AppUpdateStatus = {
 };
 
 export const BUILTIN_FUSION_TOOL_SERVER_NAME = "ccr-fusion-builtins";
+// helix 本地召回 internal tool(2026-10-14):MCP server 名与工具名。工具名与
+// helix-compressor transform 注入的 client-side recall 工具名保持一致(hc_recall / history_recall)。
+export const HELIX_RECALL_MCP_SERVER_NAME = "ccr-helix-recall";
+export const HELIX_RECALL_TOOL_NAMES = ["hc_recall", "history_recall"] as const;
+// helix recall 流式修复(2026-10-15):把 recall 从 transparentToolExecution(有 !streaming 闸门,
+// 真实 Claude Code 恒 stream:true → 永远够不着)迁到 virtualModelProfiles 的 internal tool
+// 循环(支持流式 buffer → 跑 loop → 重合成 SSE)。profile 通过 **model 前缀** 命中,
+// helix transform 只在 body 含可召回占位符时把 model 改写成 `ccr-helix-recall/<真 model>`。
+// 无占位符的请求不改写 → 不命中 profile → 保持原 live 直通(零 TTFB 损失)。
+export const HELIX_RECALL_PROFILE_KEY = "ccr-helix-recall-stream";
+export const HELIX_RECALL_MODEL_PREFIX = "ccr-helix-recall/";
 export const BUILTIN_FUSION_VISION_TOOL_NAME = "vision_understand";
 export const BUILTIN_FUSION_WEB_SEARCH_TOOL_NAME = "web_search";
 export const BUILTIN_FUSION_IMAGE_GENERATION_TOOL_NAME = "image_generation";
@@ -615,6 +626,32 @@ export type ProviderIconDetectionResult = {
   sourceUrl?: string;
 };
 
+/** 单模型 recall 探测明细(供 UI 展示)。 */
+export type RecallModelProbeEntry = {
+  depth: "none" | "offline" | "tools";
+  message: string;
+  model: string;
+  protocol: string;
+  recallCapable: boolean;
+  skipped?: boolean;
+  status?: number;
+};
+
+export type RecallModelDetectionRequest = {
+  forceRefresh?: boolean;
+};
+
+export type RecallModelDetectionResult = {
+  /** 白名单是否相对现有 config 发生变化(仅 true 时会写回)。 */
+  changed: boolean;
+  /** 是否真正跑过网络探测(区别于全部命中缓存)。 */
+  detected: boolean;
+  /** 探测判定支持 recall 的真实模型名(已去重排序)。 */
+  patterns: string[];
+  /** 逐模型明细。 */
+  results: RecallModelProbeEntry[];
+};
+
 export type GatewayProviderProbeProtocolResult = {
   baseUrl?: string;
   detectedProvider?: GatewayProviderDetectedProvider;
@@ -1049,7 +1086,26 @@ export type VirtualModelExecutionMode = "decorate_only" | "tool_loop";
 
 export type VirtualModelExecutionConfig = {
   clientToolsPolicy: "allow" | "deny";
+  /**
+   * 工具循环上界。Core Gateway 要求数值型;config-compiler 对用户配置的 profile 会把
+   * 这两个值改写为 MAX_SAFE_INTEGER(内部 no-limit 哨兵),但 ccr 自己合成的 profile
+   * (如 helix recall)会显式给出有限值。见 config-compiler 的
+   * normalizeCoreGatewayVirtualModelProfile。
+   */
+  maxToolCalls?: number;
+  maxTurns?: number;
+  /**
+   * 把 internal 工具的输出折进回复文本。internal 工具的 tool_use/tool_result 对客户端
+   * 不可见,不折回则后续回合看不到这次工具读了什么。
+   */
+  foldInternalResults?: boolean;
   matchMultimodal?: boolean;
+  /**
+   * helix recall(2026-10-14):当客户端/压缩器声明了 hc_recall / history_recall 工具时,
+   * 网关用本地 `helix-recall` MCP server 兑现它们(拦截 tool call、回填原文、续同一轮)。
+   * 同族见 matchWebSearch / matchMultimodal。见 docs/issue-reviews/2026-10-14-local-closed-loop-recall-design.md §6.3。
+   */
+  matchRecall?: boolean;
   matchWebSearch?: boolean;
   mode: VirtualModelExecutionMode;
   streamMode: "buffered" | "optimistic";
@@ -1829,6 +1885,26 @@ export type BotGatewayQrWindowCloseResult = {
   closed: boolean;
 };
 
+/**
+ * helix recall(2026-10-14):外部网关 @the-next-ai/ai-gateway 的透明工具执行开关。
+ * 网关读 `config.transparentToolExecution`(见其 `iat`/`Mat`/`H9e`,默认 enabled=false),
+ * 当 assistant 返回的函数调用命中已注册 MCP 工具时,由网关自行执行、回填、续跑,
+ * 无需客户端参与、无需 response-hook 续跑协议(外部网关不支持后者)。
+ * ccr 编译期在 helix 本地模式下自动开启,让 hc_recall / history_recall 闭环。
+ * requireClientDeclaration=false 是关键:客户端不会携带 recall 工具声明(由 helix
+ * transform 在 beforeUpstream 注入到 requestBody.tools,但 gate 读的是 h.standardRequest.tools),
+ * 只有关掉客户端声明校验才能拦截到 LLM 的 recall 调用。
+ */
+export type TransparentToolExecutionConfig = {
+  allowTools?: string[];
+  denyTools?: string[];
+  enabled: boolean;
+  maxToolCalls?: number;
+  maxTurns?: number;
+  requireClientDeclaration?: boolean;
+  unknownToolPolicy?: "fail" | "return_to_client";
+};
+
 export type AppConfig = {
   /** Revision returned by getConfig; required when replacing existing settings. */
   configRevision?: string;
@@ -1865,6 +1941,7 @@ export type AppConfig = {
   trayWidgets: TrayWidgetConfig[];
   trayWindowModules: TrayWindowModuleId[];
   toolHub: ToolHubConfig;
+  transparentToolExecution?: TransparentToolExecutionConfig;
   virtualModelProfiles?: VirtualModelProfileConfig[];
 };
 
@@ -2226,11 +2303,43 @@ export function requestLogOutcome(entry: { error?: string; ok: boolean; statusCo
   return entry.ok ? "completed" : "error";
 }
 
+/**
+ * 主动 compact 明细(2026-10-15):压缩后仍超 token 预算时,网关折叠更早历史成一个摘要。
+ * 随 `x-ccr-helix-compact-json` 响应头跨进程传到 request-log worker,写进 entry,供 UI 展示。
+ */
+export type CompressionProactiveCompactStat = {
+  /** 摘要来源:cache(前缀逐字节命中)/ incremental(前缀增量)/ model(整段新摘要)。 */
+  source: string;
+  /** 该摘要覆盖的历史代次(累计被折叠消息条数)。 */
+  coveredCount: number;
+  /** 本次折叠掉的更早历史条数。 */
+  foldedCount: number;
+  /** 折叠后提交给上游的 messages token 数(= 修正后的 compressionPostTokens)。 */
+  tokensAfter: number;
+  /** 摘要自身 token 数(model/incremental 才有)。 */
+  summaryTokens?: number;
+  /** 本次生效的 compact 预算(percent 路径为 clamp 后值,否则 = tokenBudget)。 */
+  budgetTokens?: number;
+  /** compact 之前(仅 helix 压缩后)的 token 数,用于对比。 */
+  preCompactTokens: number;
+};
+
 export type RequestLogEntry = {
   activeOutputMs?: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
   client: string;
+  // helix V1.2 / 2026-10-13: 4 个 helix 压缩 token 统计(从 compressionStatsStore 写,UI 显示用)
+  compressionBaselineTokens?: number;
+  compressionBilledTokens?: number;
+  compressionPostTokens?: number;
+  // helix V1.4 / 2026-10-15: 主动 compact 明细(压缩后仍超预算时折叠更早历史)
+  compressionProactiveCompact?: CompressionProactiveCompactStat;
+  // helix 2026-10-16: recall(hc_recall/history_recall)回填的原文 token 数。
+  //   上游实收 prompt = post(压缩后 messages) + 召回回填 + system/tools;
+  //   只有把召回回填从「上游实收 − post」里剥出来,才能得到真正的「上下文开销」。
+  compressionRecallTokens?: number;
+  compressionSubmittedTokens?: number;
   completedAt?: string;
   costUsd?: number;
   createdAt: string;

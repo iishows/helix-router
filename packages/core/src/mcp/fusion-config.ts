@@ -3,8 +3,9 @@
  */
 import { join as pathJoin } from "node:path";
 import type { AppConfig, GatewayMcpServerConfig, VirtualModelFusionVisionConfig, VirtualModelFusionWebSearchConfig, VirtualModelFusionWebSearchProvider } from "@ccr/core/contracts/app";
-import { BUILTIN_FUSION_VISION_TOOL_NAME, BUILTIN_FUSION_WEB_SEARCH_TOOL_NAME, GROK_MEDIA_FUSION_TOOL_NAMES, MEDIA_TOOLS_MCP_SERVER_NAME, MEDIA_IMAGE_EDIT_TOOL_PREFIX, MEDIA_IMAGE_GENERATE_TOOL_PREFIX, MEDIA_JOB_CANCEL_TOOL_PREFIX, MEDIA_JOB_GET_TOOL_PREFIX, MEDIA_VIDEO_START_TOOL_PREFIX, ROUTER_FALLBACK_MAX_RETRY_COUNT } from "@ccr/core/contracts/app";
+import { BUILTIN_FUSION_VISION_TOOL_NAME, BUILTIN_FUSION_WEB_SEARCH_TOOL_NAME, GROK_MEDIA_FUSION_TOOL_NAMES, HELIX_RECALL_MCP_SERVER_NAME, MEDIA_TOOLS_MCP_SERVER_NAME, MEDIA_IMAGE_EDIT_TOOL_PREFIX, MEDIA_IMAGE_GENERATE_TOOL_PREFIX, MEDIA_JOB_CANCEL_TOOL_PREFIX, MEDIA_JOB_GET_TOOL_PREFIX, MEDIA_VIDEO_START_TOOL_PREFIX, ROUTER_FALLBACK_MAX_RETRY_COUNT } from "@ccr/core/contracts/app";
 import { TOOL_HUB_MCP_SERVER_NAME, toolHubBuiltInBackendServers, toolHubMcpRuntimeConfig, toolHubRequestTimeoutMs } from "@ccr/core/mcp/toolhub-config";
+import { HELIX_RECALL_DIR } from "@ccr/core/config/constants";
 import { isRecord, numberValue, stringListValue, stringValue } from "@ccr/core/gateway/internal/value";
 import { defaultFusionWebSearchProvider, fusionModelProviderName } from "@ccr/core/gateway/internal/shared";
 import type { BrowserWebSearchMcpIntegration, CoreGatewayProvider } from "@ccr/core/gateway/internal/shared";
@@ -106,6 +107,16 @@ export async function fusionBuiltinToolArtifacts(
         }
       }
     }
+
+    // helix 本地召回(2026-10-14):profile 开启 matchRecall 时,挂载本地 helix-recall
+    // MCP server(modulePath = 同目录 helix-recall-mcp.js),由网关 internal tool loop 兑现
+    // hc_recall / history_recall。global unique(与 profile id 无关),同一缓存文件。
+    // 见 docs/issue-reviews/2026-10-14-local-closed-loop-recall-design.md §6.3。
+    const execution = isRecord(profile.execution) ? profile.execution : {};
+    if (execution.matchRecall === true && !toolServerKeys.has("helix_recall")) {
+      toolServerKeys.add("helix_recall");
+      mcpServers.push(helixRecallMcpServer());
+    }
   }
 
   return { mcpServers, providers };
@@ -158,6 +169,30 @@ function fusionBuiltinMcpServer({
 
 function bundledFusionBuiltinMcpEntryPath(): string {
   return pathJoin(__dirname, "fusion-vision-mcp.js");
+}
+
+
+/**
+ * 本地召回 MCP server。数据源是 append-only JSONL 缓存,由 transform 端写入。
+ * 缓存目录通过 HELIX_RECALL_CACHE_DIR 传给子进程;未设时子进程
+ * helix-recall-local-store 会回退到 {DATADIR}/helix-recall(store 内部逻辑)。
+ */
+export function helixRecallMcpServer(): GatewayMcpServerConfig {
+  return {
+    args: [pathJoin(__dirname, "helix-recall-mcp.js")],
+    command: process.execPath,
+    env: {
+      ELECTRON_RUN_AS_NODE: "1",
+      // 与 transform 端(gateway 进程)共享同一 JSONL 文件。store 侧同值,保证读写同路径。
+      HELIX_RECALL_CACHE_DIR: HELIX_RECALL_DIR
+    },
+    name: HELIX_RECALL_MCP_SERVER_NAME,
+    protocolVersion: "2024-11-05",
+    requestTimeoutMs: 600000,
+    startupTimeoutMs: 600000,
+    stdioMessageMode: "content-length",
+    transport: "stdio"
+  };
 }
 
 

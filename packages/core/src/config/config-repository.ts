@@ -52,11 +52,102 @@ export class AppConfigConflictError extends Error {
   }
 }
 
-/** Theme and gateway credentials have independent, atomic save operations. */
+/**
+ * 算 saved config 的 revision。必须跟 packages/core/src/gateway/runtime-config-control.ts
+ * 的 gatewayRuntimeConfigRevision 算出**完全相同**的 hash,否则 saved 和
+ * running 永远对不上,导致 "Failed to update the externally managed CCR gateway:
+ * Timed out waiting for the running CCR gateway to load configuration revision ..."
+ * 错误。
+ *
+ * 修法历史(2026-10-13):
+ *   - 旧实现用 JSON.stringify(键序敏感)+ 排除 4 字段(theme/configRevision/APIKEY/APIKEYS)
+ *     → 跟 gatewayRuntimeConfigRevision(stableJson 排序键 + 全 config)算出不同 hash
+ *   - 新实现:跟 gatewayRuntimeConfigRevision 一样,stableJson 算全 config
+ *     (saved 上原本就没 configRevision 字段,排除没意义)
+ *
+ *   V1.2 / 2026-10-13 二次修:除 stableJson 算法外,还需排除 4 字段 + sanitize profile。
+ *     - saved disk 上的 profile 没 remoteFrontendMode 等字段
+ *       (sanitizeProfileConfigForDisk 删了 codex.remoteFrontendMode 和
+ *        profiles[*] 的 coreMode/frontendMode/remoteFrontendMode),
+ *     - 但 running in-memory 上的 profile.profiles[*] 有 remoteFrontendMode="app"
+ *       (parseProfiles 恢复)。
+ *     不 sanitize 算 hash,saved 和 running 在 profile 字段上永远不等,导致
+ *     外部 gateway 重载 timeout。
+ *     此 sanitize 必须跟 packages/core/src/gateway/runtime-config-control.ts 中
+ *     gatewayRuntimeConfigRevision 的 sanitizeProfileForRevision 完全一致(都排除
+ *     theme/configRevision/APIKEY/APIKEYS + 删 profile 字段)。
+ */
 export function appConfigRevision(value: unknown): string {
-  const { theme: _theme, configRevision: _revision, APIKEY: _key, APIKEYS: _keys, ...settings } =
-    value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-  return createHash("sha256").update(JSON.stringify(settings)).digest("hex");
+  return createHash("sha256")
+    .update(stableJsonStringify(sanitizeProfileForRevision(value)))
+    .digest("hex");
+}
+
+function sanitizeProfileForRevision(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+  const result = { ...(value as Record<string, unknown>) };
+  // 排除 4 字段: theme, configRevision, APIKEY, APIKEYS(跟 gatewayRuntimeConfigRevision 对齐)
+  //   saved 上 APIKEY/APIKEYS 已经被 sanitizeConfigForDisk 脱敏为 ""/[],in-memory 上是真值,
+  //   但排除后不影响 hash;configRevision 是上次的陈旧值;theme 是 UI 偏好。
+  delete result.theme;
+  delete result.configRevision;
+  delete result.APIKEY;
+  delete result.APIKEYS;
+  // V1.2 helix follow-up / 2026-10-13: 排除 gateway.coreHost/corePort(运行时配置,
+  //   loadAppConfig 用 DEFAULT_CONFIG.gateway merge 但 saved disk 上从未写过这俩字段)。
+  //   不排除的话 in-memory(hash with coreHost/corePort) 永远跟 saved(hash without) 不同。
+  if (result.gateway && typeof result.gateway === "object" && !Array.isArray(result.gateway)) {
+    const gw = { ...(result.gateway as Record<string, unknown>) };
+    delete gw.coreHost;
+    delete gw.corePort;
+    result.gateway = gw;
+  }
+  if (result.profile && typeof result.profile === "object" && !Array.isArray(result.profile)) {
+    const profile = { ...(result.profile as Record<string, unknown>) };
+    if (profile.codex && typeof profile.codex === "object" && !Array.isArray(profile.codex)) {
+      const codex = { ...(profile.codex as Record<string, unknown>) };
+      delete codex.remoteFrontendMode;
+      profile.codex = codex;
+    }
+    if (Array.isArray(profile.profiles)) {
+      profile.profiles = (profile.profiles as unknown[]).map((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+        const profileItem = { ...(item as Record<string, unknown>) };
+        const agent = profileItem.agent;
+        if (agent !== "codex" && agent !== "opencode" && agent !== "kilo" && agent !== "workbuddy" && agent !== "zcode") {
+          return profileItem;
+        }
+        delete profileItem.coreMode;
+        delete profileItem.frontendMode;
+        delete profileItem.remoteFrontendMode;
+        return profileItem;
+      });
+    }
+    result.profile = profile;
+  }
+  return result;
+}
+
+/**
+ * 与 packages/core/src/gateway/runtime-config-control.ts 的 stableJson 完全一致
+ *  (sorted keys, 过滤 undefined)。两个函数必须同步,否则 saved/running hash
+ *  对不上。
+ */
+function stableJsonStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJsonStringify).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .filter((key) => record[key] !== undefined)
+      .map((key) => `${JSON.stringify(key)}:${stableJsonStringify(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 export class ConfigRepository {

@@ -1,5 +1,6 @@
 import { loadModelCatalogPayload } from "@ccr/core/models/catalog-file";
 import type { GatewayProviderConfig } from "@ccr/core/contracts/app";
+import { effectiveContextWindowPercentFor } from "@ccr/core/contracts/app";
 import { getProviderCatalogModels } from "@ccr/core/providers/model-catalog";
 
 const claudeCodeDefaultContextTokens = 200_000;
@@ -174,6 +175,28 @@ export function modelCatalogMaxOutputTokens(entry: ModelCatalogEntry | undefined
     entry?.limits?.outputTokens ?? 0,
     entry?.limits?.maxTokens ?? 0
   );
+}
+
+/**
+ * 解析某模型的「有效上下文长度」(token)。
+ * 优先 provider 配置里的 metadata(contextWindow/maxContextWindow,按 effectiveContextWindowPercent 折算);
+ * 缺失则回退内置目录(models.json)的 limits.contextTokens。都拿不到 → 0。
+ */
+export function resolveModelContextWindow(
+  provider: Pick<GatewayProviderConfig, "api_base_url" | "baseUrl" | "baseurl" | "name" | "modelMetadata"> | undefined,
+  model: string
+): number {
+  const metadata = provider?.modelMetadata?.[model] ?? provider?.modelMetadata?.[model.trim()];
+  const pinned = Math.max(
+    0,
+    Number(metadata?.contextWindow) || 0,
+    Number(metadata?.maxContextWindow) || 0
+  );
+  if (pinned > 0) {
+    const percent = effectiveContextWindowPercentFor(metadata) ?? 100;
+    return Math.floor((pinned * percent) / 100);
+  }
+  return modelCatalogMaxInputTokens(findProviderModelCatalogEntry(provider, model));
 }
 
 export function readCatalogCapability(capabilities: ModelCatalogCapabilities, key: string): boolean {

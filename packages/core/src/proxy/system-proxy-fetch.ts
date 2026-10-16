@@ -46,6 +46,11 @@ export async function fetchWithSystemProxy(input: RequestInfo | URL, init?: Requ
 }
 
 export function readEnvProxyUrl(): string | undefined {
+  // helix V1.2 / 2026-10-13: 不读 ALL_PROXY / all_proxy。Claude 桌面端在用户
+  //   shell 里会设 ALL_PROXY=http://127.0.0.1:63214 指向自己的 desktop server
+  //   (不是真正的 HTTP proxy),让 ccr 读这个值会导致所有 upstream 调用走 63214
+  //   立即 fail。CCR 的 proxy 用 proxy.upstream 配置控制,shell 的 ALL_PROXY
+  //   不应该影响 ccr。
   const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy ||
     process.env.HTTP_PROXY || process.env.http_proxy;
   return envProxy ? envProxy.trim() : undefined;

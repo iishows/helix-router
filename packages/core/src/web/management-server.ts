@@ -33,6 +33,7 @@ import { getProviderCatalogModels } from "@ccr/core/providers/model-catalog";
 import { getOpenRouterProviderCatalog } from "@ccr/core/providers/openrouter-provider-catalog";
 import { getProviderPresets } from "@ccr/core/providers/presets/index";
 import { checkGatewayProviderConnectivity, probeGatewayProvider, probeGatewayProviderCandidates } from "@ccr/core/providers/probe";
+import { applyRecallDetection, detectRecallModelsForConfig } from "@ccr/core/providers/recall-model-detect";
 import { stopProviderModelAutoRefreshService, syncProviderModelAutoRefreshService } from "@ccr/core/providers/model-auto-refresh";
 import { applyProfileConfig } from "@ccr/core/profiles/service";
 import { getProfileOpenCommand, getProfileRuntimeStatus, openProfileFromCcr, stopProfileFromCcr } from "@ccr/core/profiles/launch-service";
@@ -310,6 +311,18 @@ const rpcHandlers: Record<string, RpcHandler> = {
   clearProxyNetworkCaptures: () => proxyService.clearNetworkCaptures(),
   closeBotGatewayQrWindow: (_request) => ({ closed: false }),
   detectProviderIcon: (request) => detectProviderIcon(request as ProviderIconDetectionRequest),
+  detectRecallModels: async (request) => {
+    const options = (request ?? {}) as { forceRefresh?: boolean };
+    const config = await loadAppConfig();
+    const detected = await detectRecallModelsForConfig(config, { forceRefresh: options.forceRefresh === true });
+    // 仅当白名单真的变化才写回(避免 config 保存 → 网关重启回环);写回走热更新,不 restart。
+    if (detected.changed) {
+      const saved = await saveAppConfig(applyRecallDetection(config, detected));
+      await gatewayService.updateConfig(saved);
+      invalidateProviderAccountSnapshotCache();
+    }
+    return detected;
+  },
   exportData: () => exportAppData(),
   fetchProviderManifest: (request) => fetchProviderManifest(request as ProviderManifestFetchRequest),
   getAgentAnalysis: (filter) => getAgentAnalysis(filter as AgentAnalysisFilter | undefined),

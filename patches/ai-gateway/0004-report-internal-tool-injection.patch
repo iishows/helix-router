@@ -1,0 +1,199 @@
+Subject: [PATCH] Report injected internal tool content for Helix recall accounting
+
+The virtual-model tool loop injects original text back into the prompt when the
+model calls an internal recall tool (hc_recall / history_recall). That injected
+text is the cost of recalling compressed history, but it was never reported,
+so request_logs.compression_recall_tokens stayed 0 and the UI had nothing to
+show even when recall actually fired.
+
+The gateway has no tokenizer, so accumulate the injected content length (in
+characters) per internal call name and publish it as a new internal_tool_stats
+raw-trace part. CCR tokenizes it with the same gpt-tokenizer the compression
+headers use, then writes compression_recall_tokens.
+
+---
+ src/gateway/handler.ts | 47 +++++++++++++++++++++++++++++++++++++++++++++++
+ src/types.ts           |  3 ++-
+ 2 files changed, 49 insertions(+), 1 deletion(-)
+
+--- a/src/gateway/handler.ts	2026-10-16 22:43:36.837303500 +0800
++++ b/src/gateway/handler.ts	2026-10-16 22:44:10.234131000 +0800
+@@ -295,6 +295,14 @@
+   upstreamResponseStatus?: number;
+   upstreamResponseStream?: unknown;
+   upstreamResponseStreamContentType?: string;
++  /**
++   * Per-internal-tool-result injected content length, in characters, keyed by the
++   * call name. Only the Helix recall tools are meaningful here: their results are
++   * original text injected back into the prompt after compression, which the CCR
++   * request log reports as `compression_recall_tokens`. The gateway has no tokenizer,
++   * so it emits raw character lengths and lets CCR tokenize.
++   */
++  internalToolInjectionChars?: Record<string, number>;
+ }
+ 
+ const rawTraceRequestStartedAtMs = new WeakMap<FastifyRequest, number>();
+@@ -2846,9 +2854,13 @@
+       const internalResultsRun: StandardRequestInputContent[] = [];
+     let internalToolCalls = 0;
+     let lastUpstreamRequest: UpstreamRequest | undefined;
++    let lastUpstreamResponseStatus: number | undefined;
+     let lastResponse: StandardResponse | undefined;
+     let lastAttemptSequence = 0;
+     let loopExhausted = true;
++    // Helix recall: character length of original text injected by internal tool
++    // results, keyed by call name. Reported to CCR as compression_recall_tokens.
++    const internalInjectionChars: Record<string, number> = {};
+ 
+     const precheckResult = await runPrecheckOnce(
+       targetProvider,
+@@ -2935,6 +2947,7 @@
+ 
+       const { upstreamRequest, upstreamResponse } = upstreamDispatchResult;
+       lastUpstreamRequest = upstreamRequest;
++      lastUpstreamResponseStatus = upstreamResponse.status;
+       upstreamAttemptSequence += 1;
+       lastAttemptSequence = upstreamAttemptSequence;
+ 
+@@ -3218,7 +3231,9 @@
+         isStreaming,
+         model,
+         rewrittenBaseRequest,
+-        lastUpstreamRequest
++        lastUpstreamRequest,
++        lastUpstreamResponseStatus,
++        internalInjectionChars
+       );
+       }
+ 
+@@ -3277,7 +3292,9 @@
+         isStreaming,
+         model,
+         rewrittenBaseRequest,
+-        lastUpstreamRequest
++        lastUpstreamRequest,
++        lastUpstreamResponseStatus,
++        internalInjectionChars
+       );
+       }
+ 
+@@ -3303,6 +3320,8 @@
+         mergedToolingResult.toolOwners,
+         multimodalRewrite.references
+       );
++      // Helix recall: accumulate injected-content length per internal call name.
++      recordInternalToolInjectionChars(internalInjectionChars, callPartition.internal, toolResults);
+       internalCallsRun.push(...callPartition.internal);
+       internalResultsRun.push(...toolResults);
+       aggregatedUsage = addServerToolUseToStandardUsage(
+@@ -3668,6 +3687,41 @@
+   return results;
+ }
+ 
++/**
++ * Helix recall accounting: for each internal tool result produced this turn,
++ * add its injected-content character length under the call name. The result
++ * content is already a string (stringifyVirtualToolOutput); successful recall
++ * results carry the original Q&A / block text that replaced a ⟦QA:⟧ placeholder.
++ * Errors are excluded so a not_found never inflates the recall total.
++ */
++function recordInternalToolInjectionChars(
++  target: Record<string, number>,
++  calls: StandardResponseFunctionCall[],
++  results: StandardRequestInputContent[]
++): void {
++  const nameByCallId = new Map<string, string>();
++  for (const call of calls) {
++    nameByCallId.set(call.call_id, call.name);
++  }
++  for (const result of results) {
++    if (!isObject(result)) {
++      continue;
++    }
++    const record = result as Record<string, unknown>;
++    const toolUseId = typeof record.tool_use_id === 'string' ? record.tool_use_id : '';
++    const name = nameByCallId.get(toolUseId) || '';
++    if (!name || record.is_error === true) {
++      continue;
++    }
++    const content = record.content;
++    const length = typeof content === 'string' ? content.length : 0;
++    if (length <= 0) {
++      continue;
++    }
++    target[name] = (target[name] ?? 0) + length;
++  }
++}
++
+ export function rewriteVirtualModelMultimodalInput(
+   request: StandardRequest,
+   body: Record<string, unknown>,
+@@ -4831,7 +4885,9 @@
+   streaming: boolean,
+   model: string,
+   standardRequest?: StandardRequest,
+-  upstreamRequest?: UpstreamRequest
++  upstreamRequest?: UpstreamRequest,
++  upstreamResponseStatus?: number,
++  internalInjectionChars?: Record<string, number>
+ ) {
+   attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, fallbackAttempts, targetProviderConfig);
+ 
+@@ -4864,7 +4920,9 @@
+       }),
+       {
+         upstreamRequest,
+-        upstreamResponseBody: sourcePayload
++        upstreamResponseBody: sourcePayload,
++        internalToolInjectionChars: internalInjectionChars,
++        upstreamResponseStatus
+       }
+     );
+     return reply.code(200).send(sourcePayload);
+@@ -4889,7 +4947,9 @@
+     }),
+     {
+       upstreamRequest,
+-      upstreamResponseBody: sourceStandardResponse
++      upstreamResponseBody: sourceStandardResponse,
++      internalToolInjectionChars: internalInjectionChars,
++      upstreamResponseStatus
+     }
+   );
+   return relayConvertedStreamFromStandardResponse(reply, source, sourceStandardResponse);
+@@ -9422,6 +9482,23 @@
+     });
+   }
+ 
++  // Helix recall accounting: per-internal-tool injected content length (chars).
++  // CCR tokenizes this to fill request_logs.compression_recall_tokens. Only emitted
++  // when a virtual-model tool actually injected content this turn.
++  if (
++    rawTraceCapture.internalToolInjectionChars &&
++    Object.keys(rawTraceCapture.internalToolInjectionChars).length > 0
++  ) {
++    parts.push({
++      partType: 'internal_tool_stats' as const,
++      content: resolveRawTraceContent(config.rawTrace.mode, {
++        injectedChars: rawTraceCapture.internalToolInjectionChars,
++      }),
++      contentType: 'application/json; charset=utf-8',
++      redactionPolicy,
++    });
++  }
++
+   const completedAtMs = Date.now();
+   const startedAtMs = rawTraceRequestStartedAtMs.get(request) ?? completedAtMs;
+   enqueueRawTraceCapture({
+--- a/src/types.ts	2026-10-16 22:43:36.837303500 +0800
++++ b/src/types.ts	2026-10-16 22:44:10.235233900 +0800
+@@ -243,7 +243,8 @@
+   | 'upstream_request'
+   | 'upstream_response_metadata'
+   | 'upstream_response'
+-  | 'response_stream';
++  | 'response_stream'
++  | 'internal_tool_stats';
+ export type RawTraceStorageBackend = 'local';
+ 
+ export interface RawTraceSyncConfig {

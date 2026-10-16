@@ -1,15 +1,16 @@
 /**
  * Extracted from gateway/service.ts. Keep this module focused on its named gateway boundary.
  */
-import { isGatewayProviderEnabled } from "@ccr/core/contracts/app";
+import { HELIX_RECALL_MODEL_PREFIX, HELIX_RECALL_PROFILE_KEY, HELIX_RECALL_TOOL_NAMES, isGatewayProviderEnabled } from "@ccr/core/contracts/app";
 import type { AppConfig, GatewayProviderConfig, GatewayProviderProtocol, VirtualModelProfileConfig } from "@ccr/core/contracts/app";
 import { codexDefaultBaseUrl, kimiAccessTokenExpired, kimiIdentityHeaders, localAgentProviderApiKey, readClaudeCodeOauth, readCodexAuth, readGrokAuth, readKimiAuth, resolveGrokAuth, resolveKimiAuth } from "@ccr/core/agents/local-providers/service";
 import { grokAccessTokenExpired, grokClientVersion } from "@ccr/core/agents/local-providers/grok";
 import { pluginService } from "@ccr/core/plugins/service";
 import { normalizeRouteSelector, providerRuntimeId } from "@ccr/core/routing/model-registry";
 import { isRecord, stringListValue, stringValue } from "@ccr/core/gateway/internal/value";
-import { fusionBuiltinToolArtifacts, fusionToolFallbackMcpServer, normalizeFusionWebSearchProfileToolName, toolHubMcpServer, withCodexCompatibleVirtualModelProfiles, withFusionVirtualModelAliases, withFusionVisionToolInstructions, withFusionWebSearchToolInstructions } from "@ccr/core/mcp/fusion-config";
+import { fusionBuiltinToolArtifacts, fusionToolFallbackMcpServer, helixRecallMcpServer, normalizeFusionWebSearchProfileToolName, toolHubMcpServer, withCodexCompatibleVirtualModelProfiles, withFusionVirtualModelAliases, withFusionVisionToolInstructions, withFusionWebSearchToolInstructions } from "@ccr/core/mcp/fusion-config";
 import { mediaToolsMcpServer } from "@ccr/core/mcp/grok-media-config";
+import { helixLocalRecallEnabled } from "@ccr/core/plugins/built-ins/helix-compressor";
 import { resolveGatewayPublicModelId } from "@ccr/core/gateway/features/model-discovery";
 import { activeProviderCredentials, inferProtocol, normalizedProviderCapabilities, normalizeProviderProtocol, providerCapabilityForClientProtocol, providerCapabilityInternalName, providerCapabilityNameMatches, providerCredentialInternalName, providerProtocolForClientProtocol, sortProviderCredentialsForConfig, toCoreGatewayProviders } from "@ccr/core/providers/runtime-topology";
 import { buildRawTraceConfig } from "@ccr/core/observability/raw-trace-sync";
@@ -113,8 +114,15 @@ export async function compileCoreGatewayConfig(
   ];
   const toolHubServer = toolHubMcpServer(config, externalMcpServers);
   const mediaMcpServer = mediaToolsMcpServer(config);
+  const helixRecallProfile = helixRecallVirtualModelProfile(config);
+  // helix 本地召回 MCP server:本地压缩模式下始终挂。它是网关 tool provider
+  // (listDefinitions/execute)能解析 hc_recall / history_recall 的前提 —— 无论是
+  // virtual-model profile 的 internal tool 循环(流式)还是用户自配的透明工具执行,
+  // 都要靠它把 recall 工具名解析到具体实现。不依赖 toolHub(agent.mcpServers 直接加载)。
+  const helixRecallServer = helixLocalRecallEnabled(config) ? helixRecallMcpServer() : undefined;
   const mcpServers = [
     ...builtinToolArtifacts.mcpServers,
+    ...(helixRecallServer ? [helixRecallServer] : []),
     ...(mediaMcpServer ? [mediaMcpServer] : []),
     ...(toolHubServer ? [toolHubServer] : externalMcpServers)
   ];
@@ -178,7 +186,57 @@ export async function compileCoreGatewayConfig(
     }),
     providerPlugins: providerPluginsWithCapabilityAliases.map(withoutStaticLocalOauthAuth),
     providers,
-    virtualModelProfiles
+    ...(config.transparentToolExecution?.enabled ? { transparentToolExecution: config.transparentToolExecution } : {}),
+    virtualModelProfiles: [...virtualModelProfiles, ...(helixRecallProfile ? [helixRecallProfile] : [])]
+  };
+}
+
+/**
+ * helix recall 闭环(2026-10-15):把 recall 执行从 wasted 的透明工具执行迁到
+ * virtual-model profile 的 internal tool 循环,因为网关的透明工具执行有
+ * `!streaming` 闸门(真实 Claude Code 恒 stream:true → 永远够不着),而 profile 的
+ * internal tool 循环支持流式(buffered → 跑 loop → 重合成 SSE)。
+ *
+ * 命中方式是 **model 前缀**:helix transform 只在 body 真的含可召回占位符
+ * (⟦QA:⟧ / ⟦HC:⟧)时把 model 改写成 `ccr-helix-recall/<真 model>`,网关据此匹配本 profile;
+ * 无占位符的请求不改写 → 不命中 → 保持原 live 直通(零 TTFB 回归,对齐 headroom #3071)。
+ *
+ * 为什么只对命中 profile 的请求 buffer:profile 一旦挂了 internal tool,该请求就走
+ * buffered 收集路径;所以门控必须做在 transform 侧(改写 model)而不是 profile 侧。
+ *
+ * 若用户在 config 中显式配置了 transparentToolExecution,则原样透传,不受影响。
+ * 见 docs/issue-reviews/2026-10-14-local-closed-loop-recall-design.md §6.1。
+ */
+function helixRecallVirtualModelProfile(config: AppConfig): VirtualModelProfileConfig | undefined {
+  if (!helixLocalRecallEnabled(config)) {
+    return undefined;
+  }
+  return {
+    description: "Internal profile that runs the local helix recall tool loop for compressed ⟦QA:⟧ / ⟦HC:⟧ placeholders.",
+    displayName: "Helix Recall",
+    enabled: true,
+    execution: {
+      clientToolsPolicy: "allow",
+      maxToolCalls: 8,
+      maxTurns: 4,
+      mode: "tool_loop",
+      streamMode: "buffered"
+    },
+    id: HELIX_RECALL_PROFILE_KEY,
+    key: HELIX_RECALL_PROFILE_KEY,
+    match: {
+      exactAliases: [],
+      prefixes: [HELIX_RECALL_MODEL_PREFIX],
+      suffixes: []
+    },
+    materialization: {
+      enabled: false,
+      includeInGatewayModels: false
+    },
+    tools: [...HELIX_RECALL_TOOL_NAMES].map((name) => ({
+      name,
+      visibility: "internal" as const
+    }))
   };
 }
 

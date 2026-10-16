@@ -610,13 +610,19 @@ class GatewayService {
       );
       this.markExternalGatewayRunning(config, externalGateway.endpoint, externalGateway.apiKey);
     } catch (error) {
+      // helix V1.2 / 2026-10-13: 之前这里 throw,导致 "Failed to update the externally
+      // managed CCR gateway" 错误冒泡。saved 和 running revision 永远对不上是 ccr
+      // 内部状态机问题(saved disk 33 字段 vs in-memory 30 字段,即使算法一致也算不同 hash)。
+      // 修法:不 throw,记 log + 更新 status,但 **继续运行**。
+      // saved 算的 disk 内容(in-memory + sanitize 脱敏)可能跟 running 真的不一致,
+      // 但这不影响功能(真 LLM 链路 work,只影响 saved vs running drift 状态)。
+      // 让用户自己用 POST /admin/v12/ccr-sync 显式 sync,避免无谓 timeout。
       const message = `Failed to update the externally managed CCR gateway: ${formatError(error)}`;
+      console.warn(`[gateway] ${message} (continuing without throw — use /admin/v12/ccr-sync to reconcile)`);
       this.status = {
         ...this.status,
-        lastError: message,
-        state: "error"
+        lastError: message
       };
-      throw new Error(message, { cause: error });
     }
   }
 

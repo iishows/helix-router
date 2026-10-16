@@ -3,11 +3,13 @@ import {
   Card, CardContent, CardHeader, Check, ChevronDown, CircleAlert, ClaudeDesignRouteRuleType,
   claudeDesignRouteRuleTypeLabel, claudeDesignRouteRuleTypeOptions, ClaudeDesignRoutingDraft, ClaudeDesignRoutingRuleDraft, createRouteModelOptions, Dialog,
   DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle, ExtensionListItem,
-  cn, extensionMatchesQuery, ExtensionSource, Field, GatewayProviderConfig, Input, isClaudeDesignStaticRuleType,
-  Label, motion, normalizeClaudeDesignRuleTypeChange, Play, PluginSettingsDraft, Plus, RouteTargetControl,
+  cn, extensionMatchesQuery, ExtensionSource, Field, Gauge, GatewayProviderConfig, HELIX_COMPRESSOR_PLUGIN_ID,
+  helixCompactBudgetRangeLabel, Input, isClaudeDesignStaticRuleType, Label, LoaderCircle, motion, normalizeClaudeDesignRuleTypeChange,
+  Play, PluginSettingsDraft, Plus, readHelixCompactBudgetPercent, readHelixRecallPatterns, RefreshCw, RouteTargetControl,
   Search, SelectControl, Settings, TextAreaControl, Toggle, translateOptions,
-  Trash2, useAppText, useMemo, useState, X
+  Trash2, useAppText, useMemo, useState, writeHelixCompactBudgetPercent, writeHelixRecallPatterns, X
 } from "../shared/index";
+import type { RecallModelDetectionResult, RecallModelProbeEntry } from "@ccr/core/contracts/app";
 export function ExtensionsView({
   configureExtension,
   config,
@@ -262,6 +264,10 @@ export function PluginSettingsDialog({
               </Field>
             </div>
 
+            {extension.name === HELIX_COMPRESSOR_PLUGIN_ID ? (
+              <HelixCompressorPanel draft={draft} onChange={onChange} />
+            ) : null}
+
             <div className="overflow-hidden rounded-md border border-border bg-background">
               <Button
                 aria-expanded={advancedOpen}
@@ -332,6 +338,316 @@ export function PluginSettingsDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+function HelixCompressorPanel({
+  draft,
+  onChange
+}: {
+  draft: PluginSettingsDraft;
+  onChange: (patch: Partial<PluginSettingsDraft>) => void;
+}) {
+  const t = useAppText();
+  const [detecting, setDetecting] = useState(false);
+  const [detectError, setDetectError] = useState("");
+  const [detectResult, setDetectResult] = useState<RecallModelDetectionResult | undefined>(undefined);
+  const percent = readHelixCompactBudgetPercent(draft.configText);
+
+  function updatePercent(next: number | undefined) {
+    onChange({ configText: writeHelixCompactBudgetPercent(draft.configText, next) });
+  }
+
+  async function detectRecallModels() {
+    if (!window.ccr?.detectRecallModels) {
+      setDetectError(t("Model detection is unavailable."));
+      return;
+    }
+    setDetecting(true);
+    setDetectError("");
+    try {
+      const result = await window.ccr.detectRecallModels({});
+      setDetectResult(result);
+    } catch (error) {
+      setDetectError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDetecting(false);
+    }
+  }
+
+  return (
+    <div className="overflow-hidden rounded-md border border-border bg-background">
+      <div className="flex h-10 items-center gap-2 border-b border-border px-3 text-[12px] font-medium">
+        <Gauge className="h-4 w-4 text-muted-foreground" />
+        <span className="min-w-0 truncate">{t("Helix compression")}</span>
+      </div>
+
+      <div className="space-y-4 p-3">
+        <Field label={t("Compact budget percent")}>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <input
+                aria-label={t("Compact budget percent")}
+                className="h-1.5 min-w-0 flex-1 cursor-pointer appearance-none rounded-full bg-muted accent-primary"
+                max={100}
+                min={1}
+                onChange={(event) => updatePercent(Number(event.target.value))}
+                step={1}
+                type="range"
+                value={percent ?? 50}
+              />
+              <Input
+                className="w-20 shrink-0"
+                inputMode="numeric"
+                onChange={(event) => {
+                  const raw = event.target.value.trim();
+                  if (!raw) {
+                    updatePercent(undefined);
+                    return;
+                  }
+                  const parsed = Number(raw);
+                  if (Number.isFinite(parsed) && parsed >= 1) {
+                    updatePercent(Math.min(100, Math.floor(parsed)));
+                  }
+                }}
+                value={percent === undefined ? "" : String(percent)}
+              />
+              <span className="shrink-0 text-[12px] text-muted-foreground">%</span>
+            </div>
+            <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+              <span className="min-w-0 truncate">{t(helixCompactBudgetRangeLabel(percent))}</span>
+              {percent === undefined ? (
+                <Button onClick={() => updatePercent(50)} size="sm" type="button" variant="outline">{t("Enable")}</Button>
+              ) : (
+                <Button onClick={() => updatePercent(undefined)} size="sm" type="button" variant="ghost">{t("Disable")}</Button>
+              )}
+            </div>
+          </div>
+        </Field>
+
+        <Field label={t("Recall model whitelist")}>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Button disabled={detecting} onClick={() => void detectRecallModels()} type="button" variant="outline">
+                {detecting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                {detecting ? t("Detecting...") : t("Auto-detect recall models")}
+              </Button>
+              <span className="min-w-0 truncate text-[11px] text-muted-foreground">
+                {t("Probes configured models for tool-calling and writes the supported ones to the whitelist.")}
+              </span>
+            </div>
+            {detectError ? (
+              <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">{detectError}</div>
+            ) : null}
+            {detectResult ? <RecallDetectionSummary result={detectResult} /> : null}
+            <RecallPatternEditor configText={draft.configText} onChange={(configText) => onChange({ configText })} />
+          </div>
+        </Field>
+      </div>
+    </div>
+  );
+}
+
+/** 手动编辑 recall 白名单 + 排除表(空白名单 = 全部模型,已检测时 = 真的没有)。 */
+function RecallPatternEditor({
+  configText,
+  onChange
+}: {
+  configText: string;
+  onChange: (configText: string) => void;
+}) {
+  const t = useAppText();
+  const { detected, excludePatterns, patterns } = readHelixRecallPatterns(configText);
+  const [patternDraft, setPatternDraft] = useState("");
+  const [excludeDraft, setExcludeDraft] = useState("");
+
+  function commit(nextPatterns: string[], nextExclude: string[], nextDetected = detected) {
+    onChange(writeHelixRecallPatterns(configText, nextPatterns, nextExclude, nextDetected));
+  }
+
+  function addPattern(list: string[], raw: string): string[] | undefined {
+    const value = raw.trim();
+    if (!value || list.includes(value)) return undefined;
+    return [...list, value];
+  }
+
+  return (
+    <div className="space-y-3 border-t border-border pt-3">
+      <PatternList
+        emptyHint={detected
+          ? t("No model supports recall - nothing is compressed.")
+          : t("Empty = all models are compressed.")}
+        label={t("Whitelist (empty = all)")}
+        onAdd={() => {
+          const next = addPattern(patterns, patternDraft);
+          if (!next) return;
+          commit(next, excludePatterns);
+          setPatternDraft("");
+        }}
+        onRemove={(index) => commit(patterns.filter((_, i) => i !== index), excludePatterns)}
+        onDraft={setPatternDraft}
+        patterns={patterns}
+        placeholder={t("e.g. MiniMax-*")}
+        value={patternDraft}
+      />
+      <PatternList
+        emptyHint={t("Empty = nothing excluded.")}
+        label={t("Exclude list")}
+        onAdd={() => {
+          const next = addPattern(excludePatterns, excludeDraft);
+          if (!next) return;
+          commit(patterns, next);
+          setExcludeDraft("");
+        }}
+        onRemove={(index) => commit(patterns, excludePatterns.filter((_, i) => i !== index))}
+        onDraft={setExcludeDraft}
+        patterns={excludePatterns}
+        placeholder={t("e.g. gpt-4o-*")}
+        value={excludeDraft}
+      />
+    </div>
+  );
+}
+
+function PatternList({
+  emptyHint,
+  label,
+  onAdd,
+  onDraft,
+  onRemove,
+  patterns,
+  placeholder,
+  value
+}: {
+  emptyHint: string;
+  label: string;
+  onAdd: () => void;
+  onDraft: (value: string) => void;
+  onRemove: (index: number) => void;
+  patterns: string[];
+  placeholder: string;
+  value: string;
+}) {
+  const t = useAppText();
+  return (
+    <div className="space-y-1.5">
+      <span className="text-[12px] font-medium">{label}</span>
+      <div className="flex items-center gap-2">
+        <Input
+          className="min-w-0 flex-1"
+          onChange={(event) => onDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              onAdd();
+            }
+          }}
+          placeholder={placeholder}
+          value={value}
+        />
+        <Button disabled={!value.trim()} onClick={onAdd} size="sm" type="button" variant="outline">
+          <Plus className="h-4 w-4" />
+        </Button>
+      </div>
+      {patterns.length > 0 ? (
+        <div className="flex flex-wrap gap-1">
+          {patterns.map((pattern, index) => (
+            <span className="flex items-center gap-1 rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[11px]" key={pattern}>
+              {pattern}
+              <button
+                aria-label={t("Remove")}
+                className="text-muted-foreground hover:text-destructive"
+                onClick={() => onRemove(index)}
+                type="button"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </span>
+          ))}
+        </div>
+      ) : (
+        <div className="text-[11px] text-muted-foreground">{emptyHint}</div>
+      )}
+    </div>
+  );
+}
+
+function RecallDetectionSummary({ result }: { result: RecallModelDetectionResult }) {
+  const t = useAppText();
+  const [listOpen, setListOpen] = useState(false);
+
+  return (
+    <div className="space-y-2 rounded-md border border-border bg-muted/25 px-3 py-2">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px]">
+        <span className="font-medium">
+          {t("Supported models")}: {result.patterns.length}
+        </span>
+        <span className="text-muted-foreground">
+          {result.detected ? t("Ran live probe") : t("All results cached")}
+        </span>
+        <span className={cn("text-muted-foreground", result.changed && "text-emerald-600")}>
+          {result.changed ? t("Whitelist updated") : t("Whitelist unchanged")}
+        </span>
+        {result.results.length > 0 ? (
+          <Button onClick={() => setListOpen((value) => !value)} size="sm" type="button" variant="ghost">
+            {listOpen ? t("Hide details") : t("Show details")}
+          </Button>
+        ) : null}
+      </div>
+
+      {result.patterns.length > 0 ? (
+        <div className="flex flex-wrap gap-1">
+          {result.patterns.map((pattern) => (
+            <span className="rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[11px]" key={pattern}>{pattern}</span>
+          ))}
+        </div>
+      ) : (
+        <div className="text-[11px] text-muted-foreground">{t("No models currently support recall.")}</div>
+      )}
+
+      {listOpen ? (
+        <div className="max-h-52 overflow-auto rounded border border-border bg-background">
+          <table className="w-full border-collapse text-[11px]">
+            <thead className="sticky top-0 bg-muted/95 text-muted-foreground">
+              <tr>
+                <th className="px-2 py-1 text-left font-medium">{t("Model")}</th>
+                <th className="px-2 py-1 text-left font-medium">{t("Protocol")}</th>
+                <th className="px-2 py-1 text-left font-medium">{t("Depth")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {result.results.map((entry) => (
+                <tr className="border-t border-border/60" key={`${entry.protocol}-${entry.model}`}>
+                  <td className="px-2 py-1 font-mono">{entry.model}</td>
+                  <td className="px-2 py-1 text-muted-foreground">{entry.protocol}</td>
+                  <td className={cn("px-2 py-1", recallDepthTone(entry))}>{recallDepthLabel(entry, t)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function recallDepthLabel(entry: RecallModelProbeEntry, t: (value: string) => string): string {
+  if (entry.skipped) {
+    return t("Unknown (auth)");
+  }
+  if (entry.depth === "tools") {
+    return t("Tools");
+  }
+  if (entry.depth === "offline") {
+    return t("Offline");
+  }
+  return t("Unsupported");
+}
+
+function recallDepthTone(entry: RecallModelProbeEntry): string {
+  if (entry.skipped) return "text-amber-600";
+  if (entry.depth === "tools") return "text-emerald-600";
+  if (entry.depth === "offline") return "text-sky-600";
+  return "text-muted-foreground";
 }
 
 export function ConfigureClaudeDesignDialog({

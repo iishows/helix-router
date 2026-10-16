@@ -5,6 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, opendir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { basename, dirname, join, resolve as pathResolve, sep as pathSep } from "node:path";
+import { encode as gptEncode } from "gpt-tokenizer";
 import type { AppConfig } from "@ccr/core/contracts/app";
 import { RAW_TRACE_SPOOL_DIR } from "@ccr/core/config/constants";
 import {
@@ -1624,14 +1625,16 @@ export async function readRawTraceRequestLogBundle(
     upstreamResponseMetadata,
     upstreamRequestBody,
     upstreamResponseStream,
-    fallbackResponseBody
+    fallbackResponseBody,
+    internalToolStats
   ] = await Promise.all([
     readRawTraceJsonPart(parts, "client_request_metadata", spoolDirectory),
     readRawTraceJsonPart(parts, "upstream_request_metadata", spoolDirectory),
     readRawTraceJsonPart(parts, "upstream_response_metadata", spoolDirectory),
     readRawTracePart(parts, "upstream_request", spoolDirectory),
     readRawTracePart(parts, "response_stream", spoolDirectory),
-    readRawTracePart(parts, "upstream_response", spoolDirectory)
+    readRawTracePart(parts, "upstream_response", spoolDirectory),
+    readRawTraceJsonPart(parts, "internal_tool_stats", spoolDirectory)
   ]);
   const upstreamResponseBody = upstreamResponseStream ?? fallbackResponseBody;
   const target = isRecord(manifest.target) ? manifest.target : {};
@@ -1674,10 +1677,53 @@ export async function readRawTraceRequestLogBundle(
       responseHeaders: headerRecordFromUnknown(upstreamResponseMetadata?.headers),
       ...(stringValue(manifest.startedAt) ? { startedAt: stringValue(manifest.startedAt) } : {}),
       statusCode: numberValue(upstreamResponseMetadata?.statusCode),
-      url
+      url,
+      ...recallTokensFromInternalToolStats(internalToolStats)
     }
   };
 }
+
+/**
+ * Helix recall: the gateway reports per-internal-tool injected content length in
+ * characters (it has no tokenizer). Recall tools (history_recall / hc_recall)
+ * inject original text back into the prompt, which CCR reports as
+ * `compression_recall_tokens`. Tokenize the recalled characters with the same
+ * gpt-tokenizer the compression headers use so the figure is comparable.
+ */
+const HELIX_RECALL_TOOL_NAMES_FOR_STATS = new Set(["history_recall", "hc_recall"]);
+
+function recallTokensFromInternalToolStats(
+  stats: Record<string, unknown> | undefined
+): { compressionRecallTokens?: number } {
+  if (!stats || !isRecord(stats.injectedChars)) {
+    return {};
+  }
+  let recalledChars = 0;
+  for (const [name, value] of Object.entries(stats.injectedChars as Record<string, unknown>)) {
+    if (!HELIX_RECALL_TOOL_NAMES_FOR_STATS.has(name)) {
+      continue;
+    }
+    const chars = numberValue(value);
+    if (chars !== undefined && chars > 0) {
+      recalledChars += chars;
+    }
+  }
+  if (recalledChars <= 0) {
+    return {};
+  }
+  try {
+    const tokens = gptEncode("x".repeat(Math.min(recalledChars, maxRecallTokenizeChars))).length;
+    // scale back up if we clamped the sample
+    const scaled = recalledChars > maxRecallTokenizeChars
+      ? Math.round(tokens * (recalledChars / maxRecallTokenizeChars))
+      : tokens;
+    return { compressionRecallTokens: scaled };
+  } catch {
+    return {};
+  }
+}
+
+const maxRecallTokenizeChars = 200_000;
 
 function readUnknownHeader(headers: unknown, name: string): unknown {
   if (!isRecord(headers)) return undefined;

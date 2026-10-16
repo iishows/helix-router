@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
+import { encode as gptEncode } from "gpt-tokenizer";
 import { createDefaultAppConfig } from "@ccr/core/config/default-config.ts";
 import { providerRuntimeId } from "@ccr/core/routing/model-registry.ts";
 import { rawTraceSyncHeader } from "@ccr/core/gateway/internal/shared.ts";
@@ -196,6 +197,65 @@ test("raw trace bundle preserves manifest lifecycle metadata", async () => {
     assert.equal(bundle.update.completedAt, completedAt);
     assert.equal(bundle.update.durationMs, 1234);
     assert.equal(bundle.update.bundleCapturedAt, completedAt);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("internal_tool_stats recall chars are tokenized into compressionRecallTokens", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-raw-trace-recall-test-"));
+  const spoolDirectory = path.join(dir, "spool");
+  const bundleDirectory = path.join(spoolDirectory, "producer-bundle");
+  const statsFile = path.join(bundleDirectory, "internal_tool_stats.json");
+  const bodyFile = path.join(bundleDirectory, "upstream_response.json");
+  mkdirSync(bundleDirectory, { recursive: true });
+  // 4000 chars of "x" ≈ 500 cl100k tokens for recall; a non-recall tool must be ignored.
+  writeFileSync(statsFile, JSON.stringify({
+    injectedChars: { history_recall: 4000, hc_recall: 800, some_other_tool: 99999 }
+  }));
+  writeFileSync(bodyFile, "{}");
+  try {
+    const bundle = await readRawTraceRequestLogBundle({
+      parts: [{
+        contentType: "application/json",
+        filePath: statsFile,
+        partType: "internal_tool_stats"
+      }, {
+        contentType: "application/json",
+        filePath: bodyFile,
+        partType: "upstream_response"
+      }],
+      requestId: "core-recall-stats"
+    }, spoolDirectory);
+
+    assert.ok(bundle);
+    // 4800 positive-only recall chars are tokenized; the unrelated tool is excluded.
+    const expected = gptEncode("x".repeat(4800)).length;
+    assert.equal(bundle.update.compressionRecallTokens, expected);
+    assert.ok(expected > 0);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("internal_tool_stats with no recall tools yields no compressionRecallTokens", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-raw-trace-norecall-test-"));
+  const spoolDirectory = path.join(dir, "spool");
+  const bundleDirectory = path.join(spoolDirectory, "producer-bundle");
+  const statsFile = path.join(bundleDirectory, "internal_tool_stats.json");
+  mkdirSync(bundleDirectory, { recursive: true });
+  writeFileSync(statsFile, JSON.stringify({ injectedChars: { web_search: 5000 } }));
+  try {
+    const bundle = await readRawTraceRequestLogBundle({
+      parts: [{
+        contentType: "application/json",
+        filePath: statsFile,
+        partType: "internal_tool_stats"
+      }],
+      requestId: "core-norecall-stats"
+    }, spoolDirectory);
+    assert.ok(bundle);
+    assert.equal(bundle.update.compressionRecallTokens, undefined);
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }

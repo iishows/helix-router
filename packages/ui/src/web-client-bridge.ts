@@ -113,6 +113,7 @@ const webClientBridge: CcrApi = {
   closeBotGatewayQrWindow: (request) => rpc("closeBotGatewayQrWindow", [request]) as ReturnType<CcrApi["closeBotGatewayQrWindow"]>,
   closeTray: () => Promise.resolve(),
   detectProviderIcon: (request) => rpc("detectProviderIcon", [request]) as ReturnType<CcrApi["detectProviderIcon"]>,
+  detectRecallModels: (request) => rpc("detectRecallModels", [request]) as ReturnType<CcrApi["detectRecallModels"]>,
   exportData: () => rpc("exportData") as ReturnType<CcrApi["exportData"]>,
   fetchProviderManifest: (request) => rpc("fetchProviderManifest", [request]) as ReturnType<CcrApi["fetchProviderManifest"]>,
   getAgentAnalysis: (filter) => rpc("getAgentAnalysis", [filter]) as ReturnType<CcrApi["getAgentAnalysis"]>,

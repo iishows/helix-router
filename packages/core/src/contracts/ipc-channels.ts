@@ -3,6 +3,7 @@ export const IPC_CHANNELS = {
   appCaptureElementPng: "ccr:app:capture-element-png",
   appCloseTray: "ccr:app:close-tray",
   appDetectProviderIcon: "ccr:app:detect-provider-icon",
+  appDetectRecallModels: "ccr:app:detect-recall-models",
   appExportData: "ccr:app:export-data",
   appGetConfig: "ccr:app:get-config",
   appGetAgentAnalysis: "ccr:app:get-agent-analysis",

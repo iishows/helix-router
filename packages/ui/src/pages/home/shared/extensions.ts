@@ -327,6 +327,109 @@ export function formatEditableJson(value: unknown): string {
   return JSON.stringify(value, null, 2);
 }
 
+export const HELIX_COMPRESSOR_PLUGIN_ID = "helix-compressor";
+export const HELIX_COMPACT_BUDGET_FLOOR_TOKENS = 48000;
+export const HELIX_COMPACT_BUDGET_CEILING_TOKENS = 120000;
+
+/**
+ * 读 helix 插件 config JSON 文本里的 compact 预算百分比(1-100)。
+ * 未配置 / JSON 非法 / 非正整数 → undefined(表示关闭百分比模式,回退绝对 tokenBudget)。
+ */
+export function readHelixCompactBudgetPercent(configText: string): number | undefined {
+  const config = parsePluginConfigSettingsText(configText);
+  if (!config.ok || !config.value) {
+    return undefined;
+  }
+  const raw = config.value.compactBudgetPercent;
+  if (typeof raw !== "number" || !Number.isFinite(raw)) {
+    return undefined;
+  }
+  const percent = Math.floor(raw);
+  return percent >= 1 && percent <= 100 ? percent : undefined;
+}
+
+/**
+ * 把百分比写入 helix 插件 config JSON 文本(保留其它键与原有编辑格式)。
+ * percent 为 undefined 时删除该键(回退绝对 tokenBudget)。JSON 非法则原样返回。
+ */
+export function writeHelixCompactBudgetPercent(configText: string, percent: number | undefined): string {
+  const trimmed = configText.trim();
+  const config: Record<string, unknown> = trimmed ? (() => {
+    const parsed = parsePluginConfigSettingsText(configText);
+    return parsed.ok && parsed.value ? parsed.value : {};
+  })() : {};
+  if (percent === undefined) {
+    delete config.compactBudgetPercent;
+  } else {
+    config.compactBudgetPercent = Math.min(100, Math.max(1, Math.floor(percent)));
+  }
+  return formatEditableJson(config);
+}
+
+/** 概算预算区间说明(仅提示,真实 clamp 在 core 侧用模型上下文长度计算)。 */
+export function helixCompactBudgetRangeLabel(percent: number | undefined, contextTokens?: number): string {
+  if (percent === undefined) {
+    return "Percent disabled - using absolute tokenBudget.";
+  }
+  const clamp = (value: number) => Math.min(HELIX_COMPACT_BUDGET_CEILING_TOKENS, Math.max(HELIX_COMPACT_BUDGET_FLOOR_TOKENS, Math.floor(value)));
+  if (!contextTokens || contextTokens <= 0) {
+    return `Budget = context x ${percent}% (${HELIX_COMPACT_BUDGET_FLOOR_TOKENS / 1000}k-${HELIX_COMPACT_BUDGET_CEILING_TOKENS / 1000}k).`;
+  }
+  return `Budget = ${clamp(contextTokens * percent / 100)} tokens (context ${contextTokens} x ${percent}%).`;
+}
+
+/**
+ * 读 helix 插件 config 里的 recall 模型白名单 + 排除表 + 是否已自动检测。
+ * JSON 非法 / 缺字段 → 空数组 + detected=false。
+ */
+export function readHelixRecallPatterns(configText: string): {
+  patterns: string[];
+  excludePatterns: string[];
+  detected: boolean;
+} {
+  const config = parsePluginConfigSettingsText(configText);
+  const value = config.ok && config.value ? config.value : {};
+  const readList = (raw: unknown): string[] =>
+    Array.isArray(raw) ? raw.filter((item): item is string => typeof item === "string") : [];
+  return {
+    detected: value.recallModelDetected === true,
+    excludePatterns: readList(value.recallModelExcludePatterns),
+    patterns: readList(value.recallModelPatterns)
+  };
+}
+
+/**
+ * 把白名单 / 排除表写入 helix 插件 config JSON 文本(保留其它键)。
+ * 空数组时删除对应键。detected 为 true 时写 recallModelDetected(自动检测语义:
+ * 空白名单 = 真的没有模型支持,而非"未配置=全部")。JSON 非法则原样返回。
+ */
+export function writeHelixRecallPatterns(
+  configText: string,
+  patterns: string[],
+  excludePatterns: string[],
+  detected?: boolean
+): string {
+  const trimmed = configText.trim();
+  const config: Record<string, unknown> = trimmed
+    ? (() => {
+        const parsed = parsePluginConfigSettingsText(configText);
+        return parsed.ok && parsed.value ? parsed.value : {};
+      })()
+    : {};
+  const clean = (list: string[]) => list.map((item) => item.trim()).filter(Boolean);
+  const kept = clean(patterns);
+  const excluded = clean(excludePatterns);
+  if (kept.length > 0) config.recallModelPatterns = kept;
+  else delete config.recallModelPatterns;
+  if (excluded.length > 0) config.recallModelExcludePatterns = excluded;
+  else delete config.recallModelExcludePatterns;
+  if (detected !== undefined) {
+    if (detected) config.recallModelDetected = true;
+    else delete config.recallModelDetected;
+  }
+  return formatEditableJson(config);
+}
+
 export function sanitizeConfigId(value: string): string {
   return value
     .toLowerCase()

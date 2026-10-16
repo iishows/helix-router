@@ -207,7 +207,12 @@ export function createDefaultAppConfig(options: DefaultAppConfigOptions = {}): A
           server: "",
           username: ""
         },
-        mode: "system"
+        // helix V1.2 / 2026-10-13: 默认 "none" 而不是 "system"。
+        //   "system" 模式读 Windows 注册表 / netsh winhttp / ALL_PROXY env,
+        //   在 Claude 桌面端(设了 ALL_PROXY=127.0.0.1:63214)或 Windows 上残留
+        //   WinHTTP proxy 配置时,会把 ccr 的 upstream fetch 引导到无效端口 → 502。
+        //   显式设 "none" 关闭系统代理探测,需要时用户在 web UI 切 "system" / "custom"。
+        mode: "none"
       }
     },
     providerPlugins: [],

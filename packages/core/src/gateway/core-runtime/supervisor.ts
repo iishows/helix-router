@@ -396,6 +396,20 @@ function createGatewayProcessEnv(
     if (key.startsWith("RAW_TRACE_")) delete env[key];
   }
 
+  // helix V1.2 / 2026-10-13: 显式删除继承自父进程的 outbound proxy env。
+  //   ccr 通过 `proxy.upstream` 配置控制自己的 outbound proxy(由 gateway bootstrap
+  //   通过 IPC 传给 ai-gateway runtime),不应该从 shell 继承 HTTP_PROXY / ALL_PROXY
+  //   等。Claude 桌面端在用户 shell 里会设 ALL_PROXY=http://127.0.0.1:63214
+  //   指向自己的 desktop server 端口,这个端口不代理真正的 HTTPS 请求 — 让
+  //   ai-gateway runtime 继承这个 env 会把所有 upstream 调用走 63214 立即 fail。
+  //   CCR_UPSTREAM_PROXY_URL 是 ccr 自己的,保留(用于显式 proxy mode)。
+  for (const key of [
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
+    "NO_PROXY", "no_proxy"
+  ]) {
+    delete env[key];
+  }
+
   const noProxy = mergeNoProxy(env.NO_PROXY || env.no_proxy, [
     "127.0.0.1",
     "localhost",

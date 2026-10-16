@@ -182,6 +182,13 @@ export type GatewayPluginResponseHookResult = {
   continueLoop: boolean;
   messagesToAppend?: LLMMessage[];
   finalResponse?: unknown;
+  /**
+   * 本次 hook 回填的召回原文 token 数(2026-10-16)。用于「真实端到端节省」——
+   * 上游实收 prompt 里有多少是召回 history_recall/hc_recall 后回填的原文,
+   * 需从 post(压缩后 messages) 里扣掉才得到「messages 口径」净节省。
+   * 与 messagesToAppend 会被网关累加到同一请求的多轮 recall 上。
+   */
+  recallTokens?: number;
 };
 
 export type GatewayPluginResponseHookHandler = (
@@ -767,10 +774,12 @@ class GatewayPluginService {
     continueLoop: boolean;
     messagesToAppend: LLMMessage[];
     finalResponse?: unknown;
+    recallTokens?: number;
   }> {
     let messagesToAppend: LLMMessage[] = [];
     let finalResponse: unknown;
     let continueLoop = false;
+    let recallTokens = 0;
 
     for (const hook of this.gatewayResponseHooks) {
       try {
@@ -778,6 +787,9 @@ class GatewayPluginService {
         if (!result) continue;
         if (Array.isArray(result.messagesToAppend) && result.messagesToAppend.length > 0) {
           messagesToAppend = [...messagesToAppend, ...result.messagesToAppend];
+        }
+        if (typeof result.recallTokens === "number" && Number.isFinite(result.recallTokens) && result.recallTokens > 0) {
+          recallTokens += result.recallTokens;
         }
         if (result.finalResponse !== undefined) {
           finalResponse = result.finalResponse;
@@ -790,11 +802,12 @@ class GatewayPluginService {
       }
     }
 
-    const out: { continueLoop: boolean; messagesToAppend: LLMMessage[]; finalResponse?: unknown } = {
+    const out: { continueLoop: boolean; messagesToAppend: LLMMessage[]; finalResponse?: unknown; recallTokens?: number } = {
       continueLoop,
       messagesToAppend
     };
     if (finalResponse !== undefined) out.finalResponse = finalResponse;
+    if (recallTokens > 0) out.recallTokens = recallTokens;
     return out;
   }
 

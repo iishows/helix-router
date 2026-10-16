@@ -10,7 +10,10 @@
  */
 
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { beforeEach } from "node:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   HISTORY_RECALL_TOOL_SCHEMA,
   HISTORY_RECALL_TOOL_NAME,
@@ -20,9 +23,27 @@ import {
   extractAnthropicHistoryRecallCalls,
   helixCompressorResponseHook
 } from "@ccr/core/plugins/built-ins/helix-compressor.ts";
+import {
+  configureCacheDir,
+  putBatch as seedRecallCache,
+  _resetIndexForTest,
+  _clearCacheForTest
+} from "@ccr/core/observability/helix-recall-local-store";
 
-const HELIX_API = "https://api.helix-compressor.com";
-const HELIX_KEY = "hk_test_xxx";
+// P2(2026-10-15):history_recall 读本地 store,不打任何云端。测试改为预置本地 JSONL。
+configureCacheDir(mkdtempSync(join(tmpdir(), "helix-qa-recall-test-")));
+
+function seedRecallEntries(entries) {
+  _clearCacheForTest();
+  _resetIndexForTest();
+  seedRecallCache(entries);
+  _resetIndexForTest();
+}
+
+beforeEach(() => {
+  _clearCacheForTest();
+  _resetIndexForTest();
+});
 
 function mockContext(overrides = {}) {
   return {
@@ -35,14 +56,7 @@ function mockContext(overrides = {}) {
     },
     paths: { configDir: "", dataDir: "", pluginDataDir: "" },
     permissions: [],
-    pluginConfig: {
-      helixApiUrl: HELIX_API,
-      helixApiKey: HELIX_KEY,
-      evaluatorApiUrl: "https://api.openai.com",
-      evaluatorApiKey: "sk-test",
-      evaluatorModel: "gpt-4o-mini",
-      timeoutMs: 5000
-    },
+    pluginConfig: {},
     pluginId: "helix-compressor",
     openSqliteStore: async () => { throw new Error("not implemented"); },
     ...overrides
@@ -73,6 +87,29 @@ test("hasQAPlaceholder: detects in string content", () => {
   assert.equal(hasQAPlaceholder([
     { role: "assistant", content: "" }
   ]), false);
+});
+
+// 真实 Claude Code 的 content 恒为数组块([{type:"text",text:"⟦QA:hash⟧"}])。
+// 旧实现只检查字符串 → 数组块里的 ⟦QA:⟧ 永远漏检 → history_recall 工具/教学 prompt
+// 从不注入(请求日志 3605 实测:body 有 2 个 ⟦QA:⟧ 但 history_recall 工具缺失)。
+test("hasQAPlaceholder: 检测数组块 content(真实 Claude Code 形状)", () => {
+  assert.equal(hasQAPlaceholder([
+    { role: "user", content: [{ type: "text", text: "⟦QA:d1e0fad99226a6f8⟧" }] }
+  ]), true);
+  assert.equal(hasQAPlaceholder([
+    { role: "user", content: [{ type: "text", text: "普通文本" }] }
+  ]), false);
+  // tool_result 块(无 text 字段)不应误报
+  assert.equal(hasQAPlaceholder([
+    { role: "user", content: [{ type: "tool_result", content: "output" }] }
+  ]), false);
+  // 混合:数组里既有 text 又有 tool_use
+  assert.equal(hasQAPlaceholder([
+    { role: "assistant", content: [
+      { type: "text", text: "⟦QA:aaaabbbbccccdddd⟧" },
+      { type: "tool_use", id: "call_1", name: "Bash", input: {} }
+    ] }
+  ]), true);
 });
 
 // ============== injectHistoryRecallInstruction(幂等是关键)==============
@@ -202,11 +239,7 @@ test("extractAnthropicHistoryRecallCalls: extracts with_media=true", () => {
 // 在 hook 走到 audit log 时抛 TypeError,gateway 吞掉 → LLM 看到 tool_call 没回结果。
 
 test("response hook: history_recall path 不抛错 (回归测试)", async () => {
-  const originalFetch = global.fetch;
-  global.fetch = async () => ({
-    ok: true,
-    json: async () => ({ q: "原 Q 文本", a: "原 A 文本" })
-  });
+  seedRecallEntries([["abc123def4567890", { q: "原 Q 文本", a: "原 A 文本" }]]);
 
   const response = {
     choices: [{
@@ -249,16 +282,13 @@ test("response hook: history_recall path 不抛错 (回归测试)", async () => 
   const content = result.messagesToAppend[0].content;
   assert.ok(content.includes("原 Q 文本"));
   assert.ok(content.includes("原 A 文本"));
-
-  global.fetch = originalFetch;
+  // 2026-10-16: 回填的原文 token 数(供「真实端到端节省」扣除召回回填)
+  assert.equal(typeof result.recallTokens, "number");
+  assert.ok(result.recallTokens > 0, "recallTokens 应 > 0(有回填原文)");
 });
 
 test("response hook: history_recall hash miss 优雅处理 (审计 + 不抛错)", async () => {
-  const originalFetch = global.fetch;
-  global.fetch = async () => ({
-    ok: false,
-    status: 404
-  });
+  seedRecallEntries([]);
 
   const response = {
     choices: [{
@@ -289,7 +319,78 @@ test("response hook: history_recall hash miss 优雅处理 (审计 + 不抛错)"
   }
 
   assert.equal(threw, false);
-  global.fetch = originalFetch;
+});
+
+// V3.4: anthropic 协议 + with_media=true + 命中图片 → tool_result 用块数组返回真实 image 块
+test("response hook: anthropic with_media=true returns a real image content block", async () => {
+  seedRecallEntries([
+    ["abcdabcdabcdabcd", {
+      q: "[media block: image image/png, 4 bytes]",
+      a: "",
+      kind: "media",
+      qMedia: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } }]
+    }]
+  ]);
+
+  const response = {
+    content: [{
+      type: "tool_use",
+      id: "toolu_media1",
+      name: HISTORY_RECALL_TOOL_NAME,
+      input: { hash_id: "abcdabcdabcdabcd", with_media: true }
+    }]
+  };
+
+  const result = await helixCompressorResponseHook(
+    {
+      body: {}, headers: {}, method: "POST", path: "/v1/chat",
+      requestId: "r1", responsePayload: response, statusCode: 200, protocol: "anthropic"
+    },
+    mockContext()
+  );
+
+  assert.equal(result.continueLoop, true);
+  const block = result.messagesToAppend[0].content[0];
+  assert.equal(block.type, "tool_result");
+  assert.equal(block.tool_use_id, "toolu_media1");
+  assert.ok(Array.isArray(block.content), "tool_result content 应为块数组");
+  const img = block.content.find((c) => c.type === "image");
+  assert.deepEqual(img, {
+    type: "image",
+    source: { type: "base64", media_type: "image/png", data: "AAAA" }
+  });
+});
+
+test("response hook: anthropic without with_media keeps plain-text q_media (no image block)", async () => {
+  seedRecallEntries([
+    ["abcdabcdabcdabcd", {
+      q: "[media block: image image/png, 4 bytes]",
+      a: "",
+      kind: "media",
+      qMedia: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } }]
+    }]
+  ]);
+
+  const response = {
+    content: [{
+      type: "tool_use",
+      id: "toolu_media2",
+      name: HISTORY_RECALL_TOOL_NAME,
+      input: { hash_id: "abcdabcdabcdabcd" }
+    }]
+  };
+
+  const result = await helixCompressorResponseHook(
+    {
+      body: {}, headers: {}, method: "POST", path: "/v1/chat",
+      requestId: "r1", responsePayload: response, statusCode: 200, protocol: "anthropic"
+    },
+    mockContext()
+  );
+
+  const block = result.messagesToAppend[0].content[0];
+  assert.equal(typeof block.content, "string", "无 with_media 时应为纯文本");
+  assert.ok(!block.content.includes("AAAA"), "不应把 base64 当文本返回");
 });
 
 // ============== Prompt directive 内容(防止将来误删)==============
