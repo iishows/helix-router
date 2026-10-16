@@ -34,35 +34,19 @@ function squeeze(source) {
 
 /**
  * Apply `edits` to `source`. Each edit is a [from, to] pair; both are whitespace-
- * normalized before matching. Throws if an anchor is missing or ambiguous so a
- * gateway upgrade that renames things fails loudly instead of silently no-op'ing.
+ * normalized before matching. Throws if an anchor is missing so a gateway upgrade that
+ * renames things fails loudly instead of silently no-op'ing.
  */
 function applyEdits(source, edits, label) {
-  const squeezed = squeeze(source);
-  for (const [from, to] of edits) {
-    const nFrom = squeeze(from);
-    const nTo = squeeze(to);
-    const count = squeezed.split(nFrom).length - 1;
-    if (count === 0) {
-      throw new Error(`[patch-gateway] ${label}: anchor not found: ${nFrom.slice(0, 80)}`);
-    }
-    if (count > 1 && nFrom !== nTo) {
-      // Multiple structural anchors are expected for the two call sites; apply all.
-    }
-  }
-  // Rebuild by index-mapping: replace on the squeezed text then splice back is lossy,
-  // so do the replacement against a token-split approach instead.
-  const result = replaceAllNormalized(source, edits);
-  return result;
+  return replaceAllNormalized(source, edits, label);
 }
 
 /**
  * Replace `from` → `to` in `source`, tolerating differing whitespace between the two
- * needles by walking token boundaries. Simpler and sufficient here: because anchors are
- * short and unique modulo whitespace, normalize both sides to a single space and use a
- * regex built from the normalized token sequence.
+ * needles: normalize the anchor to a single space and build a regex that allows any
+ * whitespace between tokens. The two shipped minifier variants differ only in spacing.
  */
-function replaceAllNormalized(source, edits) {
+function replaceAllNormalized(source, edits, label = "ai-gateway") {
   let out = source;
   for (const [from, to] of edits) {
     const tokens = squeeze(from).trim().split(" ");
@@ -71,7 +55,7 @@ function replaceAllNormalized(source, edits) {
     const before = out;
     out = out.replace(re, () => to);
     if (out === before) {
-      throw new Error(`[patch-gateway] replacement had no effect for: ${from.slice(0, 80)}`);
+      throw new Error(`[patch-gateway] ${label}: replacement had no effect for: ${from.slice(0, 80)}`);
     }
   }
   return out;
