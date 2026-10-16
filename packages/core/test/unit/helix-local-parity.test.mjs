@@ -481,6 +481,19 @@ test("maxCompressToolResults caps count (largest savings first)", () => {
   assert.equal(compressed.length, 3);
 });
 
+test("default maxCompressToolResults covers real agent sessions (not capped at 20)", () => {
+  // 真实 Claude Code 会话单请求可达 600+ 条 tool_result(实测某请求 278 条超阈值),
+  // 旧默认 20 导致 95% 的超阈值工具输出原样明文发给上游。默认上限须足以覆盖真实历史。
+  const msgs = makeToolHistory(3000, 60);
+  const r = compressV3x(msgs, { keepRecentToolResults: 2 });
+  const compressed = toolResultBlocks(r.messages).filter((b) => String(b.content).includes("⟦QA:"));
+  // 远超旧默认 20 即证明上限已放宽;具体条数取决于 anchor/recent 保护。
+  assert.ok(
+    compressed.length > 50,
+    `默认上限须覆盖真实会话(>50),实际 ${compressed.length}(旧默认只压 20)`
+  );
+});
+
 test("compressToolResults:false disables tool_result compression", () => {
   const msgs = makeToolHistory(4000, 6);
   const r = compressV3x(msgs, { compressToolResults: false });

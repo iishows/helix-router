@@ -35,8 +35,11 @@ const DEFAULT_BLOCK_THRESHOLD_CHARS = 0;
 const DEFAULT_TOOL_RESULT_THRESHOLD_CHARS = 1000;
 // 最近 N 条 tool_result 永不压缩(模型最依赖近因工具输出)。
 const DEFAULT_KEEP_RECENT_TOOL_RESULTS = 2;
-// 单请求 tool_result 压缩条数上限(风控兜底)。
-const DEFAULT_MAX_COMPRESS_TOOL_RESULTS = 20;
+// 单请求 tool_result 压缩条数上限。真实 agent 会话(实测)单请求可达 600+ 条 tool_result、
+//   其中 200+ 条超阈值;旧默认 20 导致 95% 的超阈值工具输出原样明文发给上游
+//   (实测某请求 663k 字符仅压 20 条)。放宽到 200:覆盖真实会话历史,同时保留一个
+//   合理上界避免病态输入。真正该兜底的是"压缩后仍超预算→主动 compact",而非此处硬顶。
+const DEFAULT_MAX_COMPRESS_TOOL_RESULTS = 200;
 const PLACEHOLDER_PREFIX = "⟦QA:";
 const PLACEHOLDER_SUFFIX = "⟧";
 const LEGACY_PLACEHOLDER_PREFIX = "⟦CCR:";
