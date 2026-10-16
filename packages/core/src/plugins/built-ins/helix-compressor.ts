@@ -223,7 +223,10 @@ export const HELIX_COMPRESSOR_DEFAULTS: HelixCompressorConfig = {
   compressToolResults: true,
   toolResultThresholdChars: 1000,
   keepRecentToolResults: 2,
-  maxCompressToolResults: 20,
+  // 真实 agent 会话单请求可达 600+ 条 tool_result(实测某请求 662 条、278 条超阈值)。
+  // 旧默认 20 导致 95% 的超阈值工具输出原样明文发给上游(663k 字符仅压 20 条)。
+  // 放宽到 200 覆盖真实历史;真正的预算兜底是"压缩后超预算 → 主动 compact"。
+  maxCompressToolResults: 200,
   keepRecentTurns: 2,
   proactiveCompactCacheTtlMs: 259200000,
   proactiveCompactMinNewMessages: 100,
