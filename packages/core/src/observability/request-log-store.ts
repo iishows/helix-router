@@ -5211,6 +5211,7 @@ function readRequestLogById(database: SqlDatabase, id: number): StoredRequestLog
         compression_post_tokens,
         compression_submitted_tokens,
         compression_billed_tokens,
+        compression_recall_tokens,
         compression_proactive_compact_json,
         error
       FROM request_logs

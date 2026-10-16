@@ -318,6 +318,43 @@ test("RequestLogStore keeps list rows lightweight and detail rows complete", asy
   }
 });
 
+test("RequestLogStore exposes compression recall tokens in both list and detail", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-request-log-recall-test-"));
+  let store;
+  try {
+    store = new RequestLogStore(path.join(dir, "request-logs.sqlite"));
+    await store.record({
+      completedAt: new Date().toISOString(),
+      compressionRecallTokens: 169,
+      durationMs: 42,
+      method: "POST",
+      path: "/v1/chat/completions",
+      providerName: "test-provider",
+      requestBody: Buffer.from(JSON.stringify({ messages: [], model: "test-model" }), "utf8"),
+      requestHeaders: { "content-type": "application/json" },
+      requestId: "request-log-recall-test",
+      responseBodyText: "{}",
+      responseHeaders: { "content-type": "application/json" },
+      startedAt: new Date().toISOString(),
+      statusCode: 200,
+      url: "http://127.0.0.1:3456/v1/chat/completions"
+    });
+
+    const page = await store.list({ pageSize: 25 });
+    assert.equal(page.items.length, 1);
+    assert.equal(page.items[0].compressionRecallTokens, 169);
+
+    const detail = await store.getDetail({ id: page.items[0].id });
+    assert.ok(detail);
+    // Regression: the detail SELECT must include compression_recall_tokens; otherwise the
+    // expanded log row silently drops the 召回回填 figure even though the list has it.
+    assert.equal(detail.compressionRecallTokens, 169);
+  } finally {
+    await store?.close();
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("RequestLogStore persists stream experience metrics and derives authoritative TPS", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ccr-request-log-speed-test-"));
   let store;
