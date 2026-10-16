@@ -4,6 +4,7 @@ import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSyn
 import { builtinModules, createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { patchInstalledGateway } from "./patch-gateway.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const requireFromHere = createRequire(import.meta.url);
@@ -29,6 +30,11 @@ export const coreMainOutDir = path.join(coreDistDir, "main");
 export const electronMainOutDir = path.join(electronDistDir, "main");
 export const mainOutDir = electronMainOutDir;
 export const gatewayPackageRoot = resolveGatewayPackageRoot();
+// Patch the installed ai-gateway runtime before it is bundled (both build.mjs and the
+// dev watcher import this module). The npm package ships pristine minified dist; the
+// CCR-required status/recall fixes live in build/patch-gateway.mjs. Without this, every
+// rebuild (especially the dev watcher) silently reverts them.
+patchInstalledGateway(projectRoot);
 export const gatewayRuntimeInput = resolveGatewayRuntimeInput(gatewayPackageRoot);
 export const electronGatewayRuntimeOutput = path.join(electronMainOutDir, "next-ai-gateway.js");
 export const botGatewaySdkPackageRoot = path.dirname(requireFromHere.resolve("@the-next-ai/bot-gateway-sdk/package.json"));
