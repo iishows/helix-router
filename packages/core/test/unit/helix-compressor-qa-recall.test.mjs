@@ -401,14 +401,14 @@ test("HISTORY_RECALL_INSTRUCTION 含明确触发词 + 反例", () => {
   const [injected] = injectHistoryRecallInstruction(messages);
   const text = injected.content;
 
-  // 强触发词
+  // 强触发符号
   assert.ok(text.includes("⚠️"), "应有 ⚠️ 强触发符号");
-  // 必须调用的场景关键词
-  assert.ok(text.includes("必须调用"), "应明确'必须调用'场景");
+  // 强制召回指令(英文,直接命令模型先召回再回答)
+  assert.ok(text.includes("MUST recall"), "应明确'必须召回'的强制指令");
   // 决策示例:hash_id 提取
   assert.ok(text.includes("abc123def4567890"), "应有 hash_id 提取示例");
-  // 反例
-  assert.ok(text.includes("禁止"), "应有'禁止'反例段");
+  // 反例 / 禁令
+  assert.ok(text.includes("Do NOT"), "应有禁令段");
   // 召回时的 with_media 决策
   assert.ok(text.includes("with_media"), "应提示 with_media 用途");
 });

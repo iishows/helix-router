@@ -547,16 +547,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 // ============= hc_recall Tool Schema（Recall 能力）=============
 
+const HC_RECALL_TOOL_DESCRIPTION =
+  "Retrieve the original text behind a ⟦HC:hash⟧ placeholder. Content in this conversation was " +
+  "compressed: long tool results, file reads and command output were replaced by ⟦HC:<16-hex>⟧ " +
+  "markers that hold NO information on their own. Call this tool with the hash_id to get the exact " +
+  "original content back before you answer. If your answer depends on anything a placeholder hides " +
+  "— a number, name, file path, code snippet, config key, error string, or any verbatim text — you " +
+  "MUST recall it first; never guess or say the information is unavailable. Do NOT call repeatedly " +
+  "for the same hash, and recall only the placeholders the task actually needs.";
+
 export const HC_RECALL_TOOL_SCHEMA = {
   type: "function",
   function: {
     name: helixCompressorRecallToolName,
-    description:
-      "Recall the original content of a HC-compressed block. " +
-      "When you see ⟦HC:hash⟧ placeholders (hex hash) in the conversation, " +
-      "call this tool with the hash_id to get the full original text. " +
-      "Only call when you genuinely need the original content to answer accurately. " +
-      "Do NOT call repeatedly — there's a per-request budget.",
+    description: HC_RECALL_TOOL_DESCRIPTION,
     parameters: {
       type: "object",
       properties: {
@@ -579,12 +583,7 @@ export const HC_RECALL_TOOL_SCHEMA = {
 // Anthropic 协议版本: 字段名从 parameters 改为 input_schema,顶层去 type/function 包裹
 export const HC_RECALL_TOOL_SCHEMA_ANTHROPIC = {
   name: helixCompressorRecallToolName,
-  description:
-    "Recall the original content of a HC-compressed block. " +
-    "When you see ⟦HC:hash⟧ placeholders (hex hash) in the conversation, " +
-    "call this tool with the hash_id to get the full original text. " +
-    "Only call when you genuinely need the original content to answer accurately. " +
-    "Do NOT call repeatedly — there's a per-request budget.",
+  description: HC_RECALL_TOOL_DESCRIPTION,
   input_schema: {
     type: "object",
     properties: {
@@ -606,22 +605,37 @@ export const HC_RECALL_TOOL_SCHEMA_ANTHROPIC = {
 const HC_RECALL_INSTRUCTION_MARKER = "<<HC_RECALL_INSTRUCTION_v1>>";
 
 const HC_RECALL_INSTRUCTION = `${HC_RECALL_INSTRUCTION_MARKER}
-## 工具调用: ${helixCompressorRecallToolName}
+## ⚠️ Compressed content — you MUST recall before answering
 
-你会在对话中看到形如 ⟦HC:hash⟧ 的占位符（hash 为十六进制字符串）。
-这些占位符代表被压缩缓存的**原始内容**（工具结果、长文件、长 RAG chunk 等）。
+Long content in this conversation (tool results, file reads, command output, retrieved documents)
+was replaced by **placeholders** of the form \`⟦HC:<16-hex>⟧\`. A placeholder carries NO
+information of its own — it only marks that original content exists and can be retrieved.
 
-**规则**：
-1. 当你需要被压缩的**原文细节**来准确回答（例如：关键代码、文件路径、数字、工具返回 JSON），
-   立即调用 \`${helixCompressorRecallToolName}\` 工具，参数 hash_id 取占位符中的 hash（不含 ⟦HC:⟧ 前缀和 ⟧ 后缀）。
-2. **不要**把 ⟦HC:hash⟧ 当作完整信息处理（那只是压缩后的极简摘要，信息可能不全）。
-3. **不要**反复调同一个 hash_id（有 per-request 上限 ${helixCompressorMaxRecallPerRequest} 次，多了就拒绝）。
-4. **不要**为每个占位符都 recall — 只在你**真正需要原文**时调。
-5. 你也可以直接基于已有的摘要信息作答，没必要全文 recall。
+**Non-negotiable:** a placeholder is NOT a summary you may reason over. If your answer depends on
+anything the placeholder hides, you MUST call the \`${helixCompressorRecallToolName}\` tool FIRST and
+answer from the returned original text.
 
-**示例**：
-占位符：\`⟦HC:abcdef0123456789⟧\`
-调用：${helixCompressorRecallToolName}(hash_id="abcdef0123456789", reason="need original file content")
+### Call \`${helixCompressorRecallToolName}\` immediately when
+1. The task needs a **specific value** from compressed content — a number, name, file path, code
+   snippet, config key, error string, or any verbatim text.
+2. The user refers back to earlier work ("the file you read", "that output", "what did it print").
+3. The current step **cannot be completed correctly** without the original text.
+4. You are about to **guess, assume, or claim you lack the information** — that is exactly the
+   moment to recall instead.
+
+### How to call
+- The placeholder looks like \`⟦HC:abcdef0123456789⟧\`.
+- \`hash_id\` = the 16 hex chars only (drop the \`⟦HC:\` prefix and the \`⟧\` suffix): \`abcdef0123456789\`.
+- One call retrieves one placeholder; issue additional calls when a task needs more than one.
+
+### Do NOT
+- ❌ Treat \`⟦HC:hash⟧\` as the content. It is a pointer, never an answer.
+- ❌ Recall every placeholder blindly — recall only what the current task needs.
+- ❌ Call the same \`hash_id\` twice (per-request limit: ${helixCompressorMaxRecallPerRequest}).
+
+### Example
+Placeholder in history: \`⟦HC:abcdef0123456789⟧\`
+→ Call: \`${helixCompressorRecallToolName}(hash_id="abcdef0123456789", reason="need the original file content")\`
 `;
 
 // hash_id 格式校验：8-128 位 hex
@@ -766,17 +780,21 @@ export function clientCompactSkills(messages: LLMMessage[]): LLMMessage[] {
 
 export const HISTORY_RECALL_TOOL_NAME = "history_recall";
 
+const HISTORY_RECALL_TOOL_DESCRIPTION =
+  "Retrieve the original content behind a ⟦QA:hash⟧ placeholder. Earlier turns of this conversation " +
+  "were compressed: past Q&A pairs and folded tool outputs were replaced by ⟦QA:<16-hex>⟧ markers " +
+  "that hold NO information on their own. Call this tool with the hash_id to bring the exact original " +
+  "question, answer or tool output back before you answer. The placeholder is NOT a summary — if your " +
+  "answer depends on a specific number, name, code, verbatim snippet or earlier artifact that a " +
+  "placeholder hides, you MUST recall it first; never guess or claim the information is unavailable. " +
+  "Set with_media=true only when you need the original image/video/document from the earlier question. " +
+  "Do NOT recall every placeholder and do NOT repeat the same hash_id.";
+
 export const HISTORY_RECALL_TOOL_SCHEMA = {
   type: "function",
   function: {
     name: HISTORY_RECALL_TOOL_NAME,
-    description:
-      "Recall a compressed Q&A pair from conversation history. " +
-      "When you see ⟦QA:hash⟧ placeholders (16-char hex) in the conversation, " +
-      "call this tool to get the original user question and assistant answer. " +
-      "By default only the text content is returned; set with_media=true to include " +
-      "the original image/video/document that was in the question. " +
-      "Only call when you genuinely need the original content to answer accurately.",
+    description: HISTORY_RECALL_TOOL_DESCRIPTION,
     parameters: {
       type: "object",
       properties: {
@@ -804,13 +822,7 @@ export const HISTORY_RECALL_TOOL_SCHEMA = {
 // Anthropic 协议版本
 export const HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC = {
   name: HISTORY_RECALL_TOOL_NAME,
-  description:
-    "Recall a compressed Q&A pair from conversation history. " +
-    "When you see ⟦QA:hash⟧ placeholders (16-char hex) in the conversation, " +
-    "call this tool to get the original user question and assistant answer. " +
-    "By default only the text content is returned; set with_media=true to include " +
-    "the original image/video/document that was in the question. " +
-    "Only call when you genuinely need the original content to answer accurately.",
+  description: HISTORY_RECALL_TOOL_DESCRIPTION,
   input_schema: {
     type: "object",
     properties: {
@@ -837,41 +849,41 @@ export const HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC = {
 const HISTORY_RECALL_INSTRUCTION_MARKER = "<<HISTORY_RECALL_INSTRUCTION_v1>>";
 
 const HISTORY_RECALL_INSTRUCTION = `${HISTORY_RECALL_INSTRUCTION_MARKER}
-## ⚠️ 历史 Q&A 召回机制
+## ⚠️ Compressed history — you MUST recall before answering
 
-对话中形如 \`⟦QA:abc123def4567890⟧\` 的标记是 **被压缩掉的历史内容**,可能是:
-- **历史的 Q&A 对**(原用户问题 + 原助手回答),或
-- **被折叠的工具输出**(旧的 tool_result,如超大文件读取 / 命令输出 —— 为省 token 已折叠成占位符)。
+The marker \`⟦QA:abc123def4567890⟧\` replaces **compressed-away earlier content**, which may be:
+- an earlier **Q&A pair** (user question + assistant answer), or
+- a **folded tool output** (an old tool_result — a large file read or command output — collapsed to a placeholder to save tokens).
 
-**这条占位符本身只携带"曾存在过"信号**,不含具体细节 —— 看 hash 名不会让你知道被压的是什么。
+The placeholder itself carries NO information — seeing the hash tells you nothing about what was hidden.
+Treating it as if it were the content is a **correctness bug**: you will answer from a lossy summary
+and get facts wrong.
 
-### 🎯 必须调用 \`${HISTORY_RECALL_TOOL_NAME}\` 的场景
-1. 当前任务需要某个历史 Q&A 里的 **具体数字 / 名称 / 代码 / 原文片段**
-2. 用户提问明确指向历史:"刚才/之前/我们前面聊过的 X 是什么"
-3. 比较/引用:**"对比之前那张图"**、"**用前面那份 PDF** 里的某段"
-4. 上下文依赖:**不调回历史内容,当前任务就无法正确完成**
-5. 需要某段**已折叠的工具输出原文**(之前 Read/Bash/Grep 的完整结果被折叠成 ⟦QA:⟧ 了)
+### Call \`${HISTORY_RECALL_TOOL_NAME}\` immediately when
+1. The current task needs a **specific number / name / code / verbatim snippet** from earlier history.
+2. The user refers back to history: "what was X we discussed earlier", "the file from before".
+3. You must compare or quote an earlier artifact ("compare against the earlier diagram/PDF").
+4. The task **cannot be done correctly** without bringing the original content back.
 
-### ✅ 通常**不需要**调用的场景
-- 只关心"我们讨论过 X"的方向感,不需要细节
-- 答案能在上文 recent 段找到,不依赖压缩区
+### Do NOT
+- ❌ Treat \`⟦QA:hash⟧\` as complete information — it is a pointer label, not the content.
+- ❌ Recall **every** placeholder blindly — there is a per-request budget; recall only what you need.
+- ❌ Assume the answer is unavailable or guess — **if the needed fact lives behind a placeholder,
+  recall it first**, then answer.
 
-### 🔧 调用方法
-- 占位符: \`⟦QA:abc123def4567890⟧\`
-- \`hash_id\` = 中间 16 位 hex(去掉 \`⟦QA:\` 前缀和 \`⟧\` 后缀):**\`abc123def4567890\`**
-- 默认 \`with_media=false\`,只返回 Q+A 文本 —— **A 已包含助手对图片/视频/文档内容的文字描述**,绝大多数情况已够用
-- 仅当历史 Q 中含**图片**(image)且你需要**像素级细节**时,才设 \`with_media=true\` —— 此时会返回**可直接查看的原图**,你能真正看到它
+### How to call
+- Placeholder: \`⟦QA:abc123def4567890⟧\`
+- \`hash_id\` = the 16 hex chars only (drop the \`⟦QA:\` prefix and \`⟧\` suffix): **\`abc123def4567890\`**
+- Default \`with_media=false\` returns the Q+A text only — the answer already contains the assistant's
+  textual description of any image/video/document, which is enough in most cases.
+- Set \`with_media=true\` **only** when the earlier question contained an **image** and you need
+  pixel-level detail; the call then returns the original image you can actually look at.
 
-### 调用示例
+### Examples
 \`\`\`
-${HISTORY_RECALL_TOOL_NAME}(hash_id="abc123def4567890", reason="需要前面那张图的细节")
-${HISTORY_RECALL_TOOL_NAME}(hash_id="abc123def4567890", with_media=true, reason="对比新旧两份 PDF")
+${HISTORY_RECALL_TOOL_NAME}(hash_id="abc123def4567890", reason="need the detail from that earlier image")
+${HISTORY_RECALL_TOOL_NAME}(hash_id="abc123def4567890", with_media=true, reason="compare the old and new PDF")
 \`\`\`
-
-### ⚠️ 禁止
-- ❌ 把 \`⟦QA:hash⟧\` 当作完整信息处理 —— 它只是摘要标签
-- ❌ 一次请求里为**所有**占位符都 recall —— 每请求有预算,浪费且无意义
-- ❌ 同一 \`hash_id\` 反复调 —— 一次即可
 `;
 
 /** 检测 ⟦QA:hash⟧ 占位符(V3.2 Q&A pair 压缩) */

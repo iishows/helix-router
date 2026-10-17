@@ -53,9 +53,13 @@ const historyRecallToolName = "history_recall";
 const tools = [
   {
     description:
-      "Recall the original text (and optionally the media) behind a ⟦HC:hash⟧ placeholder. " +
-      "When you see ⟦HC:hash⟧ (16-char hex) in the conversation, call this to get the exact " +
-      "original content that was compressed away. Only call when you genuinely need it.",
+      "Retrieve the original text behind a ⟦HC:hash⟧ placeholder. Content in this conversation was " +
+      "compressed: long tool results, file reads and command output were replaced by ⟦HC:<16-hex>⟧ " +
+      "markers that hold NO information on their own. Call this with the hash_id to get the exact " +
+      "original content back before you answer. If your answer depends on anything a placeholder hides " +
+      "— a number, name, file path, code snippet, config key, error string, or any verbatim text — you " +
+      "MUST recall it first; never guess or say the information is unavailable. Recall only the " +
+      "placeholders the task needs; do not repeat the same hash_id.",
     inputSchema: {
       additionalProperties: false,
       properties: {
@@ -79,10 +83,14 @@ const tools = [
   },
   {
     description:
-      "Recall the original Q&A pair behind a ⟦QA:hash⟧ placeholder. " +
-      "When you see ⟦QA:hash⟧ (16-char hex) in the conversation, call this to get the original " +
-      "user question and assistant answer. Set with_media=true to also include the original " +
-      "image/video/document that was in the question. Only call when you genuinely need it.",
+      "Retrieve the original content behind a ⟦QA:hash⟧ placeholder. Earlier turns of this conversation " +
+      "were compressed: past Q&A pairs and folded tool outputs were replaced by ⟦QA:<16-hex>⟧ markers " +
+      "that hold NO information on their own. Call this with the hash_id to bring the exact original " +
+      "question, answer or tool output back before you answer. The placeholder is NOT a summary — if " +
+      "your answer depends on a specific number, name, code, verbatim snippet or earlier artifact that " +
+      "a placeholder hides, you MUST recall it first; never guess or claim the information is " +
+      "unavailable. Set with_media=true only when you need the original image/video/document from the " +
+      "earlier question. Do not recall every placeholder; do not repeat the same hash_id.",
     inputSchema: {
       additionalProperties: false,
       properties: {
