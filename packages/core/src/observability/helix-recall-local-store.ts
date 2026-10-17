@@ -52,30 +52,48 @@ export function configureCacheDir(dir: string): void {
 interface CacheIndex {
   dir: string;
   file: string;
-  /** 已扫描的字节数 */
+  /** 已登记完整行的字节数(半写尾部不计入,下次从该偏移续扫) */
   scanned: number;
+  /** 上次扫描时文件的 inode;被 compaction(renameSync)替换后会变化 */
+  ino: number;
   /** hash -> 该 hash 最近一次出现的行起始字节偏移 */
   offsets: Map<string, number>;
 }
 
 let index: CacheIndex | undefined;
 
+/**
+ * 返回当前缓存文件的索引(hash→offset)。
+ *
+ * 跨进程注意:写入端(gateway 进程)触发 compaction(见 `cleanup`,用 renameSync
+ * 整体重写文件)或追加时,**读取端**(长驻的 helix-recall MCP 子进程)的进程内
+ * index 不会自动同步。若仅用「文件变大则续扫」判断,会漏掉两类情况:
+ *   1. 文件被 compaction 重写后变小 → 旧 offsets 指向新文件的错误位置;
+ *   2. 文件被替换后仍然变大 → 续扫点之前的旧 offsets 已经错位。
+ * 因此这里以**文件身份(ino)**为判据:ino 变化即视为换了一个文件,索引整体重建。
+ * 无法取得 ino(部分平台返回 0)时,退化为「size 不小于已扫描量才续扫」的安全近似。
+ */
 function ensureIndex(): CacheIndex {
   const dir = resolveCacheDir();
   const file = pathJoin(dir, CACHE_FILE_NAME);
-  if (index && index.dir === dir && index.file === file) {
-    // 文件增长则增量续扫
-    if (existsSync(file)) {
-      const size = statSync(file).size;
-      if (size > index.scanned) {
-        scanInto(index, size);
+  if (index && index.dir === dir && index.file === file && existsSync(file)) {
+    const st = statSync(file);
+    // 文件身份未变(同 inode 或两端都拿不到 inode)且未被截断 → 可增量续扫。
+    const sameFile = (index.ino === 0 || st.ino === 0 || st.ino === index.ino)
+      && st.size >= index.scanned;
+    if (sameFile) {
+      if (st.size > index.scanned) {
+        scanInto(index, st.size);
       }
+      return index;
     }
-    return index;
   }
-  index = { dir, file, scanned: 0, offsets: new Map() };
+  // 首次建立,或文件被替换/截断 → 整体重建。
+  index = { dir, file, scanned: 0, ino: 0, offsets: new Map() };
   if (existsSync(file)) {
-    scanInto(index, statSync(file).size);
+    const st = statSync(file);
+    index.ino = st.ino;
+    scanInto(index, st.size);
   }
   return index;
 }

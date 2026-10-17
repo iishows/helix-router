@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync, readFileSync, existsSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync, readFileSync, existsSync, statSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -137,6 +137,34 @@ test("resolveCacheDir throws when env not set", () => {
     assert.throws(() => get("x"), /HELIX_RECALL_CACHE_DIR/);
   } finally {
     if (saved !== undefined) process.env.HELIX_RECALL_CACHE_DIR = saved;
+  }
+});
+
+test("index recovers when the cache file is rewritten externally (cross-process compaction)", () => {
+  const dir = freshDir();
+  try {
+    // Simulate the reader (MCP subprocess) having populated its in-process index.
+    putBatch([["old1", { q: "OLD-1", a: "" }]]);
+    putBatch([["old2", { q: "OLD-2", a: "" }]]);
+    assert.equal(get("old1").q, "OLD-1");
+    assert.equal(get("old2").q, "OLD-2");
+
+    // Simulate the writer (gateway process) compacting the file: it is replaced by
+    // renameSync with a *smaller* file that no longer contains old1/old2. The reader's
+    // in-process index (same process here) still holds stale offsets if not rebuilt.
+    const file = path.join(dir, "cache.jsonl");
+    const now = Date.now();
+    const kept = JSON.stringify({ h: "new1", c: { q: "NEW-1", a: "" }, t: now, e: now + 999999999 }) + "\n";
+    const tmp = `${file}.tmp-test`;
+    writeFileSync(tmp, kept, "utf-8");
+    renameSync(tmp, file);
+
+    // After the external rewrite the reader must not return stale content, and must
+    // see the new entry written by "the writer".
+    assert.equal(get("old1"), null, "stale entry from before compaction must not resolve");
+    assert.equal(get("new1").q, "NEW-1", "entry written after compaction must be visible");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
