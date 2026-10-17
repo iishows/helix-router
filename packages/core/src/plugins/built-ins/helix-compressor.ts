@@ -551,10 +551,10 @@ const HC_RECALL_TOOL_DESCRIPTION =
   "Retrieve the original text behind a ⟦HC:hash⟧ placeholder. Content in this conversation was " +
   "compressed: long tool results, file reads and command output were replaced by ⟦HC:<16-hex>⟧ " +
   "markers that hold NO information on their own. Call this tool with the hash_id to get the exact " +
-  "original content back before you answer. If your answer depends on anything a placeholder hides " +
-  "— a number, name, file path, code snippet, config key, error string, or any verbatim text — you " +
-  "MUST recall it first; never guess or say the information is unavailable. Do NOT call repeatedly " +
-  "for the same hash, and recall only the placeholders the task actually needs.";
+  "original content back. Recall ONLY when the fact you need is genuinely hidden behind a placeholder " +
+  "and cannot be answered from the visible conversation — every recall re-injects the original text " +
+  "and gives back the tokens that were saved, so do not recall \"just in case\". Do not recall every " +
+  "placeholder, and never repeat the same hash_id.";
 
 export const HC_RECALL_TOOL_SCHEMA = {
   type: "function",
@@ -605,36 +605,42 @@ export const HC_RECALL_TOOL_SCHEMA_ANTHROPIC = {
 const HC_RECALL_INSTRUCTION_MARKER = "<<HC_RECALL_INSTRUCTION_v1>>";
 
 const HC_RECALL_INSTRUCTION = `${HC_RECALL_INSTRUCTION_MARKER}
-## ⚠️ Compressed content — you MUST recall before answering
+## ⚠️ Compressed content: recall only when the answer is NOT visible
 
 Long content in this conversation (tool results, file reads, command output, retrieved documents)
 was replaced by **placeholders** of the form \`⟦HC:<16-hex>⟧\`. A placeholder carries NO
-information of its own — it only marks that original content exists and can be retrieved.
+information of its own — it only marks that original content once existed and can be retrieved.
 
-**Non-negotiable:** a placeholder is NOT a summary you may reason over. If your answer depends on
-anything the placeholder hides, you MUST call the \`${helixCompressorRecallToolName}\` tool FIRST and
-answer from the returned original text.
+**Recall is the exception, not the default.** Compressed content was collapsed for a reason: the
+whole point is to keep the prompt small. Every recall re-injects the original text and gives back
+the tokens that were saved. Call \`${helixCompressorRecallToolName}\` **only when the specific fact
+you need is genuinely hidden behind a placeholder and cannot be answered from what is already
+visible** — otherwise answer directly and do NOT recall.
 
-### Call \`${helixCompressorRecallToolName}\` immediately when
-1. The task needs a **specific value** from compressed content — a number, name, file path, code
-   snippet, config key, error string, or any verbatim text.
-2. The user refers back to earlier work ("the file you read", "that output", "what did it print").
-3. The current step **cannot be completed correctly** without the original text.
-4. You are about to **guess, assume, or claim you lack the information** — that is exactly the
-   moment to recall instead.
+### Recall ONLY when
+1. The answer needs a **specific value that lives inside compressed content** — a number, name, file
+   path, code snippet, config key, or verbatim string you cannot produce from the visible text.
+2. The user explicitly asks you to retrieve or quote an earlier artifact.
+3. You are about to **guess, assume, or claim the information is unavailable** — if that fact is
+   behind a placeholder, recall it instead of guessing.
+
+### Do NOT recall when
+- The question can be answered from the visible conversation (summary already suffices, it is a
+  follow-up/opinion/next-step, or you recognise the answer from context). Answer directly.
+- You would only be recalling "just in case" — that wastes the tokens compression saved.
 
 ### How to call
 - The placeholder looks like \`⟦HC:abcdef0123456789⟧\`.
 - \`hash_id\` = the 16 hex chars only (drop the \`⟦HC:\` prefix and the \`⟧\` suffix): \`abcdef0123456789\`.
-- One call retrieves one placeholder; issue additional calls when a task needs more than one.
+- One call retrieves one placeholder; issue additional calls only if the task needs more than one.
 
-### Do NOT
-- ❌ Treat \`⟦HC:hash⟧\` as the content. It is a pointer, never an answer.
-- ❌ Recall every placeholder blindly — recall only what the current task needs.
-- ❌ Call the same \`hash_id\` twice (per-request limit: ${helixCompressorMaxRecallPerRequest}).
+### Hard limits
+- ❌ Never treat \`⟦HC:hash⟧\` as the content. It is a pointer, never an answer.
+- ❌ Never recall every placeholder — recall only what the current task actually needs.
+- ❌ Never call the same \`hash_id\` twice (per-request limit: ${helixCompressorMaxRecallPerRequest}).
 
 ### Example
-Placeholder in history: \`⟦HC:abcdef0123456789⟧\`
+Only if the exact file content is needed: \`⟦HC:abcdef0123456789⟧\`
 → Call: \`${helixCompressorRecallToolName}(hash_id="abcdef0123456789", reason="need the original file content")\`
 `;
 
@@ -784,11 +790,12 @@ const HISTORY_RECALL_TOOL_DESCRIPTION =
   "Retrieve the original content behind a ⟦QA:hash⟧ placeholder. Earlier turns of this conversation " +
   "were compressed: past Q&A pairs and folded tool outputs were replaced by ⟦QA:<16-hex>⟧ markers " +
   "that hold NO information on their own. Call this tool with the hash_id to bring the exact original " +
-  "question, answer or tool output back before you answer. The placeholder is NOT a summary — if your " +
-  "answer depends on a specific number, name, code, verbatim snippet or earlier artifact that a " +
-  "placeholder hides, you MUST recall it first; never guess or claim the information is unavailable. " +
-  "Set with_media=true only when you need the original image/video/document from the earlier question. " +
-  "Do NOT recall every placeholder and do NOT repeat the same hash_id.";
+  "question, answer or tool output back. The placeholder is NOT a summary, but recall is the " +
+  "exception: call this ONLY when the specific fact you need is genuinely hidden behind a placeholder " +
+  "and cannot be answered from the visible text — every recall re-injects the original and gives back " +
+  "the saved tokens, so do not recall \"just in case\". Set with_media=true only when you need the " +
+  "original image/video/document from the earlier question. Do not recall every placeholder; never " +
+  "repeat the same hash_id.";
 
 export const HISTORY_RECALL_TOOL_SCHEMA = {
   type: "function",
@@ -849,7 +856,7 @@ export const HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC = {
 const HISTORY_RECALL_INSTRUCTION_MARKER = "<<HISTORY_RECALL_INSTRUCTION_v1>>";
 
 const HISTORY_RECALL_INSTRUCTION = `${HISTORY_RECALL_INSTRUCTION_MARKER}
-## ⚠️ Compressed history — you MUST recall before answering
+## ⚠️ Compressed history: recall only when the answer is NOT visible
 
 The marker \`⟦QA:abc123def4567890⟧\` replaces **compressed-away earlier content**, which may be:
 - an earlier **Q&A pair** (user question + assistant answer), or
@@ -859,17 +866,22 @@ The placeholder itself carries NO information — seeing the hash tells you noth
 Treating it as if it were the content is a **correctness bug**: you will answer from a lossy summary
 and get facts wrong.
 
-### Call \`${HISTORY_RECALL_TOOL_NAME}\` immediately when
-1. The current task needs a **specific number / name / code / verbatim snippet** from earlier history.
-2. The user refers back to history: "what was X we discussed earlier", "the file from before".
-3. You must compare or quote an earlier artifact ("compare against the earlier diagram/PDF").
-4. The task **cannot be done correctly** without bringing the original content back.
+But recall is the exception, not the default: each recall re-injects the original text and gives back
+the tokens that were saved. Call \`${HISTORY_RECALL_TOOL_NAME}\` **only when the specific fact you need
+is genuinely hidden behind a placeholder and cannot be answered from what is already visible.**
 
-### Do NOT
-- ❌ Treat \`⟦QA:hash⟧\` as complete information — it is a pointer label, not the content.
-- ❌ Recall **every** placeholder blindly — there is a per-request budget; recall only what you need.
-- ❌ Assume the answer is unavailable or guess — **if the needed fact lives behind a placeholder,
-  recall it first**, then answer.
+### Recall ONLY when
+1. The current task needs a **specific number / name / code / verbatim snippet** that lives inside
+   compressed history and you cannot produce it from the visible text.
+2. The user explicitly asks you to retrieve or quote an earlier artifact ("compare against the earlier
+   diagram/PDF", "what was the file from before").
+3. You are about to **guess, assume, or say the information is unavailable** — if that fact is behind
+   a placeholder, recall it instead of guessing.
+
+### Do NOT recall when
+- The question can be answered from the visible conversation (summary suffices, it is a follow-up,
+  or you recognise the answer from context). Answer directly.
+- You would only be recalling "just in case" — that wastes the tokens compression saved.
 
 ### How to call
 - Placeholder: \`⟦QA:abc123def4567890⟧\`
@@ -878,6 +890,11 @@ and get facts wrong.
   textual description of any image/video/document, which is enough in most cases.
 - Set \`with_media=true\` **only** when the earlier question contained an **image** and you need
   pixel-level detail; the call then returns the original image you can actually look at.
+
+### Hard limits
+- ❌ Never treat \`⟦QA:hash⟧\` as complete information — it is a pointer label, not the content.
+- ❌ Never recall **every** placeholder — there is a per-request budget; recall only what you need.
+- ❌ Never call the same \`hash_id\` twice.
 
 ### Examples
 \`\`\`

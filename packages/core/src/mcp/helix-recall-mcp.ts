@@ -56,10 +56,10 @@ const tools = [
       "Retrieve the original text behind a ⟦HC:hash⟧ placeholder. Content in this conversation was " +
       "compressed: long tool results, file reads and command output were replaced by ⟦HC:<16-hex>⟧ " +
       "markers that hold NO information on their own. Call this with the hash_id to get the exact " +
-      "original content back before you answer. If your answer depends on anything a placeholder hides " +
-      "— a number, name, file path, code snippet, config key, error string, or any verbatim text — you " +
-      "MUST recall it first; never guess or say the information is unavailable. Recall only the " +
-      "placeholders the task needs; do not repeat the same hash_id.",
+      "original content back. Recall ONLY when the fact you need is genuinely hidden behind a " +
+      "placeholder and cannot be answered from the visible conversation — every recall re-injects the " +
+      "original and gives back the saved tokens, so do not recall \"just in case\". Do not recall every " +
+      "placeholder; never repeat the same hash_id.",
     inputSchema: {
       additionalProperties: false,
       properties: {
@@ -86,11 +86,12 @@ const tools = [
       "Retrieve the original content behind a ⟦QA:hash⟧ placeholder. Earlier turns of this conversation " +
       "were compressed: past Q&A pairs and folded tool outputs were replaced by ⟦QA:<16-hex>⟧ markers " +
       "that hold NO information on their own. Call this with the hash_id to bring the exact original " +
-      "question, answer or tool output back before you answer. The placeholder is NOT a summary — if " +
-      "your answer depends on a specific number, name, code, verbatim snippet or earlier artifact that " +
-      "a placeholder hides, you MUST recall it first; never guess or claim the information is " +
-      "unavailable. Set with_media=true only when you need the original image/video/document from the " +
-      "earlier question. Do not recall every placeholder; do not repeat the same hash_id.",
+      "question, answer or tool output back. The placeholder is NOT a summary, but recall is the " +
+      "exception: call this ONLY when the specific fact you need is genuinely hidden behind a " +
+      "placeholder and cannot be answered from the visible text — every recall re-injects the original " +
+      "and gives back the saved tokens, so do not recall \"just in case\". Set with_media=true only " +
+      "when you need the original image/video/document from the earlier question. Do not recall every " +
+      "placeholder; never repeat the same hash_id.",
     inputSchema: {
       additionalProperties: false,
       properties: {

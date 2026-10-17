@@ -403,12 +403,13 @@ test("HISTORY_RECALL_INSTRUCTION 含明确触发词 + 反例", () => {
 
   // 强触发符号
   assert.ok(text.includes("⚠️"), "应有 ⚠️ 强触发符号");
-  // 强制召回指令(英文,直接命令模型先召回再回答)
-  assert.ok(text.includes("MUST recall"), "应明确'必须召回'的强制指令");
+  // 核心原则:仅当答案不可见时才召回(避免过度召回白费节省的 token)
+  assert.ok(text.includes("recall only when the answer is NOT visible"), "应指明'仅在答案不可见时召回'");
+  assert.ok(text.includes("exception, not the default"), "应说明召回是例外而非常态");
   // 决策示例:hash_id 提取
   assert.ok(text.includes("abc123def4567890"), "应有 hash_id 提取示例");
   // 反例 / 禁令
-  assert.ok(text.includes("Do NOT"), "应有禁令段");
+  assert.ok(text.includes("Do NOT recall when"), "应有'何时不召回'段");
   // 召回时的 with_media 决策
   assert.ok(text.includes("with_media"), "应提示 with_media 用途");
 });
