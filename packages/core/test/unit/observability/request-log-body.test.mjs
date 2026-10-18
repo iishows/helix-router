@@ -63,3 +63,45 @@ test("request log body compaction does not borrow image context from an adjacent
   assert.equal(compacted.compacted, false);
   assert.equal(JSON.parse(compacted.buffer.toString("utf8"))[1].data, audioBase64);
 });
+
+test("request log body compaction handles the escaped JSON-string shape real proxies store", () => {
+  // 真实流量:OpenAI 形状的 `role:"tool"` 消息 content 是"块数组的 JSON 字符串",
+  //   所以媒体块被**双层转义**:`…{\"type\":\"base64\",\"data\":\"iVBOR…`。
+  //   旧实现只认裸 `"data"`,这类 body 从没被压过 → 请求日志涨到几百 MB。
+  const big = `${"iVBORw0KGgo".padEnd(32, "A")}${"A".repeat(64 * 1024)}`;
+  const innerBlocks = JSON.stringify([{ type: "image", source: { type: "base64", media_type: "image/png", data: big } }]);
+  const input = Buffer.from(JSON.stringify({
+    messages: [{ role: "tool", tool_call_id: "c1", content: innerBlocks }]
+  }));
+  const compacted = compactBase64ImagePayloads(input);
+
+  assert.equal(compacted.compacted, true);
+  assert.equal(compacted.imageCount, 1);
+  assert.ok(compacted.buffer.byteLength < 1024, "压缩后应远小于原 body");
+  // 占位符必须落在内层 data 的位置,且外层 JSON 仍可解析。
+  const outer = JSON.parse(compacted.buffer.toString("utf8"));
+  const restoredInner = JSON.parse(outer.messages[0].content);
+  assert.match(restoredInner[0].source.data, /^\[base64 image omitted from log;/);
+});
+
+test("request log body compaction handles escaped b64_json too", () => {
+  const big = "A".repeat(64 * 1024);
+  const inner = JSON.stringify({ b64_json: big, model: "gpt-image-1" });
+  const input = Buffer.from(JSON.stringify({ choices: [{ message: { content: inner } }] }));
+  const compacted = compactBase64ImagePayloads(input);
+
+  assert.equal(compacted.compacted, true);
+  assert.equal(compacted.imageCount, 1);
+  const outer = JSON.parse(compacted.buffer.toString("utf8"));
+  const restoredInner = JSON.parse(outer.choices[0].message.content);
+  assert.match(restoredInner.b64_json, /^\[base64 image omitted from log;/);
+});
+
+test("request log body compaction still ignores escaped non-image (audio) base64", () => {
+  const big = "A".repeat(64 * 1024);
+  const inner = JSON.stringify({ audio: { data: big, media_type: "audio/wav", type: "base64" } });
+  const input = Buffer.from(JSON.stringify({ messages: [{ role: "tool", content: inner }] }));
+  const compacted = compactBase64ImagePayloads(input);
+
+  assert.equal(compacted.compacted, false);
+});
