@@ -98,6 +98,14 @@ export type ProactiveCompactInput = {
 
 const MAX_SUMMARY_TRANSCRIPT_CHARS = 200_000;
 const SUMMARY_MAX_TOKENS = 2048;
+/**
+ * 推理模型(DeepSeek-R1/V3.x、Qwen3、GLM 等)会把 `max_tokens` 全花在 `reasoning_content` 上,
+ * 导致 `finish_reason=length` 且 `content` 为空 —— 摘要拿不到文本 → compact 被静默跳过。
+ * 实测 autodl/DeepSeek-V4.1-Flash:2048/4096/8192 的 content 全为 0。
+ * 对策:先发 `enable_thinking:false`(或 `reasoning.effort:minimal`)关思考;个别 provider
+ * 拒绝该字段时退回「今天的原样请求」,保证零回归。
+ */
+const SUMMARY_DISABLE_THINKING_FIELDS = { enable_thinking: false } as const;
 
 /** 主动 compact 主入口。命中门控则返回折叠后的 body;否则返回 undefined。 */
 export async function applyHelixProactiveCompact(
@@ -407,27 +415,51 @@ async function callSummary(input: {
     return undefined;
   }
   const apiKey = providerApiKey(input.provider);
-  const { headers, body } = buildSummaryRequest(input.protocol, input.model, input.prompt, apiKey);
+  // 先试「关思考」。只有当 provider **拒绝**该字段(4xx)时才退回「原样请求」——
+  //   若返回 200 但正文为空(reasoning 吃光预算),重试同样形状无意义,直接放弃(与原行为一致)。
+  const withDisable = await attemptSummary(
+    { endpoint, protocol: input.protocol, timeoutMs: input.timeoutMs, signal: input.signal },
+    buildSummaryRequest(input.protocol, input.model, input.prompt, apiKey, true)
+  );
+  if (withDisable.text !== undefined) {
+    return withDisable.text;
+  }
+  if (!withDisable.rejected) {
+    return undefined;
+  }
+  const fallback = await attemptSummary(
+    { endpoint, protocol: input.protocol, timeoutMs: input.timeoutMs, signal: input.signal },
+    buildSummaryRequest(input.protocol, input.model, input.prompt, apiKey, false)
+  );
+  return fallback.text;
+}
 
+type SummaryAttempt = { text?: string; rejected: boolean };
+
+/** 发一次摘要请求并提取助手文本。`rejected=true` 表示 provider 4xx 拒了请求体(可换形状重试)。 */
+async function attemptSummary(
+  input: { endpoint: string; protocol: GatewayProviderProtocol; timeoutMs: number; signal?: AbortSignal },
+  request: { headers: Record<string, string>; body: JsonObject }
+): Promise<SummaryAttempt> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(1000, input.timeoutMs));
   const onAbort = () => controller.abort();
   input.signal?.addEventListener("abort", onAbort);
   try {
-    const response = await fetch(endpoint, {
-      body: JSON.stringify(body),
-      headers,
+    const response = await fetch(input.endpoint, {
+      body: JSON.stringify(request.body),
+      headers: request.headers,
       method: "POST",
       signal: controller.signal
     });
     if (!response.ok) {
-      return undefined;
+      return { rejected: true };
     }
     const rawText = await response.text();
     const text = extractArchiveAssistantText(rawText, input.protocol, response.headers.get("content-type") ?? undefined);
-    return text.trim() ? text : undefined;
+    return { rejected: false, text: text.trim() ? text : undefined };
   } catch {
-    return undefined;
+    return { rejected: false };
   } finally {
     clearTimeout(timer);
     input.signal?.removeEventListener("abort", onAbort);
@@ -438,8 +470,14 @@ function buildSummaryRequest(
   protocol: GatewayProviderProtocol,
   model: string,
   prompt: string,
-  apiKey: string
+  apiKey: string,
+  disableThinking = false
 ): { headers: Record<string, string>; body: JsonObject } {
+  // 推理模型的「关思考」开关(OpenAI Chat 协议):`enable_thinking:false` 让模型直出正文,
+  //   否则 `max_tokens` 会被 `reasoning_content` 吃光 → 摘要为空。见 SUMMARY_DISABLE_THINKING_FIELDS。
+  const thinkingFields = disableThinking && protocol === "openai_chat_completions"
+    ? { ...SUMMARY_DISABLE_THINKING_FIELDS }
+    : {};
   if (protocol === "anthropic_messages") {
     return {
       body: {
@@ -472,6 +510,7 @@ function buildSummaryRequest(
   }
   return {
     body: {
+      ...thinkingFields,
       max_tokens: SUMMARY_MAX_TOKENS,
       messages: [{ content: prompt, role: "user" }],
       model,

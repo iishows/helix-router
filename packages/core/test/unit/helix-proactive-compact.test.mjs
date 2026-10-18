@@ -433,6 +433,67 @@ test("降级: 空文本 → undefined", async () => {
   });
 });
 
+// ============= 推理模型:摘要被 reasoning_content 吃光 =============
+
+test("推理模型:摘要请求带 enable_thinking:false(避免 max_tokens 被 reasoning 吃光)", async () => {
+  resetCacheIndex();
+  await withMockFetch(() => openAiSummaryResponse("HANDOFF SUMMARY REASONING"), async (calls) => {
+    const result = await applyHelixProactiveCompact({
+      body: { messages: multiTurnMessages() },
+      config: testConfig(),
+      headers: { "x-session-id": "sess-reasoning" },
+      model: "MiniMax-M3",
+      postCompressionTokens: 999999,
+      settings: settings()
+    });
+    assert.ok(result, "摘要成功后应折叠");
+    assert.equal(calls.length, 1, "关思考一次成功,不应重试");
+    assert.equal(calls[0].body.enable_thinking, false, "OpenAI Chat 请求应带 enable_thinking:false");
+    assert.match(result.requestBody.system, /HANDOFF SUMMARY REASONING/);
+  });
+});
+
+test("推理模型:provider 拒绝 enable_thinking(4xx)→ 退回原样请求(零回归)", async () => {
+  resetCacheIndex();
+  let call = 0;
+  await withMockFetch(() => {
+    call += 1;
+    return call === 1
+      ? new Response("unknown field enable_thinking", { status: 400 })
+      : openAiSummaryResponse("FALLBACK SUMMARY");
+  }, async (calls) => {
+    const result = await applyHelixProactiveCompact({
+      body: { messages: multiTurnMessages() },
+      config: testConfig(),
+      headers: { "x-session-id": "sess-fallback" },
+      model: "MiniMax-M3",
+      postCompressionTokens: 999999,
+      settings: settings()
+    });
+    assert.ok(result, "退回后应成功");
+    assert.equal(calls.length, 2, "先带开关被拒,再去掉开关重试");
+    assert.equal(calls[0].body.enable_thinking, false);
+    assert.equal(calls[1].body.enable_thinking, undefined, "退回请求不应含该字段");
+    assert.match(result.requestBody.system, /FALLBACK SUMMARY/);
+  });
+});
+
+test("推理模型:200 但正文为空(仍被 reasoning 吃光)→ 不盲目重试,直接 undefined", async () => {
+  resetCacheIndex();
+  await withMockFetch(() => openAiSummaryResponse(""), async (calls) => {
+    const result = await applyHelixProactiveCompact({
+      body: { messages: multiTurnMessages() },
+      config: testConfig(),
+      headers: { "x-session-id": "sess-empty-reasoning" },
+      model: "MiniMax-M3",
+      postCompressionTokens: 999999,
+      settings: settings()
+    });
+    assert.equal(result, undefined);
+    assert.equal(calls.length, 1, "形状对但正文空 → 不重试(重试同形状无意义)");
+  });
+});
+
 // ============= 成功路径 / 缓存 / 增量 =============
 
 test("成功: 折叠前缀 + system 注入摘要,diagnostic source=model", async () => {
