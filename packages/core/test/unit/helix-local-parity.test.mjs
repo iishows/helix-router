@@ -561,3 +561,118 @@ test("OpenAI role:tool below threshold stays plaintext", () => {
   const r = compressV3x(msgs, { keepRecentToolResults: 0 });
   assert.equal(r.messages.find((m) => m.role === "tool").content, "short output");
 });
+
+// ============= V1.13: 嵌套图片(块数组的 JSON 字符串)必须按媒体压缩 =============
+// 真实流量:role:"tool" 的 content 是"Anthropic 块数组的 JSON 字符串",例如
+// `[{"type":"image","source":{...}}]`(实测 66KB 的纯媒体数组)。旧实现里媒体 pass /
+// extractMediaBlocks 只认 `Array.isArray(content)`,内层图片完全不可见,整条被
+// tool_result pass 折成 kind:"text" 占位符 → 召回时图片以文本返回、模型看不到图。
+// 修复后:识别嵌套数组里的媒体块,产出 kind:"media" 候选(召回携带可渲染 image 块)。
+
+const NESTED_IMG = { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } };
+
+function nestedMediaToolHistory() {
+  return [
+    { role: "system", content: "sys" },
+    { role: "user", content: "u1 " + "x".repeat(60) },
+    { role: "assistant", content: "a1 " + "y".repeat(60) },
+    { role: "user", content: "u2 " + "z".repeat(60) },
+    {
+      role: "assistant",
+      content: JSON.stringify([{ type: "tool_use", id: "call_1", name: "Read", input: { path: "/img" } }])
+    },
+    // 关键:tool 输出是"块数组的 JSON 字符串",内层是一张 base64 图片
+    { role: "tool", tool_call_id: "call_1", content: JSON.stringify([NESTED_IMG]) },
+    { role: "user", content: "look at it" },
+    { role: "assistant", content: "ok" }
+  ];
+}
+
+test("nested media in a JSON-string tool message compresses as kind:media (not text)", () => {
+  const r = compressV3x(nestedMediaToolHistory(), { keepRecentToolResults: 0 });
+  const kinds = Object.values(r.hashMap).map((e) => e.kind);
+  assert.ok(kinds.includes("media"), `expected a media candidate, got ${JSON.stringify(kinds)}`);
+  // 不得把这条图片消息误压成 text/tool_result(那会让召回变成纯文本)
+  const mediaEntry = Object.values(r.hashMap).find((e) => e.kind === "media");
+  assert.deepEqual(mediaEntry.qMedia, [NESTED_IMG], "召回须携带可渲染的 image 块");
+  // 图片原块以占位符文本块形式回填(tool_result pass 不得覆盖为纯文本)
+  const toolMsg = r.messages.find((m) => m.role === "tool");
+  assert.equal(typeof toolMsg.content, "string");
+  assert.equal(toolMsg.content, `⟦QA:${computeHash(JSON.stringify([NESTED_IMG]))}⟧`);
+  assert.equal(toolMsg.tool_call_id, "call_1", "tool_call_id 保留");
+});
+
+test("nested media tool message: no text/tool_result candidate claims the same message", () => {
+  const r = compressV3x(nestedMediaToolHistory(), { keepRecentToolResults: 0 });
+  // 同一条消息(msgIdx)在 hashMap 里只应有一个条目,且其 kind 必须是 media
+  const toolMsgIdx = nestedMediaToolHistory().findIndex((m) => m.role === "tool");
+  const entriesForMsg = Object.values(r.hashMap).filter((e) => e.msgIdx === toolMsgIdx);
+  assert.equal(entriesForMsg.length, 1, "同一媒体消息不得被两个 pass 重复认领");
+  assert.equal(entriesForMsg[0].kind, "media");
+});
+
+// ============= V1.13 回归:超大 JSON 数组字符串不得触发无上限解析(OOM 防护) =============
+// normalizeContentBlocks 会对"看起来像块数组"的字符串做 JSON.parse。工具输出里
+// 几十万行、每行带 `type` 字段的 JSON 记录恰好满足该守卫,旧实现无上限解析,
+// 实测 ~290MB 字符串可打爆 512MB 堆(ERR_WORKER_OUT_OF_MEMORY)。修复后
+// 长度 > NESTED_BLOCK_PARSE_MAX_CHARS(1MB) 直接放弃解析,按纯文本 tool_result 处理。
+
+test("oversized JSON-array tool output is not parsed / stays tool_result", () => {
+  const row = '{"type":"row","payload":"' + "x".repeat(60) + '"},';
+  const big = "[" + row.repeat(20000) + '{"type":"row","payload":""}]'; // 超 1MB 上限
+  assert.ok(big.length > 1_000_000, "fixture 必须超过解析上限");
+  const r = compressV3x(
+    [
+      { role: "system", content: "sys" },
+      { role: "user", content: "u1 " + "x".repeat(6000) },
+      { role: "assistant", content: "a1 " + "y".repeat(6000) },
+      { role: "user", content: "u2 " + "z".repeat(6000) },
+      { role: "assistant", content: [{ type: "tool_use", id: "c1", name: "Bash", input: {} }] },
+      { role: "tool", tool_call_id: "c1", content: big },
+      { role: "user", content: "go" },
+      { role: "assistant", content: "ok" }
+    ],
+    { keepRecentToolResults: 0 }
+  );
+  const kinds = Object.values(r.hashMap).map((e) => e.kind);
+  assert.ok(!kinds.includes("media"), `超大字符串必须按文本处理: ${JSON.stringify(kinds)}`);
+  assert.ok(kinds.includes("tool_result"), `expected tool_result, got ${JSON.stringify(kinds)}`);
+});
+
+// ============= V1.13 回归:字符串"伪媒体"不得误判为图片 =============
+// mediaBlockFromString 只接受自证媒体的 `data:<image|video|audio>;base64,`。
+// 裸 http(s) URL(内容类型未知)与 `data:text/plain;base64,` 都是文本,必须保持纯文本,
+// 否则召回会把普通工具输出当图片回填。
+
+function toolMsgHistory(content) {
+  return [
+    { role: "system", content: "sys" },
+    { role: "user", content: "u1 " + "x".repeat(6000) },
+    { role: "assistant", content: "a1 " + "y".repeat(6000) },
+    { role: "user", content: "u2 " + "z".repeat(6000) },
+    { role: "assistant", content: [{ type: "tool_use", id: "c1", name: "Bash", input: {} }] },
+    { role: "tool", tool_call_id: "c1", content },
+    { role: "user", content: "go" },
+    { role: "assistant", content: "ok" }
+  ];
+}
+
+test("plain URL and non-media data-URL tool output stay text (not media)", () => {
+  for (const content of [
+    "https://example.com/reports/2026-q3-summary.csv",
+    "data:text/plain;base64,SGVsbG8gd29ybGQ="
+  ]) {
+    const r = compressV3x(toolMsgHistory(content), { keepRecentToolResults: 0 });
+    const kinds = Object.values(r.hashMap).map((e) => e.kind);
+    assert.ok(!kinds.includes("media"), `${content.slice(0, 32)} 不得识别为媒体: ${JSON.stringify(kinds)}`);
+  }
+});
+
+test("a genuine image data-URL tool output IS recognised as media", () => {
+  const r = compressV3x(
+    toolMsgHistory("data:image/png;base64," + "A".repeat(3000)),
+    { keepRecentToolResults: 0 }
+  );
+  const kinds = Object.values(r.hashMap).map((e) => e.kind);
+  assert.ok(kinds.includes("media"), `expected media, got ${JSON.stringify(kinds)}`);
+});

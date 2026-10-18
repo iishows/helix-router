@@ -129,6 +129,53 @@ export function makePlaceholder(hash: string): string {
   return `${PLACEHOLDER_PREFIX}${hash}${PLACEHOLDER_SUFFIX}`;
 }
 
+/**
+ * V1.13(2026-10-17):把消息 content 归一化成"块数组",让所有形状敏感的 pass 对
+ * content 的形状判断保持一致。**不改动原消息、不产生副作用。**
+ *
+ *   - 已是数组 → 原样返回(同一引用);
+ *   - 字符串且 trim 后以 `[` 开头 → 尝试 JSON.parse,仅当结果是"元素皆为带字符串
+ *     `type` 的对象的数组"时接受(否则 null);
+ *   - 其他 → null。
+ *
+ * 真实流量经过本代理后是 OpenAI 形状:`role:"tool"` 的 content 常是**JSON 字符串化的
+ * Anthropic 块数组**,例如 `[{"type":"image","source":{...}}]`(实测 66KB 的纯媒体数组)。
+ * 旧实现里媒体 pass / extractMediaBlocks 只认 `Array.isArray(content)`,内层图片对媒体
+ * pass 完全不可见,于是整条 66KB 字符串被文本/tool_result pass 折成一个 `kind:"text"`
+ * 占位符 —— 召回时图片以文本返回,而非可看的 image 块。故新增本共享 helper。
+ *
+ * 安全上限:解析前先看长度。JSON.parse 在 V8 里会分配"输入数组 + N 个对象"的图,
+ * 实测 ~290MB 字符串可把 512MB 堆打爆(ERR_WORKER_OUT_OF_MEMORY)。而真实流量里的
+ * 嵌套块数组是"小 header"(实测 66KB),超大字符串必是工具输出数据(如几十万行
+ * JSON 记录,恰好也满足 `type` 守卫),本就不该按块数组处理。故超限直接放弃解析。
+ */
+const NESTED_BLOCK_PARSE_MAX_CHARS = 1_000_000;
+
+function normalizeContentBlocks(content: unknown): Array<Record<string, unknown>> | null {
+  if (Array.isArray(content)) return content as Array<Record<string, unknown>>;
+  if (typeof content !== "string") return null;
+  const trimmed = content.trim();
+  if (!trimmed.startsWith("[")) return null;
+  if (trimmed.length > NESTED_BLOCK_PARSE_MAX_CHARS) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  for (const item of parsed) {
+    if (
+      !item ||
+      typeof item !== "object" ||
+      typeof (item as Record<string, unknown>).type !== "string"
+    ) {
+      return null;
+    }
+  }
+  return parsed as Array<Record<string, unknown>>;
+}
+
 // ============= 选块（对齐 hc.js:53-146）=============
 
 /** 检查是否应该跳过某条消息（system/tool/过短/已含占位符） */
@@ -323,9 +370,10 @@ export function extractText(content: unknown): string {
  * 返回 [{ type, mime, data, source? }] 或 null(无媒体)
  */
 function extractMediaBlocks(content: unknown): Array<Record<string, unknown>> | null {
-  if (!Array.isArray(content)) return null;
+  const blocks = normalizeContentBlocks(content);
+  if (!blocks) return null;
   const out: Array<Record<string, unknown>> = [];
-  for (const block of content) {
+  for (const block of blocks) {
     if (!block || typeof block !== "object") continue;
     const b = block as Record<string, unknown>;
     const type = b.type;
@@ -362,6 +410,11 @@ interface BlockCandidate {
   savings: number;
   kind: "text" | "media" | "tool_result";
   mediaBlock?: Record<string, unknown>;
+  /**
+   * V1.13:整条字符串消息(`blockIdx=-1`)里的全部媒体块。真实 OpenAI 形状的 tool 消息
+   * content 是"块数组的 JSON 字符串",可能含多张图;召回时 `qMedia` 需带回全部。
+   */
+  mediaBlocks?: Array<Record<string, unknown>>;
   toolResultBlock?: Record<string, unknown>;
 }
 
@@ -474,23 +527,84 @@ function selectMediaCandidates(
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (!msg) continue;
-    const content = msg.content;
-    if (!Array.isArray(content)) continue;
-    for (let bi = 0; bi < content.length; bi++) {
-      const b = content[bi] as Record<string, unknown> | undefined;
-      if (!b || typeof b !== "object") continue;
-      if (!MEDIA_BLOCK_TYPES.has(b.type as string)) continue;
-      if (skipIndices.has(i)) continue;
-      const mediaJson = JSON.stringify(b);
-      if (mediaJson.includes(PLACEHOLDER_PREFIX) || mediaJson.includes(LEGACY_PLACEHOLDER_PREFIX)) continue;
-      candidates.push(makeMediaCandidate(i, bi, b));
+    if (skipIndices.has(i)) continue;
+    // V1.13:归一化 content,使"块数组的 JSON 字符串"(真实 OpenAI 形状的 tool 消息)
+    //   里的媒体块也能被识别,否则内层图片对媒体 pass 不可见。
+    const blocks = normalizeContentBlocks(msg.content);
+    if (blocks) {
+      const media = blocks.filter(
+        (b) => b && typeof b === "object" && MEDIA_BLOCK_TYPES.has(b.type as string)
+      );
+      if (media.length === 0) continue;
+      const joined = JSON.stringify(media);
+      if (joined.includes(PLACEHOLDER_PREFIX) || joined.includes(LEGACY_PLACEHOLDER_PREFIX)) continue;
+      // V1.13:content 是"块数组的 JSON 字符串"(顶层字符串,非数组)→ 整条换成一个占位符,
+      //   召回时带回全部媒体块;原始数组则逐块替换(与既有逐块语义一致)。
+      if (typeof msg.content === "string") {
+        candidates.push(makeStringMediaCandidate(i, media));
+      } else {
+        for (let bi = 0; bi < blocks.length; bi++) {
+          const b = blocks[bi];
+          if (!b || typeof b !== "object" || !MEDIA_BLOCK_TYPES.has(b.type as string)) continue;
+          const mediaJson = JSON.stringify(b);
+          if (mediaJson.includes(PLACEHOLDER_PREFIX) || mediaJson.includes(LEGACY_PLACEHOLDER_PREFIX)) continue;
+          candidates.push(makeMediaCandidate(i, bi, b));
+        }
+      }
+      continue;
+    }
+    // 纯字符串(非块数组 JSON):若整体是 data URL 图片,按单个媒体块处理。
+    if (typeof msg.content === "string") {
+      const b = mediaBlockFromString(msg.content);
+      if (b) candidates.push(makeStringMediaCandidate(i, [b]));
     }
   }
   return candidates;
 }
 
+/**
+ * V1.13:从字符串解析出单个媒体块。
+ *   仅接受自证为媒体的 `data:<image|video|audio mime>;base64,<data>`
+ *   (对齐 extractMediaBlocks 的 image_url 分支)。
+ * 其余字符串一律返回 null —— 尤其是:
+ *   - 裸 http(s) URL:内容类型未知(可能是 .csv/.json 报告),且 OpenAI 形态的
+ *     `role:"tool"` content 必须是字符串,注入 image_url 块属非法形状;
+ *   - `data:text/plain;base64,...` 等非媒体 data-URL:是文本,不是图片。
+ * 两者都必须保持纯文本,否则召回会把普通工具输出当图片回填。
+ */
+function mediaBlockFromString(content: string): Record<string, unknown> | null {
+  const m = content.match(/^data:([^;]+);base64,(.+)$/s);
+  if (m && /^(image|video|audio)\//i.test(m[1])) {
+    return { type: "image", source: { type: "base64", media_type: m[1], data: m[2] } };
+  }
+  return null;
+}
+
+/** 整条字符串消息折叠为占位符的媒体候选(携带全部媒体块供召回)。 */
+function makeStringMediaCandidate(
+  msgIdx: number,
+  mediaBlocks: Array<Record<string, unknown>>
+): BlockCandidate {
+  const mediaJson = JSON.stringify(mediaBlocks);
+  const hash = computeHash(mediaJson);
+  const placeholder = makePlaceholder(hash);
+  return {
+    msgIdx,
+    blockIdx: -1,
+    text: mediaJson,
+    hash,
+    placeholder,
+    originalLen: mediaJson.length,
+    placeholderLen: placeholder.length,
+    savings: mediaJson.length - placeholder.length,
+    kind: "media",
+    mediaBlock: mediaBlocks[0],
+    mediaBlocks
+  };
+}
+
 /** 媒体块的小标记描述(落库 entry.q,避免把几十 KB base64 当"问题文本") */
-function mediaMarker(b: Record<string, unknown> | undefined): string {
+function mediaMarker(b: Record<string, unknown> | undefined, fallbackBytes = 0): string {
   const type = (b?.type as string) || "media";
   const src = b?.source as Record<string, unknown> | undefined;
   const mime =
@@ -502,7 +616,7 @@ function mediaMarker(b: Record<string, unknown> | undefined): string {
     (src?.data as string) ||
     (b?.data as string) ||
     "";
-  const bytes = typeof data === "string" ? data.length : 0;
+  const bytes = typeof data === "string" && data.length > 0 ? data.length : fallbackBytes;
   return `[media block: ${type} ${mime}, ${bytes} bytes]`;
 }
 
@@ -562,6 +676,8 @@ function selectToolResultCandidates(
     if (!msg) continue;
     if (msg.role === "tool" && typeof msg.content === "string") {
       // OpenAI 形状:blockIdx=-1 表示整条消息内容(string)就是 tool 输出。
+      //   媒体承载的工具消息由调用方经 skipIndices 排除(见 collectBlockCandidates);
+      //   文本型工具输出保持今天的"整条折成 tool_result 占位符"行为不变。
       all.push({ msgIdx: i, blockIdx: -1, block: msg as unknown as Record<string, unknown>, text: msg.content });
       continue;
     }
@@ -623,16 +739,26 @@ function collectBlockCandidates(
     maxCompressToolResults: number;
   }
 ): BlockCandidate[] {
+  // V1.13:媒体 pass 先行,并把它认领的消息(主要是"块数组 JSON 字符串"的 tool 消息)
+  //   加入本地 skip 集,避免随后的 tool_result pass 把同一条 66KB 图片数组折成文本
+  //   占位符(两 pass 争抢同一 blockIdx=-1 + 同一 msgIdx,后者会覆盖成 kind:"text")。
+  const mediaCands = opts.compressMedia ? selectMediaCandidates(messages, skipIndices) : [];
+  const mediaClaimed = new Set<number>();
+  for (const bc of mediaCands) {
+    if (bc.blockIdx === -1) mediaClaimed.add(bc.msgIdx);
+  }
+  const downstreamSkip =
+    mediaClaimed.size > 0 ? new Set<number>([...skipIndices, ...mediaClaimed]) : skipIndices;
+
   const textCands = opts.blockThresholdChars > 0
     ? selectBlockCandidates(messages, {
         threshold: opts.blockThresholdChars,
-        skipIndices,
+        skipIndices: downstreamSkip,
         includeMedia: false
       })
     : [];
-  const mediaCands = opts.compressMedia ? selectMediaCandidates(messages, skipIndices) : [];
   const toolCands = opts.compressToolResults
-    ? selectToolResultCandidates(messages, skipIndices, {
+    ? selectToolResultCandidates(messages, downstreamSkip, {
         threshold: opts.toolResultThresholdChars,
         keepRecent: opts.keepRecentToolResults,
         maxCount: opts.maxCompressToolResults
@@ -670,15 +796,15 @@ function applyBlockCandidate(m: LocalCompressMessage, bc: BlockCandidate): void 
 
 /** 由 block 候选构造召回缓存条目(media 用描述符,其余用原文)。 */
 function blockCandidateEntry(bc: BlockCandidate): HashMapEntry {
-  const qMedia = bc.kind === "media" && bc.mediaBlock ? [bc.mediaBlock] : undefined;
+  const media = bc.kind === "media" ? bc.mediaBlocks ?? (bc.mediaBlock ? [bc.mediaBlock] : undefined) : undefined;
   return {
-    q: bc.kind === "media" ? mediaMarker(bc.mediaBlock) : bc.text,
+    q: bc.kind === "media" && bc.mediaBlock ? mediaMarker(bc.mediaBlock, bc.originalLen) : bc.text,
     a: "",
     blockOnly: true,
     kind: bc.kind || "text",
     msgIdx: bc.msgIdx,
     blockIdx: bc.blockIdx,
-    ...(qMedia ? { qMedia } : {})
+    ...(media ? { qMedia: media } : {})
   };
 }
 
