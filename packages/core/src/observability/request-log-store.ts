@@ -4633,8 +4633,12 @@ function ensureRequestLogSchema(database: SqlDatabase): void {
 }
 
 const requestLogMigrationBatchSize = 500;
+// This migration reads `request_body_text` (each row can be hundreds of KB), so its
+// page is far smaller than the row-only migrations to keep the worker heap bounded.
+const streamFlagBackfillBatchSize = 100;
 const gatewayOutcomeMigrationName = "gateway-outcome-v1";
 const gatewayFinalAttemptMigrationName = "gateway-final-attempt-v1";
+const streamFlagBackfillMigrationName = "stream-flag-backfill-v1";
 
 function ensureRequestLogMigrationSchema(database: SqlDatabase): void {
   database.exec(`
@@ -4807,52 +4811,90 @@ function ensurePendingRawTraceUpdateSchema(database: SqlDatabase): void {
   prunePendingRawTraceUpdates(database, Date.now());
 }
 
+/**
+ * Legacy `is_stream` backfill for rows written before the insert path inferred the
+ * flag. Rows are matched with `request_body_text LIKE '%stream%'`, which forces
+ * SQLite to read every matching body — with ~1.7k rows that is hundreds of MB, so
+ * the scan must page by `id` (see the sibling Gateway migrations) instead of
+ * `.all()`-ing the whole set: a full materialization overflows the worker heap
+ * (`ERR_WORKER_OUT_OF_MEMORY`) as soon as the log DB grows large.
+ *
+ * Runs once; completion is recorded in `request_log_schema_migrations`, so fresh
+ * rows (which already get `is_stream` at insert) are never scanned repeatedly.
+ */
 function backfillRequestLogStreamFlags(database: SqlDatabase): void {
-  const rows = queryRows(
-    database,
-      `
-        SELECT
-          rowid AS id,
-          path,
-          url,
-          request_headers,
-          response_headers,
-          request_body_text,
-          request_body_encoding,
-          response_body_content_type
-        FROM request_logs
-        WHERE source_usage_id IS NULL
-          AND is_stream = 0
-          AND (
-            path LIKE '%stream%' OR
-            url LIKE '%stream%' OR
-            request_body_text LIKE '%stream%' OR
-            response_headers LIKE '%event-stream%' OR
-            response_body_content_type LIKE '%event-stream%'
-          )
-      `
-  );
-  if (rows.length === 0) {
-    return;
-  }
-
-  const statement = database.prepare("UPDATE request_logs SET is_stream = 1 WHERE rowid = ?");
-  for (const row of rows) {
-    const requestBodyText = String(row.request_body_encoding ?? "utf8") === "utf8"
-      ? String(row.request_body_text ?? "")
-      : undefined;
-    const isStream = inferRequestLogIsStream({
-      path: String(row.path ?? ""),
-      requestBodyText,
-      requestHeaders: parseHeaderJson(row.request_headers),
-      responseBodyContentType: String(row.response_body_content_type ?? ""),
-      responseHeaders: parseHeaderJson(row.response_headers),
-      url: String(row.url ?? "")
-    });
-    if (isStream) {
-      statement.run(normalizeCount(row.id));
+  const state = requestLogMigrationState(database, streamFlagBackfillMigrationName);
+  if (state.completed) return;
+  // `id` is the rowid PK, so `id > ? ORDER BY id LIMIT ?` is an index scan: only
+  // one page of bodies is ever resident at a time.
+  const selectBatch = database.prepare(`
+    SELECT
+      id,
+      path,
+      url,
+      request_headers,
+      response_headers,
+      request_body_text,
+      request_body_encoding,
+      response_body_content_type
+    FROM request_logs
+    WHERE id > ?
+      AND source_usage_id IS NULL
+      AND is_stream = 0
+      AND (
+        path LIKE '%stream%' OR
+        url LIKE '%stream%' OR
+        request_body_text LIKE '%stream%' OR
+        response_headers LIKE '%event-stream%' OR
+        response_body_content_type LIKE '%event-stream%'
+      )
+    ORDER BY id ASC
+    LIMIT ?
+  `);
+  const updateProgress = database.prepare(`
+    UPDATE request_log_schema_migrations
+    SET last_id = ?, updated_at = ?
+    WHERE migration = ?
+  `);
+  const statement = database.prepare("UPDATE request_logs SET is_stream = 1 WHERE id = ?");
+  let lastId = state.lastId;
+  while (true) {
+    const rows = selectBatch.all(lastId, streamFlagBackfillBatchSize) as Record<string, SqlValue>[];
+    if (rows.length === 0) break;
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      for (const row of rows) {
+        lastId = normalizeCount(row.id);
+        const requestBodyText = String(row.request_body_encoding ?? "utf8") === "utf8"
+          ? String(row.request_body_text ?? "")
+          : undefined;
+        const isStream = inferRequestLogIsStream({
+          path: String(row.path ?? ""),
+          requestBodyText,
+          requestHeaders: parseHeaderJson(row.request_headers),
+          responseBodyContentType: String(row.response_body_content_type ?? ""),
+          responseHeaders: parseHeaderJson(row.response_headers),
+          url: String(row.url ?? "")
+        });
+        if (isStream) {
+          statement.run(lastId);
+        }
+      }
+      updateProgress.run(lastId, Date.now(), streamFlagBackfillMigrationName);
+      database.exec("COMMIT");
+    } catch (error) {
+      if (database.inTransaction) database.exec("ROLLBACK");
+      throw error;
     }
   }
+  // Reaching the end of the table completes the scan. Future rows set `is_stream`
+  // on insert, so mark completion at the high-water id.
+  const maxRow = queryRows(database, "SELECT MAX(id) AS lastId FROM request_logs")[0];
+  completeRequestLogMigration(
+    database,
+    streamFlagBackfillMigrationName,
+    normalizeCount(maxRow?.lastId)
+  );
 }
 
 type RequestLogStreamInferenceInput = {
