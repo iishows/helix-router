@@ -1,23 +1,23 @@
 {
-  "timestamp": "2026-10-09T14:26:16.262Z",
+  "timestamp": "2026-10-13T03:49:16.191Z",
   "cdp_endpoint": "http://127.0.0.1:9222",
   "status": 200,
   "helix_headers": {},
   "usage": {
-    "total_tokens": 3870,
+    "total_tokens": 4012,
     "total_characters": 0,
     "prompt_tokens": 2012,
-    "completion_tokens": 1858,
+    "completion_tokens": 2000,
     "completion_tokens_details": {
-      "reasoning_tokens": 846
+      "reasoning_tokens": 266
     },
     "prompt_tokens_details": {
-      "cached_tokens": 1997
+      "cached_tokens": 157
     }
   },
-  "finish_reason": "stop",
-  "content_length": 2419,
-  "content_preview": "## 10 个主题的核心要点\n\n| # | 主题 | 一句话核心 |\n|---|---|---|\n| 1 | **Redis Cluster** | 16384 slot 分片 + gossip 同步状态 + MOVED/ASK 重定向 |\n| 2 | **Kafka 分区** | Topic 拆分为有序不可变分区(append-only log),每条消息有 offset |\n| 3 | **Docker 网络** | bridge/host/none/container 四种单机模式 + overlay (VXLAN) 跨主机 |\n| 4 | **Kubernetes 调度** | kube-scheduler 两阶段:Predicate 预选 + Priority 优选 |\n| 5 | **etcd 强一致性** | Raft (leader 选举 + 日志复制) + MVCC 多版本 |\n| 6 | **MongoDB 复制集** | oplog 同步 + Raft 主选举 + 读偏好策略 |\n| 7 | **Paxos 算法** | Prepare/Promise/Accept/Learn 共识,Multi-Paxos 复用 Prepare |\n| 8 | **InnoDB 锁** | 行锁 + gap lock + next-key lock,MVCC 实现非阻塞读 |\n| 9 | **Nginx 事件模型** | epoll 异步非阻塞 + 多 worker + accept_mutex 抗惊群 |\n| 10 | **分布式追踪** | W3C Trace Context + trace_id/span 串联调用链 |\n\n## 它们之间的关联\n\n**1. 一致性 / 共识算法族** (同一类理论基础)\n- **Paxos** 是分布式共识的\"元算法\",**ZAB** (ZooKeeper) 是它的工程变体\n- **etcd (Raft)** 和 **MongoDB 主选举 (Raft)** 都用了 Raft,Raft 本身可以理解为 Multi-Paxos 的简化版\n- 这三者解决的是同一个问题:在节点故障 / 网络分区下让集群对\"谁是 leader / 某条数据是否提交\"达成一致\n\n**2. 数据分布与复制** (存储层的共同问题)\n- **Redi",
+  "finish_reason": "length",
+  "content_length": 4489,
+  "content_preview": "# 10 个分布式系统主题全景回顾\n\n## 一、核心要点速览\n\n| # | 主题 | 核心机制 |\n|---|------|----------|\n| 1 | **Redis Cluster** | 16384 slot 分片;gossip 同步集群状态;Raft-like 选 master;MOVED/ASK 重定向;渐进式 slot 迁移 |\n| 2 | **Kafka 分区** | Topic 划分为有序分区;offset 定位消息;消费者组协调分区分配;事务协调器 + 幂等生产者实现 EOS |\n| 3 | **Docker 网络** | bridge/host/none/container 四种模式;overlay + VXLAN 跨主机;macvlan 独立 MAC/IP |\n| 4 | **Kubernetes 调度** | kube-scheduler 两阶段:Predicate 过滤 + Priority 打分;NodeSelector、亲和性、污点容忍 |\n| 5 | **etcd 强一致性** | Raft(leader 选举 + 日志复制);过半确认;readindex 保证线性化读;MVCC 多版本 |\n| 6 | **MongoDB 复制集** | oplog 主从同步;Raft-like Primary 选举;五种 readPreference |\n| 7 | **Paxos 算法** | Basic Paxos 四阶段(Prepare/Promise/Accept/Learn);Multi-Paxos 复用 leader;ZAB 变体 |\n| 8 | **MySQL InnoDB 锁** | record/gap/next-key lock;意向锁;MVCC + undo log 非阻塞读 |\n| 9 | **Nginx 事件模型** | epoll 异步非阻塞;master + 多 worker;共享 listen socket + accept 互斥锁 |\n| 10 | **分布式追踪** | W3C Trace Context(trace_id/span);头/尾/自适应采样;Jaeger/Tempo 后端 + service map |\n\n---\n\n## 二、主题之间的关联图谱\n\n### 🔗 1. 共识算法家族(Paxos ",
   "recall_hits_count": 10,
   "recall_hits": [
     "Redis Cluster 集群方案",

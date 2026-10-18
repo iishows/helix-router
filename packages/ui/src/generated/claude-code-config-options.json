@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-09T10:08:25.208Z",
+  "generatedAt": "2026-10-18T10:32:56.542Z",
   "generatedBy": "scripts/generate-claude-code-config-options.mjs",
   "sourceUrls": {
     "envEn": "https://code.claude.com/docs/en/env-vars.md",
@@ -1174,8 +1174,8 @@
       "valueKind": "boolean",
       "enumValues": [],
       "description": {
-        "en": "Turn off the Artifact tool, which publishes session output as a private web page on claude.ai. When you turn the Artifacts row off in /config, Claude Code writes this key to your user settings, so you don't usually edit it by hand. Requires Claude Code v2.1.196 or later.",
-        "zh": "Turn off the Artifact tool, which publishes session output as a private web page on claude.ai. When you turn the Artifacts row off in /config, Claude Code writes this key to your user settings, so you don't usually edit it by hand. Requires Claude Code v2.1.196 or later."
+        "en": "Turn off the Artifact tool, which publishes session output as a private web page on claude.ai. When you turn the Artifacts row off in /config, Claude Code writes this key to your user settings, so you don't usually edit it by hand.",
+        "zh": "Turn off the Artifact tool, which publishes session output as a private web page on claude.ai. When you turn the Artifacts row off in /config, Claude Code writes this key to your user settings, so you don't usually edit it by hand."
       }
     },
     {
@@ -1395,7 +1395,7 @@
       "path": [
         "forceLoginGatewayUrl"
       ],
-      "scope": "Managed. Read only from a source on the machine: managed-settings.json, the macOS plist or Windows HKLM registry, or a policy helper. Claude Code ignores it in HKCU and server-managed settings.",
+      "scope": "User or managed. Read from a managed source on the machine: managed-settings.json, the macOS plist or Windows HKLM registry, or a policy helper. On a machine with none of those, Claude Code v2.1.295 or later also reads it from user settings. Claude Code ignores it in HKCU and server-managed settings.",
       "type": "string, a full URL including the scheme",
       "default": "unset, so the Cloud gateway screen shows an error telling people to contact their IT administrator",
       "example": "{\n  \"forceLoginGatewayUrl\": \"https://claude-gateway.example.com\"\n}",
@@ -1411,7 +1411,7 @@
       "path": [
         "forceLoginMethod"
       ],
-      "scope": "Any file. Claude Code honors \"gateway\" only from a managed source on the machine: managed-settings.json, the macOS plist or Windows HKLM registry, or a policy helper. It treats \"gateway\" as unset in user, project, local, HKCU, and server-managed settings, the same rule as forceLoginGatewayUrl.",
+      "scope": "Any file. Claude Code honors \"gateway\" from the same sources as forceLoginGatewayUrl and treats it as unset everywhere else.",
       "type": "string, one of:",
       "default": "unset, so people pick a login method",
       "example": "{\n  \"forceLoginMethod\": \"claudeai\"\n}",
@@ -1520,6 +1520,22 @@
       "description": {
         "en": "An HTTP hook can put the value of an environment variable into a request header, for example an Authorization: Bearer $HOOK_TOKEN header, but only for variables the hook lists in its own allowedEnvVars. This key sets an outer limit on that list for every HTTP hook: a hook can use a variable only if both its own allowedEnvVars and this key name it. Use it to stop a hook from reading a secret it shouldn't, even when the hook's definition asks for it.",
         "zh": "An HTTP hook can put the value of an environment variable into a request header, for example an Authorization: Bearer $HOOK_TOKEN header, but only for variables the hook lists in its own allowedEnvVars. This key sets an outer limit on that list for every HTTP hook: a hook can use a variable only if both its own allowedEnvVars and this key name it. Use it to stop a hook from reading a secret it shouldn't, even when the hook's definition asks for it."
+      }
+    },
+    {
+      "key": "idleCompaction",
+      "path": [
+        "idleCompaction"
+      ],
+      "scope": "Any file",
+      "type": "Boolean",
+      "default": "true",
+      "example": "{\n  \"idleCompaction\": false\n}",
+      "valueKind": "boolean",
+      "enumValues": [],
+      "description": {
+        "en": "Idle compaction compacts a long conversation that you've stepped away from, shortly before its prompt cache expires. Your next message then sends a summary instead of the whole conversation. When you come back, the conversation shows Compacted while idle, before the prompt cache expired.",
+        "zh": "Idle compaction compacts a long conversation that you've stepped away from, shortly before its prompt cache expires. Your next message then sends a summary instead of the whole conversation. When you come back, the conversation shows Compacted while idle, before the prompt cache expired."
       }
     },
     {
@@ -3224,8 +3240,8 @@
       "valueKind": "array",
       "enumValues": [],
       "description": {
-        "en": "Add SSH connections to the Desktop environment dropdown. Administrators use it to distribute shared connections to a team. Connections you define in managed settings show as managed, so users can select them but can't edit or delete them in the app.",
-        "zh": "Add SSH connections to the Desktop environment dropdown. Administrators use it to distribute shared connections to a team. Connections you define in managed settings show as managed, so users can select them but can't edit or delete them in the app."
+        "en": "Add SSH connections to the Desktop environment dropdown. Administrators use it to distribute shared connections to a team. Connections you define in managed settings show as managed. Users can select them and set their own Worktree folder for them, but can't edit anything else or delete them in the app.",
+        "zh": "Add SSH connections to the Desktop environment dropdown. Administrators use it to distribute shared connections to a team. Connections you define in managed settings show as managed. Users can select them and set their own Worktree folder for them, but can't edit anything else or delete them in the app."
       }
     },
     {
@@ -3835,6 +3851,23 @@
       "description": {
         "en": "Choose how background sessions isolate their file edits. If you moved a session to the background with ← or /background, that session edits files in place whatever this key says. With \"worktree\", Claude Code blocks Edit and Write in the main checkout until the session calls EnterWorktree; with \"none\", background jobs edit the working copy directly. Set \"none\" for a repository where git worktrees are impractical.",
         "zh": "Choose how background sessions isolate their file edits. If you moved a session to the background with ← or /background, that session edits files in place whatever this key says. With \"worktree\", Claude Code blocks Edit and Write in the main checkout until the session calls EnterWorktree; with \"none\", background jobs edit the working copy directly. Set \"none\" for a repository where git worktrees are impractical."
+      }
+    },
+    {
+      "key": "worktree.location",
+      "path": [
+        "worktree",
+        "location"
+      ],
+      "scope": "User, in ~/.claude/settings.json on the remote machine",
+      "type": "string, an absolute path or one that starts with ~/",
+      "default": "unset, so worktrees go inside the project",
+      "example": "{\n  \"worktree\": {\n    \"location\": \"~/worktrees\"\n  }\n}",
+      "valueKind": "object",
+      "enumValues": [],
+      "description": {
+        "en": "Choose the folder on a remote machine where Desktop SSH sessions create their worktrees, instead of /.claude/worktrees/. Only the desktop app reads this key: --worktree, the EnterWorktree tool, isolated subagents, and background sessions ignore it. Requires Claude Desktop v1.44121.0 or later.",
+        "zh": "Choose the folder on a remote machine where Desktop SSH sessions create their worktrees, instead of /.claude/worktrees/. Only the desktop app reads this key: --worktree, the EnterWorktree tool, isolated subagents, and background sessions ignore it. Requires Claude Desktop v1.44121.0 or later."
       }
     },
     {
