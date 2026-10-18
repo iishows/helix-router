@@ -322,8 +322,10 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
     messages = clientCompactSkills(messages);
   }
 
-  // 1. 本地压缩:只有命中 recall 白名单的模型才做占位符压缩,否则原样透传。
+  // 本地压缩:只有命中 recall 白名单的模型才做占位符压缩,否则原样透传。
   let compressed: CompressResponse;
+  // 本轮压缩产物的 hashMap(用于生成教学 prompt 里的「hash → 主题」清单)。
+  let recallIndex = "";
   // 按模型门控 recall(2026-10-16):只有命中 recall 白名单的模型才做本地占位符压缩。
   //   未命中的模型 → 跳过 compressV3x(不产 ⟦QA:⟧/⟦HC:⟧、不落召回缓存、model 不改写),
   //   仅保留上面的安全预清理,后续只走主动 compact。空白名单 = 支持全部(向后兼容)。
@@ -344,6 +346,7 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
       });
       const cacheEntries = Object.entries(local.hashMap);
       if (cacheEntries.length > 0) {
+        recallIndex = buildHistoryRecallIndex(local.hashMap);
         try {
           // 缓存目录默认 {DATADIR}/helix-recall;若外部已通过环境变量指定则由 store 读取该值。
           ensureLocalRecallCacheDir();
@@ -411,7 +414,7 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
     outputBody.messages = outputMessages;
   }
   if (hasQA) {
-    outputMessages = injectHistoryRecallInstruction(outputMessages);
+    outputMessages = injectHistoryRecallInstruction(outputMessages, recallIndex);
     outputBody.messages = outputMessages;
   }
 
@@ -854,25 +857,34 @@ export const HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC = {
 } as const;
 
 const HISTORY_RECALL_INSTRUCTION_MARKER = "<<HISTORY_RECALL_INSTRUCTION_v1>>";
+/** 清单最多列多少条占位符主题(超出部分仍可召回,只是不进清单)。 */
+const HISTORY_RECALL_TOPIC_LIMIT = 40;
 
-const HISTORY_RECALL_INSTRUCTION = `${HISTORY_RECALL_INSTRUCTION_MARKER}
+// 教学 prompt 拆成「固定规则」+「本轮占位符清单」两段:
+//   BASE 讲清何时调/怎么调(与具体 hash 无关),INDEX 把每个 ⟦QA:hash⟧ 映射到一句话主题。
+//   动机(2026-10-17):只给 hash 时模型无法把「我需要的事实」映射到某个 hash,「按需召回」
+//   就成了空话 —— 实测调用率仅 ~6.7%(128/1952;见 tools/_diag-rate.mjs),其余要么全召回
+//   (撞 maxToolCalls → 400)要么完全不召回。清单给了「哪块折叠内容讲什么」之后,模型才能
+//   精确挑出真正需要的那一两个 hash 去要原文。
+const HISTORY_RECALL_INSTRUCTION_BASE = `${HISTORY_RECALL_INSTRUCTION_MARKER}
 ## ⚠️ Compressed history: recall only when the answer is NOT visible
 
-The marker \`⟦QA:abc123def4567890⟧\` replaces **compressed-away earlier content**, which may be:
+Earlier turns were compressed into placeholders of the form \`⟦QA:<16-hex>⟧\`. Each placeholder
+replaces **compressed-away content**, which may be:
 - an earlier **Q&A pair** (user question + assistant answer), or
-- a **folded tool output** (an old tool_result — a large file read or command output — collapsed to a placeholder to save tokens).
+- a **folded tool output** (an old tool_result — a large file read or command output — collapsed to save tokens).
 
-The placeholder itself carries NO information — seeing the hash tells you nothing about what was hidden.
-Treating it as if it were the content is a **correctness bug**: you will answer from a lossy summary
-and get facts wrong.
+The placeholder itself holds NO content — reading the hash tells you nothing on its own. But each hash IS
+listed below with a one-line **topic**, so you can tell which compressed block covers what.
 
-But recall is the exception, not the default: each recall re-injects the original text and gives back
-the tokens that were saved. Call \`${HISTORY_RECALL_TOOL_NAME}\` **only when the specific fact you need
-is genuinely hidden behind a placeholder and cannot be answered from what is already visible.**
+Recall re-injects the original text and gives back the tokens that were saved: recall is the exception, not the default.
+Call \`${HISTORY_RECALL_TOOL_NAME}\` **only when the specific fact you need is genuinely hidden behind a
+placeholder and cannot be answered from what is already visible.**
 
 ### Recall ONLY when
 1. The current task needs a **specific number / name / code / verbatim snippet** that lives inside
-   compressed history and you cannot produce it from the visible text.
+   compressed history and you cannot produce it from the visible text. Match the need against the
+   topic list below, then recall just those \`hash_id\`s.
 2. The user explicitly asks you to retrieve or quote an earlier artifact ("compare against the earlier
    diagram/PDF", "what was the file from before").
 3. You are about to **guess, assume, or say the information is unavailable** — if that fact is behind
@@ -884,8 +896,7 @@ is genuinely hidden behind a placeholder and cannot be answered from what is alr
 - You would only be recalling "just in case" — that wastes the tokens compression saved.
 
 ### How to call
-- Placeholder: \`⟦QA:abc123def4567890⟧\`
-- \`hash_id\` = the 16 hex chars only (drop the \`⟦QA:\` prefix and \`⟧\` suffix): **\`abc123def4567890\`**
+- Placeholder: \`⟦QA:abc123def4567890⟧\`; \`hash_id\` = the 16 hex chars only: \`abc123def4567890\`.
 - Default \`with_media=false\` returns the Q+A text only — the answer already contains the assistant's
   textual description of any image/video/document, which is enough in most cases.
 - Set \`with_media=true\` **only** when the earlier question contained an **image** and you need
@@ -902,6 +913,64 @@ ${HISTORY_RECALL_TOOL_NAME}(hash_id="abc123def4567890", reason="need the detail 
 ${HISTORY_RECALL_TOOL_NAME}(hash_id="abc123def4567890", with_media=true, reason="compare the old and new PDF")
 \`\`\`
 `;
+
+/**
+ * 由压缩产物 hashMap 生成「hash → 一句话主题」清单(紧跟固定规则之后注入)。
+ * topic 取原文首段的有信息片段:Q&A pair 用提问、折叠的工具/媒体输出用类型标记。
+ * 截断到 100 字、最多列 ${HISTORY_RECALL_TOPIC_LIMIT} 条,避免清单本身吃掉压缩省下的
+ * token、或把首轮 prompt 推得过大。
+ */
+export function buildHistoryRecallIndex(
+  hashMap: Record<string, {
+    q?: unknown;
+    a?: unknown;
+    kind?: "text" | "media" | "tool_result";
+    blockOnly?: boolean;
+  }>
+): string {
+  const lines: string[] = [];
+  let count = 0;
+  for (const [hash, entry] of Object.entries(hashMap)) {
+    if (count >= HISTORY_RECALL_TOPIC_LIMIT) break;
+    if (!/^[0-9a-f]{16}$/.test(hash)) continue;
+    lines.push(`- \`${hash}\` — ${historyRecallTopic(entry)}`);
+    count++;
+  }
+  if (lines.length === 0) return "";
+  return `### Compressed blocks in this conversation (hash → topic)\n${lines.join("\n")}\n`;
+}
+
+function historyRecallTopic(entry: {
+  q?: unknown;
+  a?: unknown;
+  kind?: "text" | "media" | "tool_result";
+  blockOnly?: boolean;
+}): string {
+  if (entry.kind === "media") return "[image/video/document dropped during compression]";
+  // q/a 不保证是字符串:tool_result/媒体块的 entry.q 可能是 JSON 字符串或块数组,
+  //   直接 `.replace` 会抛 TypeError → 整个 compressV3x try 块 bail → 完全不压缩。
+  const raw = coerceTopicText(entry.q) || coerceTopicText(entry.a);
+  if (!raw) return "[compressed content]";
+  const label = entry.blockOnly || entry.kind === "tool_result" ? "tool output: " : "Q: ";
+  const limit = 100 - label.length;
+  return label + (raw.length > limit ? `${raw.slice(0, limit)}…` : raw);
+}
+
+function coerceTopicText(value: unknown): string {
+  if (typeof value === "string") return value.replace(/\s+/g, " ").trim();
+  if (Array.isArray(value)) {
+    return value
+      .map((block) =>
+        block && typeof block === "object" && typeof (block as { text?: unknown }).text === "string"
+          ? (block as { text: string }).text
+          : ""
+      )
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+  return "";
+}
 
 /** 检测 ⟦QA:hash⟧ 占位符(V3.2 Q&A pair 压缩) */
 export function hasQAPlaceholder(messages: LLMMessage[]): boolean {
@@ -924,8 +993,14 @@ export function hasQAPlaceholder(messages: LLMMessage[]): boolean {
   return false;
 }
 
-/** 注入 history_recall 工具的教学 prompt(同 V2 injectRecallInstruction 模式 + marker 幂等) */
-export function injectHistoryRecallInstruction(messages: LLMMessage[]): LLMMessage[] {
+/**
+ * 注入 history_recall 工具的教学 prompt(同 V2 injectRecallInstruction 模式 + marker 幂等)。
+ * `index` 是本轮占位符清单(见 buildHistoryRecallIndex),为空时退化为仅规则段。
+ */
+export function injectHistoryRecallInstruction(
+  messages: LLMMessage[],
+  index = ""
+): LLMMessage[] {
   // marker 去重:避免多轮压缩时 system message 不断 prepend 同一段 instruction。
   // V2 injectRecallInstruction 已用此模式,V3.2 历史版本漏了。
   for (const m of messages) {
@@ -937,14 +1012,15 @@ export function injectHistoryRecallInstruction(messages: LLMMessage[]): LLMMessa
       return messages;
     }
   }
+  const instruction = index ? `${HISTORY_RECALL_INSTRUCTION_BASE}\n${index}` : HISTORY_RECALL_INSTRUCTION_BASE;
   const out: LLMMessage[] = [];
   let injected = false;
   for (const m of messages) {
     if (!injected && m?.role === "system" && typeof m.content === "string") {
-      out.push({ ...m, content: HISTORY_RECALL_INSTRUCTION + "\n" + m.content });
+      out.push({ ...m, content: instruction + "\n" + m.content });
       injected = true;
     } else if (!injected && m?.role !== "system") {
-      out.push({ role: "system", content: HISTORY_RECALL_INSTRUCTION });
+      out.push({ role: "system", content: instruction });
       out.push(m);
       injected = true;
     } else {
@@ -952,7 +1028,7 @@ export function injectHistoryRecallInstruction(messages: LLMMessage[]): LLMMessa
     }
   }
   if (!injected) {
-    out.unshift({ role: "system", content: HISTORY_RECALL_INSTRUCTION });
+    out.unshift({ role: "system", content: instruction });
   }
   return out;
 }

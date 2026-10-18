@@ -17,6 +17,7 @@ import { join } from "node:path";
 import {
   HISTORY_RECALL_TOOL_SCHEMA,
   HISTORY_RECALL_TOOL_NAME,
+  buildHistoryRecallIndex,
   hasQAPlaceholder,
   injectHistoryRecallInstruction,
   extractOpenAIHistoryRecallCalls,
@@ -147,6 +148,69 @@ test("injectHistoryRecallInstruction: NO duplicate if marker already present (�
   // 系统 prompt 应该只包含一次 marker 段,而非累积两次
   const markerCount = (result[0].content.match(/HISTORY_RECALL_INSTRUCTION_v1/g) || []).length;
   assert.equal(markerCount, 1, "marker 不应重复");
+});
+
+// ============== 占位符清单(hash → 主题)==============
+
+test("buildHistoryRecallIndex: 列出每个 hash 的一句话主题(pair 用提问)", () => {
+  const index = buildHistoryRecallIndex({
+    aaaaaaaaaaaaaaaa: { q: "How do I configure the webhook endpoint?", a: "Set WEBHOOK_URL." },
+    bbbbbbbbbbbbbbbb: { blockOnly: true, kind: "text", q: "very long tool output about x", a: "" }
+  });
+  assert.match(index, /hash → topic/);
+  assert.match(index, /`aaaaaaaaaaaaaaaa` — Q: How do I configure the webhook endpoint\?/);
+  assert.match(index, /`bbbbbbbbbbbbbbbb` — tool output: very long tool output/);
+});
+
+test("buildHistoryRecallIndex: media 折叠用描述符,不吐 base64", () => {
+  const index = buildHistoryRecallIndex({
+    cccccccccccccccc: { blockOnly: true, kind: "media", q: "[image 1234 bytes]" }
+  });
+  assert.match(index, /`cccccccccccccccc` — \[image\/video\/document dropped during compression\]/);
+});
+
+test("buildHistoryRecallIndex: 非法 hash 与空 hashMap → 空串", () => {
+  assert.equal(buildHistoryRecallIndex({}), "");
+  assert.equal(buildHistoryRecallIndex({ nothex: { q: "x" } }), "");
+});
+
+test("buildHistoryRecallIndex: q/a 非字符串(块数组/对象/undefined)不抛错(回归)", () => {
+  // 真实流量里 tool_result / 媒体块的 entry.q 可能是块数组或 JSON 字符串,
+  //   旧实现直接 `.replace` → TypeError → 整个 compressV3x try 块 bail → 完全不压缩。
+  const index = buildHistoryRecallIndex({
+    aaaaaaaaaaaaaaaa: { q: [{ type: "text", text: "block array topic" }], a: "" },
+    bbbbbbbbbbbbbbbb: { q: { nested: true }, a: undefined },
+    cccccccccccccccc: { q: "", a: [{ type: "text", text: "answer side" }] }
+  });
+  assert.match(index, /`aaaaaaaaaaaaaaaa` — Q: block array topic/);
+  assert.match(index, /`bbbbbbbbbbbbbbbb` — \[compressed content\]/);
+  assert.match(index, /`cccccccccccccccc` — Q: answer side/);
+});
+
+
+test("buildHistoryRecallIndex: 长主题截断到约 100 字", () => {
+  const long = "x".repeat(500);
+  const index = buildHistoryRecallIndex({ dddddddddddddddd: { q: long, a: "" } });
+  const line = index.split("\n").find((l) => l.includes("dddddddddddddddd"));
+  assert.ok(line.length <= 130, `主题行应被截断,实际 ${line.length}`);
+  assert.ok(line.endsWith("…"), "截断应有省略号");
+});
+
+test("injectHistoryRecallInstruction: index 为空 → 只注入规则段(不含清单)", () => {
+  const [injected] = injectHistoryRecallInstruction([{ role: "user", content: "Hi" }]);
+  assert.ok(injected.content.includes(HISTORY_RECALL_TOOL_NAME));
+  assert.doesNotMatch(injected.content, /hash → topic/);
+});
+
+test("injectHistoryRecallInstruction: 有 index → 追加清单,且 marker 仍只一次", () => {
+  const [injected] = injectHistoryRecallInstruction(
+    [{ role: "system", content: "sys" }, { role: "user", content: "⟦QA:eeeeeeeeeeeeeeee⟧" }],
+    buildHistoryRecallIndex({ eeeeeeeeeeeeeeee: { q: "topic here", a: "" } })
+  );
+  assert.match(injected.content, /hash → topic/);
+  assert.match(injected.content, /`eeeeeeeeeeeeeeee` — Q: topic here/);
+  const markerCount = (injected.content.match(/HISTORY_RECALL_INSTRUCTION_v1/g) || []).length;
+  assert.equal(markerCount, 1);
 });
 
 // ============== Extractor ==============
