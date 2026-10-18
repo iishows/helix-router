@@ -174,6 +174,13 @@ export function formatLogCompressSummary(
     const overheadPart = overhead > 0 ? `, 上下文开销(system/tools) +${overhead.toLocaleString()}` : "";
     titleParts.push(`净额(上游实收 prompt) ${netPromptTokens.toLocaleString()} tok = input ${inputTokens.toLocaleString()} + cache_read ${cacheReadTokens.toLocaleString()}${recallPart}${overheadPart}`);
   }
+  // 2026-10-17: 压缩过但召回回填为 0 时**显式**画出来,免得每次都猜"是没召回还是没渲染"。
+  //   0 分两种:响应体里仍残留 recall 调用 = 模型调了但没被执行;否则 = 模型压根没调。
+  if (hasCompressed && recallTokens === 0) {
+    titleParts.push(logRecallCallLeaked(entry)
+      ? "召回回填 0 tok（模型已调用 recall 但未执行）"
+      : "召回回填 0 tok（本轮模型未调用）");
+  }
   if (inputChars > 0) {
     titleParts.push(`内容 ${inputChars.toLocaleString()}→${outputChars.toLocaleString()} chars (${contentRatioPct}%)`);
   }
@@ -190,6 +197,17 @@ export function formatLogCompressSummary(
   if (qaCompressed > 0) titleParts.push(`Q&A 对占位 ${qaCompressed}`);
   if (scenario) titleParts.push(`场景 ${scenario}`);
   return { text, title: titleParts.join(" · ") };
+}
+
+/**
+ * 2026-10-17: 响应体里是否残留 recall 调用(history_recall / hc_recall)。
+ * 压缩过但 compressionRecallTokens==0 时,用它区分两种 0:
+ *   true  → 模型**调了** recall,但调用没被执行(未回填)→ 网关/客户端没兑现;
+ *   false → 模型压根没调 → 直接凭可见文本作答。
+ */
+export function logRecallCallLeaked(entry: RequestLogEntry): boolean {
+  const text = entry.responseBody?.text ?? "";
+  return /"name"\s*:\s*"(history_recall|hc_recall)"/.test(text);
 }
 
 function readHeaderNumber(value: string | string[] | undefined): number {

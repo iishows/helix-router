@@ -11,7 +11,7 @@ import {
   FormattedLogBody,
   isJsonContainer, isLargeLogBody, jsonChildPath, logRequestModel,
   LogBodyFormatMode, logBodyLargeTextThreshold, logBodyPreviewTextLimit, LogBodyWorkerResponse,
-  logProactiveCompact, logResolvedRouteModel, logSelectOptions, motion, MoveRight, Network, networkCodeLabel,
+  logProactiveCompact, logRecallCallLeaked, logResolvedRouteModel, logSelectOptions, motion, MoveRight, Network, networkCodeLabel,
   networkExchangeMatchesQuery, networkHeaderRows, networkLifecycleLabel, networkQueryRows, networkRowId, networkSummaryRows,
   Pause, Play, ProxyNetworkBody, ProxyNetworkExchange, ProxyNetworkSnapshot, ProxyStatus,
   ReactNode, ReactPointerEvent, RefreshCw, RequestLogBody, RequestLogBodyChunk, RequestLogEntry, RequestLogListFilter,
@@ -1456,6 +1456,9 @@ function LogCompressDetails({ entry }: { entry: RequestLogEntry }) {
   //   history_recall 调用数常为 0 → 真正的召回回填 = 0,却被误显示成数万 token。
   //   现在召回回填只认 compression_* 列里累计的真实值。
   const recallTokens = entry.compressionRecallTokens ?? 0;
+  // 召回回填 == 0 时进一步区分:响应体里若仍残留 history_recall / hc_recall 调用,
+  //   说明模型**调了**但这个调用没被网关/客户端执行(未回填)→ 与"模型压根没调"不同。
+  const recallCallLeaked = recallTokens === 0 && logRecallCallLeaked(entry);
   // 净节省(messages 同域口径,含召回回填代价)= baseline − (post + 召回回填)。
   //   ⚠️ 不能用 netPrompt(上游实收 = input+cache_read)当被减项:它含 system+tools,
   //   是 messages 口径之外的开销,跨域相减会把真实节省抹成"无净节省"。system/tools
@@ -1516,6 +1519,18 @@ function LogCompressDetails({ entry }: { entry: RequestLogEntry }) {
           label={t("召回回填")}
           value={`+${recallTokens.toLocaleString()} tok`}
           hint={t("模型调用 history_recall / hc_recall 后回填进来的原文 token 数")}
+        />
+      ) : compressed ? (
+        // 压缩过但召回回填为 0:显式画出来,免得每次都猜"是没召回还是没渲染"。
+        //   0 有两种情况,用 hint 区分(响应体里若仍有 recall 调用 = 调了但没被执行)。
+        <LogMetric
+          label={t("召回回填")}
+          value={recallCallLeaked
+            ? t("0（模型已调用但未执行）")
+            : t("0（本轮模型未调用）")}
+          hint={recallCallLeaked
+            ? t("响应里出现了 history_recall / hc_recall 调用,但未被网关/客户端执行 → 未回填。")
+            : t("本轮模型没有调用 history_recall / hc_recall → 没有原文被回填。占位符仍在,但模型选择直接作答。")}
         />
       ) : null}
       {contextOverhead > 0 ? (

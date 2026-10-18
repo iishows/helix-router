@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { RequestLogEntry } from "@ccr/core/contracts/app";
-import { compactSourceLabel, formatLogCompressSummary, logProactiveCompact } from "@ccr/ui/pages/home/shared/logs.ts";
+import { compactSourceLabel, formatLogCompressSummary, logProactiveCompact, logRecallCallLeaked } from "@ccr/ui/pages/home/shared/logs.ts";
 
 const t = (v: string) => v;
 
@@ -54,8 +54,10 @@ test("压缩列只显示「净端到端节省」百分比 = (baseline - post - �
   assert.match(title, /净额/);
   assert.match(title, /cache_read/);
   // 2026-10-16: 无 compressionRecallTokens → 上游实收−post 全部是 system/tools 上下文开销,
-  //   不得误标成「召回回填」。
-  assert.doesNotMatch(title, /召回回填/);
+  //   不得误标成「召回回填 **+N**」(正的召回回填)。
+  // 2026-10-17: 但仍**显式**画「召回回填 0 tok(...)」,免得每次都要猜"是没召回还是没渲染"。
+  assert.doesNotMatch(title, /召回回填 \+/);
+  assert.match(title, /召回回填 0 tok（本轮模型未调用）/);
   assert.match(title, /上下文开销\(system\/tools\) \+855/);
 });
 
@@ -177,6 +179,74 @@ test("主动 compact: entry 字段存在时 title 带 compact 明细", () => {
   assert.match(title, /主动 compact\(模型摘要\)/);
   assert.match(title, /折叠 6 条/);
   assert.match(title, /120,000→12,000 tok/);
+});
+
+// ============== 2026-10-17: 召回回填 == 0 的显式渲染 ==============
+
+test("压缩过但召回回填 0 → title 显式画「召回回填 0 tok（本轮模型未调用）」", () => {
+  const { title } = formatLogCompressSummary(
+    entry({
+      inputTokens: 300,
+      cacheReadTokens: 1000,
+      responseHeaders: {
+        "x-helix-compressor-enabled": "1",
+        "x-helix-compressor-baseline-tokens": "5000",
+        "x-helix-compressor-compressed-tokens": "1200"
+      }
+    }),
+    t
+  );
+  assert.match(title, /召回回填 0 tok（本轮模型未调用）/);
+});
+
+test("压缩过、召回回填 0、响应含 recall 调用 → 提示「已调用但未执行」", () => {
+  const { title } = formatLogCompressSummary(
+    entry({
+      inputTokens: 300,
+      cacheReadTokens: 1000,
+      responseBody: {
+        encoding: "utf8",
+        sizeBytes: 200,
+        text: '{"content":[{"type":"tool_use","name":"history_recall","id":"x"}]}',
+        truncated: false
+      },
+      responseHeaders: {
+        "x-helix-compressor-enabled": "1",
+        "x-helix-compressor-baseline-tokens": "5000",
+        "x-helix-compressor-compressed-tokens": "1200"
+      }
+    }),
+    t
+  );
+  assert.match(title, /召回回填 0 tok（模型已调用 recall 但未执行）/);
+});
+
+test("未压缩(pass-through)时不画召回回填 0(没有占位符,谈不上召回)", () => {
+  const { title } = formatLogCompressSummary(
+    entry({
+      inputTokens: 75,
+      responseHeaders: {
+        "x-helix-compressor-enabled": "1",
+        "x-helix-compressor-baseline-tokens": "1123",
+        "x-helix-compressor-compressed-tokens": "1123"
+      }
+    }),
+    t
+  );
+  assert.doesNotMatch(title, /召回回填/);
+});
+
+test("logRecallCallLeaked: 检测响应体里残留的 history_recall / hc_recall 调用", () => {
+  assert.equal(logRecallCallLeaked(entry({
+    responseBody: { encoding: "utf8", sizeBytes: 10, text: '"name":"history_recall"', truncated: false }
+  })), true);
+  assert.equal(logRecallCallLeaked(entry({
+    responseBody: { encoding: "utf8", sizeBytes: 10, text: '"name":"hc_recall"', truncated: false }
+  })), true);
+  assert.equal(logRecallCallLeaked(entry({
+    responseBody: { encoding: "utf8", sizeBytes: 10, text: '"name":"Bash"', truncated: false }
+  })), false);
+  assert.equal(logRecallCallLeaked(entry({})), false);
 });
 
 test("主动 compact: 无 entry 字段时 fallback 到 x-ccr-helix-compact-json 响应头", () => {
