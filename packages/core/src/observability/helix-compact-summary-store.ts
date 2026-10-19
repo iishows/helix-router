@@ -46,6 +46,13 @@ const MAX_LINE_READ_BYTES = 4 * 1024 * 1024;
  * (0.90~0.99 区间平坦,故取 0.95)。
  */
 const PREFIX_MATCH_MIN_RATIO = 0.95;
+/**
+ * 每会话最多保留的摘要行数。cleanup() 原先只按 TTL 过滤,线上实测 637 条全部未过期
+ * → 79MB 文件超 COMPACT_SIZE_BYTES 2.47x,每次 append 都触发一次「删不掉东西」的全量重写。
+ * 前缀匹配是「就近优先」(findPrefixSummary 逆向历遍),旧行几乎不再被命中:
+ * 实测 CAP=16/64/∞ 的 accumulate 命中率恒为 93.7%,故按每会话保留最近 N 条封顶。
+ */
+const MAX_ROWS_PER_SESSION = 64;
 
 /** 解析缓存目录:HELIX_RECALL_CACHE_DIR 下的 helix-compact 子目录。未配置则抛错。 */
 export function resolveCompactSummaryDir(): string {
@@ -211,13 +218,30 @@ export function findPrefixSummary(
   return best;
 }
 
-/** TTL 清理 + compaction:重写为仅含未过期、每 key 最后一行的新文件。返回保留条数。 */
+/**
+ * TTL 清理 + compaction:重写为仅含未过期、每 key 最后一行、且每会话最近
+ * `MAX_ROWS_PER_SESSION` 行的新文件。返回保留条数。
+ *
+ * 每会话封顶是必要的:TTL 单独无法控容量(线上 637 条全未过期,文件 79MB ≫ 32MB),
+ * 会让 maybeCompact 在每次 append 时都做一次无效全量重写。
+ */
 export function cleanup(now: number = Date.now()): number {
   const idx = ensureIndex();
   const file = idx.file;
   if (!existsSync(file)) return 0;
+
+  // 每个会话允许保留的偏移集合(取最近写入的 N 条)。
+  const allowed = new Set<number>();
+  for (const offsets of idx.sessionOffsets.values()) {
+    const from = Math.max(0, offsets.length - MAX_ROWS_PER_SESSION);
+    for (let i = from; i < offsets.length; i += 1) {
+      allowed.add(offsets[i]);
+    }
+  }
+
   const kept = new Map<string, string>();
   for (const [key, offset] of idx.offsets) {
+    if (!allowed.has(offset)) continue;
     const raw = readLineAt(file, offset);
     if (!raw) continue;
     const entry = parseEntryLoose(raw, now);

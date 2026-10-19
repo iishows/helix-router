@@ -30,7 +30,6 @@ import {
   findPrefixSummary,
   getCompactSummary,
   putCompactSummary,
-  _resetIndexForTest as resetCompactSummaryIndex,
   type CompactSummaryEntry
 } from "@ccr/core/observability/helix-compact-summary-store";
 
@@ -112,12 +111,6 @@ export async function applyHelixProactiveCompact(
   input: ProactiveCompactInput
 ): Promise<ProactiveCompactResult | undefined> {
   const settings = input.settings;
-  // 测试隔离:重置进程内索引,避免上一用例的缓存目录/文件被复用。
-  try {
-    resetCompactSummaryIndex();
-  } catch {
-    // ignore
-  }
   if (settings.tokenBudget <= 0 && !(settings.percent > 0)) {
     return undefined;
   }

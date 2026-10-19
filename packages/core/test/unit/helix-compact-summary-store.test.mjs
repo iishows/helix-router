@@ -172,3 +172,35 @@ test("cleanup: 丢掉过期与重复行,保留每 key 最后一行", () => {
   assert.equal(getCompactSummary("drop"), null);
   assert.equal(existsSync(path.join(cacheDir, "helix-compact", "summaries.jsonl")), true);
 });
+
+test("cleanup: 单会话超上限时只保留最近 N 条(TTL 全未过期也要收敛)", () => {
+  fresh();
+  const N = 64; // 与 MAX_ROWS_PER_SESSION 一致
+  for (let i = 0; i < N + 6; i += 1) {
+    putCompactSummary({ coveredCount: 1, key: `k${i}`, messageHashes: [`h${i}`], sessionId: "s1", summary: `v${i}` });
+  }
+  const kept = cleanup();
+  assert.equal(kept, N);
+  _resetIndexForTest();
+  // 最旧的 6 条被淘汰,最新一条保留
+  assert.equal(getCompactSummary("k0"), null);
+  assert.equal(getCompactSummary("k5"), null);
+  assert.equal(getCompactSummary("k6").summary, "v6");
+  assert.equal(getCompactSummary(`k${N + 5}`).summary, `v${N + 5}`);
+});
+
+test("cleanup: 上限按会话独立计算,互不挤占", () => {
+  fresh();
+  const N = 64;
+  for (let i = 0; i < N; i += 1) {
+    putCompactSummary({ coveredCount: 1, key: `a${i}`, messageHashes: [`a${i}`], sessionId: "sA", summary: "sa" });
+  }
+  for (let i = 0; i < 3; i += 1) {
+    putCompactSummary({ coveredCount: 1, key: `b${i}`, messageHashes: [`b${i}`], sessionId: "sB", summary: "sb" });
+  }
+  const kept = cleanup();
+  assert.equal(kept, N + 3);
+  _resetIndexForTest();
+  assert.equal(getCompactSummary("a0").summary, "sa");
+  assert.equal(getCompactSummary("b0").summary, "sb");
+});
