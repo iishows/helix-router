@@ -47,10 +47,18 @@ const MAX_LINE_READ_BYTES = 4 * 1024 * 1024;
  */
 const PREFIX_MATCH_MIN_RATIO = 0.95;
 /**
- * 每会话最多保留的摘要行数。cleanup() 原先只按 TTL 过滤,线上实测 637 条全部未过期
- * → 79MB 文件超 COMPACT_SIZE_BYTES 2.47x,每次 append 都触发一次「删不掉东西」的全量重写。
- * 前缀匹配是「就近优先」(findPrefixSummary 逆向历遍),旧行几乎不再被命中:
- * 实测 CAP=16/64/∞ 的 accumulate 命中率恒为 93.7%,故按每会话保留最近 N 条封顶。
+ * 每会话保留的**字节**预算。必须按字节而非行数封顶:摘要行随折叠区间增长
+ * (实测均值 124KB、最大 250KB),静态行数无法约束全局体积 ——
+ * 「5 会话 × 64 行 × 124KB = 38.8MB」正好落在 32MB 触发线之上,会导致
+ * maybeCompact 每次 append 都做一次收敛不了的整文件重写。
+ * 256KB/会话 × 5 会话 ≈ 1.3MB,远低于触发线(单会话约保留 2 行)。
+ * 旧行不被命中:前缀匹配是就近优先(findPrefixSummary 逆向历遍),实测 CAP=∞/64/16 命中率相同。
+ */
+const MAX_SESSION_BYTES = 256 * 1024;
+/**
+ * 每会话保留行数上限(与 `MAX_SESSION_BYTES` 取先到者)。行数只是兜底:
+ * 真正封顶体积的是字节预算。旧行不被命中 —— 前缀匹配「就近优先」
+ * (findPrefixSummary 逆向历遍),实测 CAP=∞/64/16 的命中率相同。
  */
 const MAX_ROWS_PER_SESSION = 64;
 
@@ -65,6 +73,15 @@ export function resolveCompactSummaryDir(): string {
 
 // ============= 进程内索引 (offset) =============
 
+/** 索引里的一行摘要:只需 offset / mh 长度 / 字节数即可完成筛选与保留决策,无需读全文。 */
+interface IndexRow {
+  offset: number;
+  /** 该行 messageHashes 的长度(= 覆盖条数);用于在读行前廉价排除候选。 */
+  mhLen: number;
+  /** 该行字节数(含换行);用于按字节预算保留最近若干行。 */
+  bytes: number;
+}
+
 interface CompactIndex {
   dir: string;
   file: string;
@@ -72,8 +89,8 @@ interface CompactIndex {
   scanned: number;
   /** key -> 该 key 最近一次出现的行起始字节偏移 */
   offsets: Map<string, number>;
-  /** sessionId -> 该会话所有行的偏移(文件顺序) */
-  sessionOffsets: Map<string, number[]>;
+  /** sessionId -> 该会话所有行(文件顺序) */
+  sessionOffsets: Map<string, IndexRow[]>;
 }
 
 let index: CompactIndex | undefined;
@@ -84,11 +101,15 @@ function ensureIndex(): CompactIndex {
   if (index && index.dir === dir && index.file === file) {
     if (existsSync(file)) {
       const size = statSync(file).size;
-      if (size > index.scanned) {
+      if (size < index.scanned) {
+        // 文件被外部 cleanup 重写而收缩:既有偏移全部失效,整体重建。
+        index = undefined;
+      } else if (size > index.scanned) {
+        // 增量续扫:只读新增字节(本进程 append 的行由这里登记,无需作废索引)。
         scanInto(index, size);
       }
     }
-    return index;
+    if (index) return index;
   }
   index = { dir, file, offsets: new Map(), scanned: 0, sessionOffsets: new Map() };
   if (existsSync(file)) {
@@ -114,7 +135,8 @@ function scanInto(idx: CompactIndex, limit: number): void {
     let lineStart = start;
     for (let i = 0; i < read; i++) {
       if (buf[i] === 0x0a) {
-        registerLine(idx, buf.subarray(lineStart - start, i), lineStart);
+        // lineStart 是绝对偏移,i 是块内偏移 → 行末绝对位置 = start + i。
+        registerLine(idx, buf.subarray(lineStart - start, i), lineStart, start + i + 1 - lineStart);
         lineStart = start + i + 1;
       }
     }
@@ -124,27 +146,32 @@ function scanInto(idx: CompactIndex, limit: number): void {
   }
 }
 
-function registerLine(idx: CompactIndex, lineBuf: Buffer, offset: number): void {
+function registerLine(idx: CompactIndex, lineBuf: Buffer, offset: number, bytes: number): void {
   const header = extractHeader(lineBuf);
   if (!header) return;
   idx.offsets.set(header.h, offset);
   if (header.s) {
+    const row: IndexRow = { bytes, offset, mhLen: header.mhLen };
     const list = idx.sessionOffsets.get(header.s);
     if (list) {
-      list.push(offset);
+      list.push(row);
     } else {
-      idx.sessionOffsets.set(header.s, [offset]);
+      idx.sessionOffsets.set(header.s, [row]);
     }
   }
 }
 
-function extractHeader(lineBuf: Buffer): { h: string; s?: string } | undefined {
+function extractHeader(lineBuf: Buffer): { h: string; s?: string; mhLen: number } | undefined {
   try {
     const text = lineBuf.toString("utf-8");
     if (!text) return undefined;
-    const obj = JSON.parse(text) as { h?: unknown; s?: unknown };
+    const obj = JSON.parse(text) as { h?: unknown; s?: unknown; mh?: unknown };
     if (typeof obj.h !== "string") return undefined;
-    return { h: obj.h, ...(typeof obj.s === "string" ? { s: obj.s } : {}) };
+    return {
+      h: obj.h,
+      mhLen: Array.isArray(obj.mh) ? obj.mh.length : 0,
+      ...(typeof obj.s === "string" ? { s: obj.s } : {})
+    };
   } catch {
     return undefined;
   }
@@ -173,8 +200,8 @@ export function putCompactSummary(entry: CompactSummaryEntry, ttlMs: number = DE
     t: entry.createdAt ?? now
   }) + "\n";
   appendFileSync(idx.file, line, "utf-8");
-  // 追加后使索引失效(下次读重建/续扫)
-  index = undefined;
+  // 不作废索引:ensureIndex 会按新文件大小增量续扫(只读刚追加的这几行)。
+  // 原先无条件置 index=undefined 会让下一次读全量重建(80MB 文件实测 ~530ms/请求)。
   maybeCompact(idx.dir);
   return true;
 }
@@ -200,18 +227,19 @@ export function findPrefixSummary(
 ): { entry: CompactSummaryEntry; matchedCount: number } | null {
   if (!sessionId || !Array.isArray(messageHashes) || messageHashes.length === 0) return null;
   const idx = ensureIndex();
-  const offsets = idx.sessionOffsets.get(sessionId);
-  if (!offsets || offsets.length === 0) return null;
+  const rows = idx.sessionOffsets.get(sessionId);
+  if (!rows || rows.length === 0) return null;
 
   let best: { entry: CompactSummaryEntry; matchedCount: number } | null = null;
   // 逆向:最近写入者优先(同一前缀的新摘要覆盖旧的)
-  for (let i = offsets.length - 1; i >= 0; i -= 1) {
-    const entry = parseEntryLoose(readLineAt(idx.file, offsets[i]), now);
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const { offset, mhLen } = rows[i];
+    // 读行前用索引里的 mhLen 廉价排除:越界/等长不具信息增益(文件顺序=写入顺序=前缀增长顺序)。
+    if (mhLen === 0 || mhLen > messageHashes.length) continue;
+    if (best && mhLen <= best.matchedCount) continue;
+    const entry = parseEntryLoose(readLineAt(idx.file, offset), now);
     if (!entry) continue;
-    const mh = entry.messageHashes;
-    if (mh.length === 0 || mh.length > messageHashes.length) continue;
-    if (best && mh.length <= best.matchedCount) continue;
-    const matched = approxPrefixLength(mh, messageHashes);
+    const matched = approxPrefixLength(entry.messageHashes, messageHashes);
     if (matched < 0) continue;
     best = { entry, matchedCount: matched };
   }
@@ -230,12 +258,19 @@ export function cleanup(now: number = Date.now()): number {
   const file = idx.file;
   if (!existsSync(file)) return 0;
 
-  // 每个会话允许保留的偏移集合(取最近写入的 N 条)。
+  // 每个会话允许保留的偏移集合:逆向累加字节,直到超出预算或行数上限(至少留 1 行)。
   const allowed = new Set<number>();
-  for (const offsets of idx.sessionOffsets.values()) {
-    const from = Math.max(0, offsets.length - MAX_ROWS_PER_SESSION);
-    for (let i = from; i < offsets.length; i += 1) {
-      allowed.add(offsets[i]);
+  for (const rows of idx.sessionOffsets.values()) {
+    let bytes = 0;
+    let count = 0;
+    for (let i = rows.length - 1; i >= 0; i -= 1) {
+      const row = rows[i];
+      if (count > 0 && (bytes + row.bytes > MAX_SESSION_BYTES || count >= MAX_ROWS_PER_SESSION)) {
+        break;
+      }
+      allowed.add(row.offset);
+      bytes += row.bytes;
+      count += 1;
     }
   }
 

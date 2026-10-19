@@ -204,3 +204,28 @@ test("cleanup: 上限按会话独立计算,互不挤占", () => {
   assert.equal(getCompactSummary("a0").summary, "sa");
   assert.equal(getCompactSummary("b0").summary, "sb");
 });
+
+test("cleanup: 大摘要按字节预算保留(行数没超但字节已超 → 仍淘汰旧行)", () => {
+  fresh();
+  // 每条约 60KB:两行即超 64KB 预算,但远未达 64 行上限
+  const big = "x".repeat(60000);
+  for (let i = 0; i < 5; i += 1) {
+    putCompactSummary({ coveredCount: 1, key: `big${i}`, messageHashes: [`h${i}`], sessionId: "s1", summary: big });
+  }
+  const kept = cleanup();
+  assert.ok(kept < 5, `字节预算未生效:保留了 ${kept} 行`);
+  assert.ok(kept >= 1, "至少要保留最近 1 行");
+  _resetIndexForTest();
+  // 最新一条必须在,最旧一条必须不在
+  assert.equal(getCompactSummary("big4").summary, big);
+  assert.equal(getCompactSummary("big0"), null);
+});
+
+test("findPrefixSummary: put 之后不再全量重建索引也能命中(增量续扫)", () => {
+  fresh();
+  putCompactSummary({ coveredCount: 3, key: "k3", messageHashes: ["a", "b", "c"], sessionId: "s1", summary: "three" });
+  // 同一进程内再查:不调用 _resetIndexForTest,索引应通过增量续扫感知到刚写入的行
+  const found = findPrefixSummary("s1", ["a", "b", "c", "d"]);
+  assert.ok(found, "put 后未重建索引即查不到 → 增量续扫失效");
+  assert.equal(found.entry.summary, "three");
+});
