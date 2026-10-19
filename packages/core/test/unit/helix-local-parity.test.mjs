@@ -181,6 +181,54 @@ test("already-compressed content is skipped (idempotent)", () => {
   assert.deepEqual(Object.keys(twice.hashMap), []);
 });
 
+// ============= F1(2026-10-19): "提到"占位符语法的工具输出不得免疫 =============
+//
+// 旧守卫用 `includes("⟦QA:")` 判幂等 → 任何只是**提到**该语法的正常工具输出
+// (读文档/读 hc-local.ts 本身/git log 关于 helix 的提交/memory 文件)被误判为
+// 已压缩而永久不漏压。实测审计流量里 89.9% 的未压工具字符因这条误判免疫。
+// 修复:幂等判断改为"整体即占位符"(isPlaceholderOnly 全匹配)。
+
+const F1_TOOL_PREFIX = [
+  { role: "user", content: "问题描述 ".repeat(80) },
+  { role: "assistant", content: "回答内容 ".repeat(80) }
+];
+const bigToolBody = (kw) => `工具输出开始 ${kw} ` + "数据".repeat(1200) + ` 工具输出结束 ${kw}`;
+
+test("F1: 工具输出里『提到』⟦QA:⟧ 语法仍应被压缩(旧 includes 守卫的误伤)", () => {
+  const msgs = [
+    ...F1_TOOL_PREFIX,
+    { role: "tool", tool_call_id: "t1", content: bigToolBody("文档里写了 ⟦QA:abc123⟧ 这种占位符语法") }
+  ];
+  const r = compressV3x(JSON.parse(JSON.stringify(msgs)), {
+    keepRecentPairs: 1, storeMedia: false, blockThresholdChars: 0, compressMedia: true,
+    compressToolResults: true, toolResultThresholdChars: 1000, keepRecentToolResults: 0, maxCompressToolResults: 200
+  });
+  assert.equal(Object.keys(r.hashMap).length, 1, "提到语法的工具输出应被压缩,而非免疫");
+  const tool = r.messages.find((m) => m.role === "tool");
+  assert.match(String(tool.content), /^⟦QA:[0-9a-f]{16}⟧$/, "整条应替换成占位符");
+});
+
+test("F1: 整体即占位符的工具输出仍幂等跳过", () => {
+  const msgs = [
+    ...F1_TOOL_PREFIX,
+    { role: "tool", tool_call_id: "t1", content: "⟦QA:abcdef0123456789⟧" }
+  ];
+  const r = compressV3x(JSON.parse(JSON.stringify(msgs)), {
+    keepRecentPairs: 1, storeMedia: false, blockThresholdChars: 0, compressMedia: true,
+    compressToolResults: true, toolResultThresholdChars: 1000, keepRecentToolResults: 0, maxCompressToolResults: 200
+  });
+  assert.equal(Object.keys(r.hashMap).length, 0, "已是占位符 → 幂等,不再产生候选");
+});
+
+test("F1: 整体即占位符(带空白)的消息也跳过", () => {
+  const msgs = [
+    ...F1_TOOL_PREFIX,
+    { role: "user", content: "  ⟦QA:abcdef0123456789⟧  " }
+  ];
+  const r = compressV3x(JSON.parse(JSON.stringify(msgs)), { keepRecentPairs: 1, minChars: 500 });
+  assert.equal(Object.keys(r.hashMap).length, 0);
+});
+
 // ============= 本地修正:tool block 不得产生孤儿 tool_result =============
 //
 // 云端 hc.js 会把 pair 的 assistant 整条删除。真实 Claude Code 请求里 assistant

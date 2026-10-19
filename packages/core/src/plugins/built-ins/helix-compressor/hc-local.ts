@@ -130,6 +130,19 @@ export function makePlaceholder(hash: string): string {
 }
 
 /**
+ * 内容**整体**是否就是一个占位符(允许前后空白)。
+ *
+ * 用于幂等:已压缩块不应再入候选。**必须用全匹配,不能用 `includes`** ——
+ * 任何只是"提到"占位符语法的正常工具输出(读文档/读本文件/`git log` 关于 helix
+ * 的提交/memory 文件)都会被 `includes("⟦QA:")` 误判为已压缩而**永久漏压**。
+ * 实测:审计流量里 tool 消息 41,065 字符未压缩,其中 36,900 字符(89.9%)因这条
+ * 误判免疫,每请求白丢 ~14k tokens。
+ */
+function isPlaceholderOnly(text: string): boolean {
+  return /^⟦(?:QA|CCR):[0-9a-fA-F]{8,128}⟧$/.test(text.trim());
+}
+
+/**
  * V1.13(2026-10-17):把消息 content 归一化成"块数组",让所有形状敏感的 pass 对
  * content 的形状判断保持一致。**不改动原消息、不产生副作用。**
  *
@@ -211,11 +224,9 @@ function shouldSkipMessage(msg: LocalCompressMessage, minChars: number): boolean
 
   if (charCount < minChars) return true;
 
-  // 已含占位符(QA/旧CCR) → 幂等跳过(对齐 hc.js:80-83)
-  if (
-    typeof content === "string" &&
-    (content.includes(PLACEHOLDER_PREFIX) || content.includes(LEGACY_PLACEHOLDER_PREFIX))
-  ) {
+  // 整体即占位符(QA/旧CCR) → 幂等跳过。
+  //   注意:用 isPlaceholderOnly(全匹配)而非 includes —— "提到"语法的正常输出不该免疫。
+  if (typeof content === "string" && isPlaceholderOnly(content)) {
     return true;
   }
 
@@ -441,7 +452,7 @@ function selectBlockCandidates(
     const content = msg.content;
 
     if (typeof content === "string") {
-      if (content.includes(PLACEHOLDER_PREFIX) || content.includes(LEGACY_PLACEHOLDER_PREFIX)) continue;
+      if (isPlaceholderOnly(content)) continue;
       if (skipIndices.has(i)) continue;
       if (content.length >= threshold) {
         const hash = computeHash(content);
@@ -469,7 +480,7 @@ function selectBlockCandidates(
           if (skipIndices.has(i)) continue;
           const text = (b.text as string) || "";
           if (text.length < threshold) continue;
-          if (text.includes(PLACEHOLDER_PREFIX) || text.includes(LEGACY_PLACEHOLDER_PREFIX)) continue;
+          if (isPlaceholderOnly(text)) continue;
           const hash = computeHash(text);
           const placeholder = makePlaceholder(hash);
           candidates.push({
@@ -701,7 +712,7 @@ function selectToolResultCandidates(
     if (protectedSet.has(`${item.msgIdx}:${item.blockIdx}`)) continue;
     const text = item.text;
     if (text.length < opts.threshold) continue;
-    if (text.includes(PLACEHOLDER_PREFIX) || text.includes(LEGACY_PLACEHOLDER_PREFIX)) continue;
+    if (isPlaceholderOnly(text)) continue;
     const hash = computeHash(text);
     const placeholder = makePlaceholder(hash);
     candidates.push({
