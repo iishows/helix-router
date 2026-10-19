@@ -98,8 +98,12 @@ export function formatLogCompressSummary(
     return { text: "-", title: t("未压缩（helix 跳过或未调用）") };
   }
 
-  // 内容压缩率(chars 维度)
-  const contentRatio = ratioHeader > 0 ? ratioHeader : inputChars > 0 ? 1 - outputChars / inputChars : 0;
+  // 内容压缩率(chars 维度)—— **必须与旁边的 input/output chars 同口径**。
+  //   2026-10-19 修正:此前优先用 `ratioHeader`(`x-helix-compressor-ratio`),但它是
+  //   **候选口径**(只算入选块的占比,如 0.9935),而标题里把它贴在**整消息字符**
+  //   (input→output chars,如 44,780→14,569)旁边 → 同一行数字自相矛盾
+  //   (实为 67.5% 却显示 99.4%)。故一律由 chars 现算,不用候选 ratio。
+  const contentRatio = inputChars > 0 ? 1 - outputChars / inputChars : 0;
   const contentRatioPct = (contentRatio * 100).toFixed(1);
 
   // cell 文本:只显示"净端到端节省"百分比。

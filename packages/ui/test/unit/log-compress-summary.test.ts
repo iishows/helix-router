@@ -249,6 +249,30 @@ test("logRecallCallLeaked: 检测响应体里残留的 history_recall / hc_recal
   assert.equal(logRecallCallLeaked(entry({})), false);
 });
 
+// ============== F2(2026-10-19): 内容压缩率必须与 chars 同口径 ==============
+
+test("F2: 标题内容率按 chars 现算,不混用候选口径的 ratio header", () => {
+  const { title } = formatLogCompressSummary(
+    entry({
+      inputTokens: 100,
+      responseHeaders: {
+        "x-helix-compressor-enabled": "1",
+        "x-helix-compressor-baseline-tokens": "5000",
+        "x-helix-compressor-compressed-tokens": "2000",
+        // 候选口径 ratio(只算入选块)明显高于整消息口径
+        "x-helix-compressor-ratio": "0.9935",
+        "x-helix-compressor-input-chars": "44780",
+        "x-helix-compressor-output-chars": "14569"
+      }
+    }),
+    t
+  );
+  // 整消息口径 = 1 - 14569/44780 = 67.5%;不得显示候选口径的 99.4%
+  assert.match(title, /44,780→14,569 chars \(67\.5%\)/);
+  assert.doesNotMatch(title, /99\.4%/);
+});
+
+
 test("主动 compact: 无 entry 字段时 fallback 到 x-ccr-helix-compact-json 响应头", () => {
   const compact = logProactiveCompact(
     entry({
