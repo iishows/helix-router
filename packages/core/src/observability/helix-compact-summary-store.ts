@@ -39,6 +39,13 @@ const COMPACT_DIR_NAME = "helix-compact";
 const DEFAULT_TTL_MS = 3 * 24 * 60 * 60 * 1000;
 const COMPACT_SIZE_BYTES = 32 * 1024 * 1024;
 const MAX_LINE_READ_BYTES = 4 * 1024 * 1024;
+/**
+ * 前缀复用所需的最低同位一致率。见 `approxPrefixLength` 说明:compact 跑在
+ * helix-compressor 之后,压缩器每轮会重写 1~4 条消息的字节,严格前缀必然 miss。
+ * 线上实测(真实会话重放):严格前缀 0% 命中,≥0.95 命中 90%
+ * (0.90~0.99 区间平坦,故取 0.95)。
+ */
+const PREFIX_MATCH_MIN_RATIO = 0.95;
 
 /** 解析缓存目录:HELIX_RECALL_CACHE_DIR 下的 helix-compact 子目录。未配置则抛错。 */
 export function resolveCompactSummaryDir(): string {
@@ -174,8 +181,10 @@ export function getCompactSummary(key: string, now: number = Date.now()): Compac
 }
 
 /**
- * 查找该会话下 `messageHashes` 的**严格前缀**摘要(取覆盖条数最多的一条)。
- * 命中返回 { entry, matchedCount };未命中返回 null。
+ * 查找该会话下 `messageHashes` 的**前缀**摘要(取覆盖条数最多的一条)。
+ * 采用容差匹配(见 `approxPrefixLength`):compact 跑在 helix-compressor 之后,
+ * 压缩器逐轮重写的少量消息会让严格 hash 前缀失配,放宽到同位一致率 ≥
+ * `PREFIX_MATCH_MIN_RATIO` 才能命中。命中返回 { entry, matchedCount };未命中返回 null。
  */
 export function findPrefixSummary(
   sessionId: string,
@@ -193,10 +202,11 @@ export function findPrefixSummary(
     const entry = parseEntryLoose(readLineAt(idx.file, offsets[i]), now);
     if (!entry) continue;
     const mh = entry.messageHashes;
-    if (mh.length === 0 || mh.length >= messageHashes.length) continue;
+    if (mh.length === 0 || mh.length > messageHashes.length) continue;
     if (best && mh.length <= best.matchedCount) continue;
-    if (!isPrefix(mh, messageHashes)) continue;
-    best = { entry, matchedCount: mh.length };
+    const matched = approxPrefixLength(mh, messageHashes);
+    if (matched < 0) continue;
+    best = { entry, matchedCount: matched };
   }
   return best;
 }
@@ -223,12 +233,27 @@ export function cleanup(now: number = Date.now()): number {
 
 // ============= helpers =============
 
-function isPrefix(prefix: string[], value: string[]): boolean {
-  if (prefix.length > value.length) return false;
+/**
+ * 容差前缀:同位一致率 ≥ `PREFIX_MATCH_MIN_RATIO` 且不超出 `value` 长度。
+ * 覆盖两种线上漂移形态:① 等长重写(压缩器就地改写某条消息);
+ * ② 少量插入(个别消息字节变动导致其 hash 改变)。
+ * 返回匹配到的前缀长度(用于 matchedCount);不满足则返回 -1。
+ *
+ * 安全边界:折叠区间由历史原文的切片决定,`matchedCount` 只作为「该条摘要覆盖到哪」
+ * 的标注;若上游字节确实变了,覆盖段本就会重新进入被丢弃的前缀,不会泄漏错误摘要。
+ */
+function approxPrefixLength(prefix: string[], value: string[]): number {
+  if (prefix.length === 0 || prefix.length > value.length) return -1;
+  // 允许的最大失配位数:超过即可提前判定不达标(避免对长前缀做全量比较)。
+  const maxDiff = Math.floor(prefix.length * (1 - PREFIX_MATCH_MIN_RATIO));
+  let diff = 0;
   for (let i = 0; i < prefix.length; i += 1) {
-    if (prefix[i] !== value[i]) return false;
+    if (prefix[i] !== value[i]) {
+      diff += 1;
+      if (diff > maxDiff) return -1;
+    }
   }
-  return true;
+  return prefix.length;
 }
 
 function readLineAt(file: string, offset: number): string | undefined {

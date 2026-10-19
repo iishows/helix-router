@@ -109,9 +109,40 @@ test("findPrefixSummary: 非前缀(内容不符) → null", () => {
   assert.equal(findPrefixSummary("s1", ["a", "b", "c"]), null);
 });
 
-test("findPrefixSummary: 等长(非严格前缀) → null", () => {
+test("findPrefixSummary: 等长 → 命中(压缩器就地改写场景)", () => {
   fresh();
   putCompactSummary({ coveredCount: 3, key: "k3", messageHashes: ["a", "b", "c"], sessionId: "s1", summary: "three" });
+  const found = findPrefixSummary("s1", ["a", "b", "c"]);
+  assert.ok(found);
+  assert.equal(found.matchedCount, 3);
+  assert.equal(found.entry.summary, "three");
+});
+
+test("findPrefixSummary: 容差内近似前缀 → 命中(1/20 位不同 = 0.95)", () => {
+  fresh();
+  const stored = Array.from({ length: 20 }, (_, i) => `h${i}`);
+  const current = stored.slice();
+  current[7] = "drifted";
+  putCompactSummary({ coveredCount: 20, key: "k20", messageHashes: stored, sessionId: "s1", summary: "s" });
+
+  const found = findPrefixSummary("s1", [...current, "tail"]);
+  assert.ok(found);
+  assert.equal(found.matchedCount, 20);
+});
+
+test("findPrefixSummary: 容差外(1/10 位不同 = 0.90) → null", () => {
+  fresh();
+  const stored = Array.from({ length: 10 }, (_, i) => `h${i}`);
+  const current = stored.slice();
+  current[4] = "drifted";
+  putCompactSummary({ coveredCount: 10, key: "k10", messageHashes: stored, sessionId: "s1", summary: "s" });
+
+  assert.equal(findPrefixSummary("s1", [...current, "tail"]), null);
+});
+
+test("findPrefixSummary: 存储前缀长于当前消息(非前缀) → null", () => {
+  fresh();
+  putCompactSummary({ coveredCount: 4, key: "k4", messageHashes: ["a", "b", "c", "d"], sessionId: "s1", summary: "s" });
   assert.equal(findPrefixSummary("s1", ["a", "b", "c"]), null);
 });
 
