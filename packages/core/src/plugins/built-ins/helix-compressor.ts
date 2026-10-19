@@ -502,28 +502,61 @@ function parseConfig(value: unknown): HelixCompressorConfig {
   };
 }
 
+/**
+ * 统计 messages 的"可见字符数"(不含 role/JSON 结构开销)。
+ *
+ * ⚠️ 2026-10-19 修 bug:旧实现有两个缺陷,导致 input/output-chars 与 ratio 全是坏数:
+ *   1. **early-return**:`for` 循环里 `return total + text.length` —— 只累加第一个
+ *      text 块就返回,同一消息的后续块全部丢失(实测两 text 块 100+900 → 只算 100)。
+ *   2. **只认 `.text`**:漏掉真实 Claude Code 形状里的 `tool_result.content`(字符串或
+ *      块数组)、`tool_use.input`、`tool_calls[].function.arguments` 等 —— 一条纯
+ *      tool_result 消息会被算成 0 字符。
+ *   修复:正确累加(continue 而非 return),并覆盖 string / text / tool_result.content /
+ *   tool_use.input / 其余块的 JSON 序列化长度。
+ */
 function countChars(messages: LLMMessage[]): number {
   if (!Array.isArray(messages)) return 0;
-  return messages.reduce<number>((total, msg) => {
+  let total = 0;
+  for (const msg of messages) {
     const content = msg.content;
     if (typeof content === "string") {
-      return total + content.length;
+      total += content.length;
+      continue;
     }
     if (Array.isArray(content)) {
-      for (const block of content) {
+      for (const block of content as unknown[]) {
         if (typeof block === "string") {
-          return total + (block as string).length;
+          total += block.length;
+          continue;
         }
-        if (block && typeof block === "object") {
-          const text = (block as { text?: unknown }).text;
-          if (typeof text === "string") {
-            return total + text.length;
+        if (!block || typeof block !== "object") continue;
+        const b = block as Record<string, unknown>;
+        if (typeof b.text === "string") total += b.text.length;
+        // tool_result.content:字符串或块数组(真实 CC 形状)
+        if (typeof b.content === "string") total += b.content.length;
+        else if (Array.isArray(b.content)) {
+          for (const ib of b.content) {
+            if (typeof ib === "string") total += ib.length;
+            else if (ib && typeof ib === "object" && typeof (ib as { text?: unknown }).text === "string") {
+              total += ((ib as { text: string }).text).length;
+            }
           }
         }
+        // tool_use.input / 其余非文本块:按 JSON 长度近似
+        if (b.input !== undefined) {
+          try { total += JSON.stringify(b.input).length; } catch { /* 循环引用忽略 */ }
+        }
+        // image / document 等媒体块用 base64 data 长度
+        const src = b.source as Record<string, unknown> | undefined;
+        if (src && typeof src.data === "string") total += src.data.length;
+        else if (typeof b.data === "string") total += b.data.length;
       }
+      continue;
     }
-    return total;
-  }, 0);
+    // 兜底:非常规 content,按 JSON 长度计
+    try { total += JSON.stringify(content).length; } catch { /* ignore */ }
+  }
+  return total;
 }
 
 /**

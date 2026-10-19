@@ -140,6 +140,41 @@ test("含占位符 → 注入教学 prompt(system message 含 marker)", async ()
   assert.ok(systemText.includes("HISTORY_RECALL_INSTRUCTION_v1"), "应含 history recall 教学 marker");
 });
 
+// ===== countChars 回归(2026-10-19):tool_result/tool_use/多 text 块不得漏计 =====
+//
+// 旧 countChars 有两个 bug:early-return(只算第一个 text 块)+ 只认 .text
+// (漏 tool_result.content / tool_use.input)。导致 x-helix-compressor-input-chars
+// 严重偏低 → UI ratio / "内容 X→Y chars" 全失真。此测试锁住真实 Claude Code 形状。
+
+test("countChars: tool_result.content / tool_use.input / 多 text 块都被计入", async () => {
+  const blocky = [
+    { role: "user", content: "Q".repeat(800) },
+    // 消息块:tally 应 ≥ 5000(tool_result.content) + 2000(tool_use.input) + 300+700(text)
+    { role: "assistant", content: [
+      { type: "tool_use", id: "t1", name: "Read", input: { file: "x".repeat(2000) } },
+      { type: "text", text: "A".repeat(300) },
+      { type: "text", text: "B".repeat(700) }
+    ] },
+    { role: "user", content: [
+      { type: "tool_result", tool_use_id: "t1", content: "Z".repeat(5000) }
+    ] },
+    { role: "user", content: "final question" }
+  ];
+  const result = await helixCompressorTransform(
+    {
+      body: { model: TEST_MODEL, messages: blocky },
+      headers: {}, method: "POST", path: "/v1/messages",
+      requestId: "test-countchars-1", routedModel: TEST_MODEL, url: "/v1/messages"
+    },
+    mockContext({ pluginConfig: { keepRecentPairs: 0 } })
+  );
+  assert.ok(result);
+  const inputChars = Number(result.headers["x-helix-compressor-input-chars"]);
+  // 800 + 5000 + 2000 + 300 + 700 = 8800(含少量 JSON 结构);旧实现只算 800+300=1100
+  assert.ok(inputChars >= 8800, `input-chars 应 ≥ 8800(含所有块),实测 ${inputChars}`);
+  assert.ok(inputChars < 10000, `input-chars 不应显著超出内容量,实测 ${inputChars}`);
+});
+
 test("OpenAI 协议 body 同样改写 model(与协议无关)", async () => {
   const result = await helixCompressorTransform(
     {
