@@ -101,7 +101,6 @@ export function MainLayout({
   needsTrafficLightSafeArea,
   agentAnalysisEnabled,
   networkCaptureEnabled,
-  onOpenUpdate,
   onOpenServerSettings,
   onOpenSettings,
   onSelectNavigationItem,
@@ -109,8 +108,6 @@ export function MainLayout({
   shouldReduceMotion,
   sidebarOpen,
   toggleGatewayService,
-  updateActionBusy,
-  updateStatus,
   viewProps,
   visibleNavigation
 }: {
@@ -127,7 +124,6 @@ export function MainLayout({
   isMac: boolean;
   needsTrafficLightSafeArea: boolean;
   networkCaptureEnabled: boolean;
-  onOpenUpdate: () => void;
   onOpenServerSettings: () => void;
   onOpenSettings: () => void;
   onSelectNavigationItem: (id: NavigationId) => void;
@@ -135,8 +131,6 @@ export function MainLayout({
   shouldReduceMotion: boolean | null;
   sidebarOpen: boolean;
   toggleGatewayService: () => void;
-  updateActionBusy: boolean;
-  updateStatus: AppUpdateStatus;
   viewProps: MainViewProps;
   requestLogsEnabled: boolean;
   visibleNavigation: MainNavigationItem[];

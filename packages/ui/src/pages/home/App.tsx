@@ -37,7 +37,7 @@ import { preserveEqualPollingSnapshot, startVisiblePolling } from "./shared/poll
 import { configsEqual, createConfigSaveQueue, mergeSavedApiKeys, reconcileSavedConfig } from "./shared/config-persistence";
 import { renameProviderReferences } from "./shared/provider-references";
 import {
-  AppDialogStack, FeedbackStack, LightToast, MainLayout, OnboardingLayout, PersistenceFeedback, shouldCheckForUpdateOnOpen
+  AppDialogStack, FeedbackStack, LightToast, MainLayout, OnboardingLayout, PersistenceFeedback
 } from "./components/index";
 import { hasAvailableGatewayModels } from "@ccr/core/contracts/app";
 
@@ -972,14 +972,6 @@ function App() {
     setUpdateDialogOpen(true);
     setUpdateActionError("");
     void checkForAppUpdate();
-  }
-
-  function openSidebarUpdateDialog() {
-    setUpdateDialogOpen(true);
-    setUpdateActionError("");
-    if (shouldCheckForUpdateOnOpen(updateDialogStatus)) {
-      void checkForAppUpdate();
-    }
   }
 
   async function checkForAppUpdate() {
@@ -3238,7 +3230,6 @@ function App() {
               isMac={isMac}
               needsTrafficLightSafeArea={needsTrafficLightSafeArea}
               networkCaptureEnabled={networkCaptureEnabled}
-              onOpenUpdate={openSidebarUpdateDialog}
               onOpenServerSettings={openGeneralSettingsDialog}
               onOpenSettings={openSettingsDialog}
               onSelectNavigationItem={selectNavigationItem}
@@ -3247,8 +3238,6 @@ function App() {
               shouldReduceMotion={shouldReduceMotion}
               sidebarOpen={sidebarOpen}
               toggleGatewayService={toggleGatewayService}
-              updateActionBusy={Boolean(updateActionBusy)}
-              updateStatus={updateDialogStatus}
               visibleNavigation={visibleNavigation}
               viewProps={{
                 apiKeys: {

@@ -48,15 +48,12 @@ test("sidebar navigation scrolls vertically without displacing the settings foot
       networkCaptureEnabled={false}
       onOpenServerSettings={() => undefined}
       onOpenSettings={() => undefined}
-      onOpenUpdate={() => undefined}
       onSelectNavigationItem={() => undefined}
       onToggleSidebar={() => undefined}
       requestLogsEnabled={false}
       shouldReduceMotion={true}
       sidebarOpen
       toggleGatewayService={() => undefined}
-      updateActionBusy={false}
-      updateStatus={fallbackUpdateStatus}
       viewProps={{} as never}
       visibleNavigation={navigation}
     />
