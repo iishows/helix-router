@@ -374,3 +374,38 @@ test("OpenAI and Anthropic HISTORY schemas have equivalent field semantics", () 
   );
   assert.deepEqual(openaiParams.required, anthropicSchema.required, "required 字段必须一致");
 });
+
+test("entryFitsBudget veto prevents orphan placeholders end-to-end", async () => {
+  const { compressV3x } = await import("@ccr/core/plugins/built-ins/helix-compressor/hc-local.ts");
+  const { entryFitsBudget, putBatch, get } = await import("@ccr/core/observability/helix-recall-local-store.ts");
+
+  // 7M CJK chars: under the compressor's 16M *char* cap, but ~21MB > the store's
+  // 20MB *byte* cap. This is the char/byte unit mismatch that produced the bug.
+  const cjk = "中".repeat(7_000_000);
+  assert.ok(cjk.length < 16_000_000, "must pass the compressor char cap");
+  assert.ok(Buffer.byteLength(cjk, "utf-8") > 20 * 1024 * 1024, "must exceed the byte cap");
+
+  // keepRecentPairs protects the last pair, so the oversized first pair is the candidate.
+  const messages = [
+    { role: "user", content: cjk },
+    { role: "assistant", content: "answer one" },
+    { role: "user", content: "small follow up" },
+    { role: "assistant", content: "answer two" }
+  ];
+
+  // 未注入预检:候选被选中并写入占位符 —— 但存储层随后会拒收,占位符永远读不回。
+  const ungated = compressV3x(messages, {});
+  assert.equal(Object.keys(ungated.hashMap).length, 1, "fixture must select the oversized pair");
+  assert.ok(JSON.stringify(ungated.messages).includes("\u27e6QA:"), "ungated run emits a placeholder");
+  const droppedHash = Object.keys(ungated.hashMap)[0];
+  assert.equal(putBatch([[droppedHash, ungated.hashMap[droppedHash]]]), 0, "store refuses it");
+  assert.equal(get(droppedHash), null, "…and it is therefore unrecallable");
+
+  // 注入预检(生产路径):同一候选在替换占位符前被拦下,消息里不留任何孤儿。
+  const gated = compressV3x(messages, { entryFitsBudget });
+  assert.deepEqual(Object.keys(gated.hashMap), [], "vetoed entry must not enter hashMap");
+  assert.ok(
+    !JSON.stringify(gated.messages).includes("\u27e6QA:"),
+    "no placeholder may appear for an entry the store would reject"
+  );
+});

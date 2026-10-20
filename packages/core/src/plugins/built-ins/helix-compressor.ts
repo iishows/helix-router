@@ -26,6 +26,7 @@ import { compressV3x, type LocalCompressMessage } from "@ccr/core/plugins/built-
 import {
   putBatch as putRecallCacheBatch,
   batchGet as batchGetRecallCache,
+  entryFitsBudget,
   type RecallCacheEntry
 } from "@ccr/core/observability/helix-recall-local-store";
 import { HELIX_RECALL_DIR } from "@ccr/core/config/constants";
@@ -342,7 +343,10 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
         compressToolResults: config.compressToolResults !== false,
         toolResultThresholdChars: config.toolResultThresholdChars,
         keepRecentToolResults: config.keepRecentToolResults,
-        maxCompressToolResults: config.maxCompressToolResults
+        maxCompressToolResults: config.maxCompressToolResults,
+        // 与 putBatch 同源(同一序列化 + 同一字节上限):超过上限的条目在替换占位符前
+        // 就被跳过,保证凡出现在消息里的 ⟦HC:hash⟧ 都必然可读回。
+        entryFitsBudget
       });
       const cacheEntries = Object.entries(local.hashMap);
       if (cacheEntries.length > 0) {
@@ -350,7 +354,14 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
         try {
           // 缓存目录默认 {DATADIR}/helix-recall;若外部已通过环境变量指定则由 store 读取该值。
           ensureLocalRecallCacheDir();
-          putRecallCacheBatch(cacheEntries as Array<[string, RecallCacheEntry]>);
+          const written = putRecallCacheBatch(cacheEntries as Array<[string, RecallCacheEntry]>);
+          if (written < cacheEntries.length) {
+            // 预检已按同一字节上限过滤,走到这里说明两处口径意外分叉 — 明确指出,
+            // 否则表现为"占位符在但召不回"的静默数据丢失。
+            context.logger.warn(
+              `[helix-compressor] recall cache dropped ${cacheEntries.length - written}/${cacheEntries.length} entries (over byte budget); placeholders may be unrecallable`
+            );
+          }
         } catch (cacheErr) {
           context.logger.warn(`[helix-compressor] local cache write failed: ${(cacheErr as Error).message}`);
         }

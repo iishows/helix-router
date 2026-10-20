@@ -20,7 +20,8 @@ export interface RecallCacheEntry {
   q: string;
   a: string;
   blockOnly?: boolean;
-  kind?: "text" | "media";
+  /** "tool_result" 由 helix-compressor 的块候选写入(见 hc-local.ts HashMapEntry)。 */
+  kind?: "text" | "media" | "tool_result";
   msgIdx?: number;
   blockIdx?: number;
   qIdx?: number;
@@ -37,9 +38,14 @@ const COMPACT_SIZE_BYTES = 64 * 1024 * 1024;
  * 从而保证"凡写入的必然可读回"。
  *
  * 取值须覆盖 helix-compressor 的媒体上限 `MEDIA_CONTAINER_PARSE_MAX_CHARS`
- * (16,000,000 字符;base64 属 ASCII,故 1 字符≈1 字节),留出结构开销后取 20MB。
+ * (16,000,000 字符),留出结构开销后取 20MB。
+ *
+ * 注意:媒体是 base64(ASCII,1 字符≈1 字节),但同一张表也存**任意 UTF-8 文本**条目
+ * (CJK 约 3 字节/字符)。因此字节预算不能由字符上限直接推导 —— 调用方必须用
+ * `entryFitsBudget()` 按**序列化后的真实字节数**判定,否则会出现"压缩器按字符放行、
+ * 存储层按字节拒收"的错配,留下永远读不回的孤儿占位符。
  */
-const MAX_ENTRY_BYTES = 20 * 1024 * 1024;
+export const MAX_ENTRY_BYTES = 20 * 1024 * 1024;
 /** 读取预算 = 条目上限 + 余量,确保任何合法写入(含结尾换行)都能读到行尾。 */
 const MAX_LINE_READ_BYTES = MAX_ENTRY_BYTES + 64 * 1024;
 
@@ -157,6 +163,33 @@ function extractHash(lineBuf: Buffer): string | undefined {
 
 // ============= public API =============
 
+/**
+ * 条目 → JSONL 行(含结尾换行)。`putBatch` 与调用方预检(`entryFitsBudget`)共用同一实现,
+ * 从而保证"预检判定为可写"与"实际写入"在字节数上完全一致,不会因两处格式漂移而错配。
+ */
+export function serializeEntryLine(
+  hash: string,
+  content: RecallCacheEntry,
+  now: number,
+  expiresAt: number
+): string {
+  return JSON.stringify({ h: hash, c: content, t: now, e: expiresAt }) + "\n";
+}
+
+/**
+ * 该条目写入后是否会被 `putBatch` 接受。
+ *
+ * 供压缩器在**替换占位符之前**调用:凡返回 false 的条目一律不得写入占位符,
+ * 否则消息里会留下一个永远读不回的孤儿 ⟦HC:hash⟧。
+ *
+ * 用定宽时间戳探测:`t`/`e` 真实值恒为 13 位毫秒数,固定值保证预检与真实写入同宽。
+ */
+const PROBE_TIMESTAMP = 9_999_999_999_999;
+export function entryFitsBudget(hash: string, content: RecallCacheEntry): boolean {
+  const line = serializeEntryLine(hash, content, PROBE_TIMESTAMP, PROBE_TIMESTAMP);
+  return Buffer.byteLength(line, "utf-8") <= MAX_ENTRY_BYTES;
+}
+
 /** 追加写入(内容寻址,幂等)。返回写入条数。 */
 export function putBatch(entries: Array<[string, RecallCacheEntry]>, ttlMs: number = DEFAULT_TTL_MS): number {
   if (!entries || entries.length === 0) return 0;
@@ -170,8 +203,9 @@ export function putBatch(entries: Array<[string, RecallCacheEntry]>, ttlMs: numb
   let written = 0;
   for (const [hash, content] of entries) {
     if (typeof hash !== "string" || !hash) continue;
-    const line = JSON.stringify({ h: hash, c: content, t: now, e: expiresAt }) + "\n";
+    const line = serializeEntryLine(hash, content, now, expiresAt);
     // 与 readLineAt 共用 MAX_ENTRY_BYTES:超限条目宁可丢弃,也不写入一条永远读不回的记录。
+    // 调用方应先经 entryFitsBudget 预检,避免这里丢弃后留下孤儿占位符。
     if (Buffer.byteLength(line, "utf-8") > MAX_ENTRY_BYTES) continue;
     lines += line;
     written++;

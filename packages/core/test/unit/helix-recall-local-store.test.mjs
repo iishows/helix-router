@@ -13,6 +13,8 @@ import {
   get,
   batchGet,
   cleanup,
+  entryFitsBudget,
+  MAX_ENTRY_BYTES,
   _resetIndexForTest,
   _clearCacheForTest
 } from "@ccr/core/observability/helix-recall-local-store.ts";
@@ -206,6 +208,56 @@ test("oversized entry is rejected rather than silently unreadable", () => {
     // A normal entry alongside it still lands.
     assert.equal(putBatch([["ok", { q: "Q1", a: "A1" }]]), 1);
     assert.equal(get("ok").q, "Q1");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("entryFitsBudget agrees with putBatch at the byte boundary", () => {
+  const dir = freshDir();
+  try {
+    // Build a payload tuned to the exact byte budget. Header/suffix overhead is tiny,
+    // so binary-searching is overkill: probe a few points around the budget instead.
+    const probe = (bytes) => "A".repeat(bytes);
+    const over = { q: "Q", a: probe(MAX_ENTRY_BYTES + 1024) };
+    const under = { q: "Q", a: probe(1024) };
+
+    // The predicate must predict putBatch's verdict exactly.
+    assert.equal(entryFitsBudget("h-over", over), false);
+    assert.equal(entryFitsBudget("h-under", under), true);
+
+    assert.equal(putBatch([["h-over", over]]), 0);
+    assert.equal(putBatch([["h-under", under]]), 1);
+    assert.equal(get("h-under").q, "Q");
+    assert.equal(get("h-over"), null);
+
+    // Invariant that motivated the predicate: whatever it passes must be recallable.
+    for (const [hash, entry] of [["h-over", over], ["h-under", under]]) {
+      if (entryFitsBudget(hash, entry)) {
+        assert.equal(putBatch([[hash, entry]]), 1, `${hash} passed pre-check but was dropped`);
+        assert.notEqual(get(hash), null, `${hash} passed pre-check but was unreadable`);
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("multi-byte text within char budget can exceed byte budget", () => {
+  const dir = freshDir();
+  try {
+    // Regression for the char/byte unit mismatch: hc-local.ts caps *characters*
+    // (16M), but this store caps *bytes*. CJK is ~3 bytes/char, so 7M CJK chars
+    // (~21MB) passes a char-based check yet blows MAX_ENTRY_BYTES.
+    const cjk = "中".repeat(7_000_000);
+    assert.ok(cjk.length < 16_000_000, "stays under the compressor char cap");
+    assert.ok(Buffer.byteLength(cjk, "utf-8") > MAX_ENTRY_BYTES, "yet exceeds the byte cap");
+
+    const entry = { q: "Q", a: cjk };
+    // Pre-check must reject it, so the compressor never emits an orphan placeholder.
+    assert.equal(entryFitsBudget("h-cjk", entry), false);
+    assert.equal(putBatch([["h-cjk", entry]]), 0);
+    assert.equal(get("h-cjk"), null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

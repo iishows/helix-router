@@ -797,3 +797,25 @@ test("a genuine image data-URL tool output IS recognised as media", () => {
   const kinds = Object.values(r.hashMap).map((e) => e.kind);
   assert.ok(kinds.includes("media"), `expected media, got ${JSON.stringify(kinds)}`);
 });
+
+test("entryFitsBudget veto prevents orphan placeholders", () => {
+  // Every emitted placeholder must correspond to a hashMap entry that the store would
+  // actually accept. Simulate a byte-budget veto and assert no placeholder leaks through.
+  const big = "B".repeat(64 * 1024);
+  const history = toolMsgHistory(big);
+
+  const baseline = compressV3x(history, { keepRecentToolResults: 0 });
+  assert.ok(Object.keys(baseline.hashMap).length > 0, "fixture must produce a candidate");
+
+  const vetoAll = compressV3x(history, { keepRecentToolResults: 0, entryFitsBudget: () => false });
+  assert.deepEqual(Object.keys(vetoAll.hashMap), [], "vetoed entries must not enter hashMap");
+
+  // The vetoed run must not have swapped in any placeholder it cannot back with an entry.
+  const asText = JSON.stringify(vetoAll.messages ?? []);
+  for (const hash of Object.keys(baseline.hashMap)) {
+    assert.ok(
+      !asText.includes(hash),
+      `hash ${hash} appears in messages but was vetoed — orphan placeholder`
+    );
+  }
+});

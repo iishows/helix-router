@@ -115,6 +115,17 @@ export interface CompressV3xOptions {
    * 置 false 可复现云端原始行为(用于金值比对测试)。
    */
   protectFinalUserQuestion?: boolean;
+  /**
+   * 写入前的字节预算预检:返回 false 的条目**不得**写入占位符。
+   *
+   * 由调用方(helix-compressor.ts)注入 `entryFitsBudget` → 命中与 putBatch 完全相同的
+   * 序列化与字节上限。缺省视为"全部放行",保持本模块零依赖(纯金值比对端口)。
+   *
+   * 为什么必须在这里拦:存储层按**字节**拒收超限条目,而本模块的上限按**字符**
+   * (媒体 16M 字符是 base64,ASCII 下 1:1;但 pair 文本是任意 UTF-8,CJK≈3 字节/字符)。
+   * 若只在存储层丢弃,消息里已替换的 ⟦HC:hash⟧ 就成了永远读不回的孤儿。
+   */
+  entryFitsBudget?: (hash: string, entry: HashMapEntry) => boolean;
 }
 
 // ============= 基础算法（对齐 hc.js:39-48）=============
@@ -893,6 +904,7 @@ export function compressV3x(
       : DEFAULT_MAX_COMPRESS_TOOL_RESULTS;
   // 本地修正默认开启(设计稿 §4.4)
   const protectFinalUserQuestion = options.protectFinalUserQuestion !== false;
+  const entryFitsBudget = options.entryFitsBudget;
 
   if (!Array.isArray(messages) || messages.length === 0) {
     return { messages: messages || [], hashMap: {}, stats: emptyStats() };
@@ -982,8 +994,11 @@ export function compressV3x(
       for (const bc of blockCandidates) {
         const m = newMessages[bc.msgIdx];
         if (!m) continue;
+        const entry = blockCandidateEntry(bc);
+        // 同下方主循环:预检不通过则整条跳过,绝不留下读不回的孤儿占位符。
+        if (entryFitsBudget && !entryFitsBudget(bc.hash, entry)) continue;
         applyBlockCandidate(m, bc);
-        newHashMap[bc.hash] = blockCandidateEntry(bc);
+        newHashMap[bc.hash] = entry;
         blockOrigTotal += bc.originalLen;
         blockPlaceholderTotal += bc.placeholderLen;
         blockCompressedCount++;
@@ -1058,13 +1073,17 @@ export function compressV3x(
   for (const c of chosen) {
     const qMsg = messages[c.qIdx];
     const qMedia = storeMedia ? extractMediaBlocks(qMsg?.content) : null;
-    hashMap[c.hash] = {
+    const entry: HashMapEntry = {
       q: c.text,
       a: (messages[c.aIdx]?.content as string) || "",
       ...(qMedia ? { qMedia } : {}),
       qIdx: c.qIdx,
       aIdx: c.aIdx
     };
+    // 写入预算预检:存储层按字节拒收超限条目,故这里必须在替换占位符**之前**拦住,
+    // 否则消息里会留下一个永远读不回的孤儿 ⟦HC:hash⟧。
+    if (entryFitsBudget && !entryFitsBudget(c.hash, entry)) continue;
+    hashMap[c.hash] = entry;
     if (c.toolBoundary) {
       // 本地修正:含 tool_use 的 pair → 只压缩 text 块,保留 tool_use /
       //   tool_result 块;pair 连同其依赖的 tool_result 一起压,避免孤儿。
@@ -1121,8 +1140,12 @@ export function compressV3x(
     for (const bc of blockCandidates) {
       const m = filteredMessages[bc.msgIdx];
       if (!m) continue;
+      const entry = blockCandidateEntry(bc);
+      // 必须先于 applyBlockCandidate 判定:后者会就地改写消息,一旦预检不通过再回滚
+      // 反而更易出错。不通过则整条候选跳过,消息保持原文。
+      if (entryFitsBudget && !entryFitsBudget(bc.hash, entry)) continue;
       applyBlockCandidate(m, bc);
-      hashMap[bc.hash] = blockCandidateEntry(bc);
+      hashMap[bc.hash] = entry;
       blockOrigTotal += bc.originalLen;
       blockPlaceholderTotal += bc.placeholderLen;
       blockCompressedCount++;
