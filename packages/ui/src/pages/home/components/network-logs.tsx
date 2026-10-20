@@ -1832,21 +1832,36 @@ function useLogBodyWorkerView(
     };
 
     worker.onerror = (event) => {
+      // A worker killed by the platform (OOM) reports an empty `message`; keep the
+      // location when there is one so the failure is diagnosable instead of opaque.
+      // https://github.com/anthropics/claude-code/issues/1694
+      const detail = typeof event.message === "string" && event.message.length > 0
+        ? event.message
+        : [event.filename, event.lineno ? `${event.lineno}:${event.colno ?? 0}` : ""].filter(Boolean).join(":");
       setBodyView((current) => current.bodyKey === bodyKey && current.mode === mode
-        ? { ...current, error: event.message || "Body formatter worker failed.", loading: false }
+        ? { ...current, error: detail || "Body formatter worker failed.", loading: false }
         : current);
     };
 
-    worker.postMessage({
-      body,
-      bodyKey,
-      id: formatRequestId,
-      kind: "format",
-      largeTextThreshold: logBodyLargeTextThreshold,
-      mode,
-      previewTextLimit: logBodyPreviewTextLimit,
-      query: latestQueryRef.current
-    });
+    try {
+      worker.postMessage({
+        body,
+        bodyKey,
+        id: formatRequestId,
+        kind: "format",
+        largeTextThreshold: logBodyLargeTextThreshold,
+        mode,
+        previewTextLimit: logBodyPreviewTextLimit,
+        query: latestQueryRef.current
+      });
+    } catch (error) {
+      setBodyView({
+        ...initial,
+        error: error instanceof Error ? error.message : String(error),
+        loading: false,
+        visible: initial.visible || (error instanceof Error ? error.message : String(error))
+      });
+    }
 
     return () => {
       if (workerRef.current === worker) {

@@ -79,3 +79,47 @@ test("preview mode truncates an over-large JSON text body instead of parsing it"
   assert.ok(view.text.length < hugeText.length, "should be truncated");
   assert.match(view.text, /characters omitted from preview/);
 });
+
+test("full mode falls back to raw text above the parse limit instead of cloning the JSON tree", () => {
+  const hugeText = JSON.stringify({
+    model: "test-model",
+    messages: Array.from({ length: 8000 }, (_, i) => ({
+      role: i % 2 === 0 ? "user" : "assistant",
+      content: `message body number ${i} `.repeat(20)
+    }))
+  });
+  assert.ok(hugeText.length > 1024 * 1024, "fixture should exceed the full parse limit");
+
+  const body: RequestLogBody = {
+    bodyRef: "huge-full-json-body",
+    contentType: "application/json",
+    encoding: "utf8",
+    preview: false,
+    sizeBytes: hugeText.length,
+    text: hugeText,
+    truncated: false
+  };
+
+  const view = formatLogBodyForWorker(body, "full");
+  // No JSON tree is built (that is the path that OOM-kills the worker) -- but the
+  // body is still fully readable, and the UI must not mark it as a preview.
+  assert.equal(view.json, undefined);
+  assert.equal(view.preview, false);
+  assert.equal(view.text, hugeText);
+});
+
+test("full mode still builds the JSON tree below the parse limit", () => {
+  const body: RequestLogBody = {
+    bodyRef: "small-full-json-body",
+    contentType: "application/json",
+    encoding: "utf8",
+    preview: false,
+    sizeBytes: 128,
+    text: JSON.stringify({ model: "test-model" }),
+    truncated: false
+  };
+
+  const view = formatLogBodyForWorker(body, "full");
+  assert.equal(view.preview, false);
+  assert.deepEqual(view.json, { model: "test-model" });
+});
