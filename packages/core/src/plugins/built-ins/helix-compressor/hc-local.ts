@@ -164,12 +164,41 @@ function isPlaceholderOnly(text: string): boolean {
  */
 const NESTED_BLOCK_PARSE_MAX_CHARS = 1_000_000;
 
+/**
+ * 媒体容器字符串的解析硬上限。
+ *
+ * 真实流量里"块数组 JSON 字符串"若含 base64 图片,单条可达数 MB(实测 1.2MB 的
+ * base64 PNG),必然超过 NESTED_BLOCK_PARSE_MAX_CHARS —— 但它是**合法媒体容器**,
+ * 不该被通用上限误杀(误杀后整条图被文本/tool_result pass 折成占位符,图片永远
+ * 压缩不掉,实测只省 1.4%)。故对"头部含媒体块标记"的超大字符串放行解析;
+ * 同时保留一个绝对天花板:超过此值一律放弃,避免解析分配打爆堆。
+ */
+const MEDIA_CONTAINER_PARSE_MAX_CHARS = 16_000_000;
+
+/** 头部探测窗口:只看前 64KB 即可判定是否为媒体容器,避免全串扫描。 */
+const MEDIA_HEAD_SCAN_CHARS = 64 * 1024;
+const MEDIA_TYPE_HEAD_RE = /"type"\s*:\s*"(?:image|image_url|document|video|audio)"/;
+
+/**
+ * 头部快速判定:该块数组字符串前 64KB 是否已出现媒体块类型标记。
+ * 恒为 O(1)(固定窗口),与字符串总长无关。
+ */
+function looksLikeMediaBlockArray(trimmed: string): boolean {
+  return MEDIA_TYPE_HEAD_RE.test(trimmed.slice(0, MEDIA_HEAD_SCAN_CHARS));
+}
+
 function normalizeContentBlocks(content: unknown): Array<Record<string, unknown>> | null {
   if (Array.isArray(content)) return content as Array<Record<string, unknown>>;
   if (typeof content !== "string") return null;
   const trimmed = content.trim();
   if (!trimmed.startsWith("[")) return null;
-  if (trimmed.length > NESTED_BLOCK_PARSE_MAX_CHARS) return null;
+  if (trimmed.length > NESTED_BLOCK_PARSE_MAX_CHARS) {
+    // 超大字符串:仅当"头部含媒体标记"且"未超媒体硬上限"时才放行解析。
+    // 通用大数组(如几十万行带 `type` 的 JSON 记录)不含媒体标记,仍在 1MB 处放弃,
+    // OOM 防护不受影响。
+    if (trimmed.length > MEDIA_CONTAINER_PARSE_MAX_CHARS) return null;
+    if (!looksLikeMediaBlockArray(trimmed)) return null;
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(trimmed);

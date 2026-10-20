@@ -687,6 +687,79 @@ test("oversized JSON-array tool output is not parsed / stays tool_result", () =>
   assert.ok(kinds.includes("tool_result"), `expected tool_result, got ${JSON.stringify(kinds)}`);
 });
 
+// ============= 回归:含 base64 大图的媒体容器字符串必须被压缩(不再被 1MB 上限误杀) =============
+// 真实故障:OpenAI 形状 role:"tool" 的 content 是"块数组 JSON 字符串",内含一张
+// 1.2MB 的 base64 PNG,字符串总长 > NESTED_BLOCK_PARSE_MAX_CHARS(1MB) → 旧实现
+// 放弃解析 → 图片对媒体 pass 不可见 → 被 tool_result pass 折成文本占位符,整条
+// 请求只省 ~1.4%(实测 compression_ratio=0.9966)。修复:头部含媒体标记的容器字符串
+// 放行解析(仍受 MEDIA_CONTAINER_PARSE_MAX_CHARS 硬上限保护)。
+// 注意:媒体 pass 不受 keepRecentToolResults 约束;旧实现下 kRT=2 时该图落在"最近
+// 两条工具结果"内,同时被回退保护跳过,故线上默认配置(kRT=2)必然命中此 bug。
+
+function bigImageContainer(dataChars) {
+  const data = "iVBORw0KGgoAAAANSUhEUg".repeat(Math.ceil(dataChars / 21)).slice(0, dataChars);
+  return JSON.stringify([{ type: "image", source: { type: "base64", media_type: "image/png", data } }]);
+}
+
+test("oversized media-container string is compressed and stays recallable", () => {
+  const imgJson = bigImageContainer(1_215_252);
+  assert.ok(imgJson.length > 1_000_000, "fixture 必须超过通用解析上限");
+
+  const msgs = [{ role: "system", content: "sys" }, { role: "user", content: "hello" }];
+  for (let k = 0; k < 13; k++) {
+    msgs.push({ role: "assistant", content: `call ${k}`, tool_calls: [{ id: `t${k}` }] });
+    // 图片落在倒数第 2 条工具结果(与线上一致):kRT=2 时会落进回退保护窗口。
+    msgs.push({
+      role: "tool",
+      tool_call_id: `t${k}`,
+      content: k === 11 ? imgJson : "x".repeat(3000) + " out " + k
+    });
+  }
+  msgs.push({ role: "user", content: "next?" });
+
+  const before = JSON.stringify(msgs).length;
+  const r = compressV3x(msgs, {
+    keepRecentToolResults: 2,
+    compressMedia: true,
+    compressToolResults: true,
+    toolResultThresholdChars: 1000,
+    blockThresholdChars: 0,
+    keepRecentPairs: 1
+  });
+  const after = JSON.stringify(r.messages).length;
+  const savedRatio = 1 - after / before;
+
+  assert.ok(savedRatio > 0.9, `大图必须被压掉(实测仅省 ${(savedRatio * 100).toFixed(1)}%)`);
+
+  const mediaEntries = Object.values(r.hashMap).filter((e) => e.kind === "media");
+  assert.equal(mediaEntries.length, 1, `图片必须作为 media 块压缩,而非文本: ${JSON.stringify(Object.values(r.hashMap).map((e) => e.kind))}`);
+  // 召回保真:qMedia 携带真实 image 块(base64),而非占位符文本。
+  const qMedia = mediaEntries[0].qMedia;
+  assert.ok(Array.isArray(qMedia) && qMedia.length === 1, "qMedia 必须携带全部媒体块");
+  assert.equal(qMedia[0].type, "image");
+  assert.equal(qMedia[0].source.media_type, "image/png");
+  assert.ok(String(qMedia[0].source.data).length > 1_000_000, "召回必须带回原始 base64 数据");
+});
+
+test("media-container string beyond absolute ceiling is still refused", () => {
+  const imgJson = bigImageContainer(17_000_000);
+  assert.ok(imgJson.length > 16_000_000, "fixture 必须超过媒体硬上限");
+  const r = compressV3x(
+    [
+      { role: "system", content: "sys" },
+      { role: "user", content: "u1 " + "x".repeat(6000) },
+      { role: "assistant", content: "a1 " + "y".repeat(6000) },
+      { role: "assistant", content: [{ type: "tool_use", id: "c2", name: "Bash", input: {} }] },
+      { role: "tool", tool_call_id: "c2", content: imgJson },
+      { role: "user", content: "go" },
+      { role: "assistant", content: "ok" }
+    ],
+    { keepRecentToolResults: 0 }
+  );
+  const kinds = Object.values(r.hashMap).map((e) => e.kind);
+  assert.ok(!kinds.includes("media"), `超过媒体硬上限必须放弃解析: ${JSON.stringify(kinds)}`);
+});
+
 // ============= V1.13 回归:字符串"伪媒体"不得误判为图片 =============
 // mediaBlockFromString 只接受自证媒体的 `data:<image|video|audio>;base64,`。
 // 裸 http(s) URL(内容类型未知)与 `data:text/plain;base64,` 都是文本,必须保持纯文本,
