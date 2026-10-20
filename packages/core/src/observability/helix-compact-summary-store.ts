@@ -38,7 +38,14 @@ const CACHE_FILE_NAME = "summaries.jsonl";
 const COMPACT_DIR_NAME = "helix-compact";
 const DEFAULT_TTL_MS = 3 * 24 * 60 * 60 * 1000;
 const COMPACT_SIZE_BYTES = 32 * 1024 * 1024;
-const MAX_LINE_READ_BYTES = 4 * 1024 * 1024;
+/**
+ * 单条记录(一行 JSONL,不含换行)的硬上限,写入与读取共用同一真源:
+ * `putCompactSummary` 拒绝超过它的条目,`readLineAt` 的读取预算由它推导。
+ * 摘要为模型生成文本(远小于 4MB),该上限只用于保证"写进去的必定读得回"。
+ */
+const MAX_ENTRY_BYTES = 4 * 1024 * 1024;
+/** 读取预算 = 条目上限 + 余量,确保任何合法写入(含结尾换行)都能读到行尾。 */
+const MAX_LINE_READ_BYTES = MAX_ENTRY_BYTES + 64 * 1024;
 /**
  * 前缀复用所需的最低同位一致率。见 `approxPrefixLength` 说明:compact 跑在
  * helix-compressor 之后,压缩器每轮会重写 1~4 条消息的字节,严格前缀必然 miss。
@@ -199,6 +206,8 @@ export function putCompactSummary(entry: CompactSummaryEntry, ttlMs: number = DE
     sum: entry.summary,
     t: entry.createdAt ?? now
   }) + "\n";
+  // 与 readLineAt 共用 MAX_ENTRY_BYTES:超限条目宁可拒收,也不写入一条永远读不回的记录。
+  if (Buffer.byteLength(line, "utf-8") > MAX_ENTRY_BYTES) return false;
   appendFileSync(idx.file, line, "utf-8");
   // 不作废索引:ensureIndex 会按新文件大小增量续扫(只读刚追加的这几行)。
   // 原先无条件置 index=undefined 会让下一次读全量重建(80MB 文件实测 ~530ms/请求)。
@@ -336,7 +345,9 @@ function readLineAt(file: string, offset: number): string | undefined {
       pos += n;
       total += n;
     }
-    return chunks.length ? Buffer.concat(chunks).toString("utf-8") : undefined;
+    // 预算内未见换行 ⇒ 这不是一条完整记录(损坏/超限)。宁可判为未命中,
+    // 也不再返回半截 JSON。
+    return undefined;
   } catch {
     return undefined;
   } finally {

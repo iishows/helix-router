@@ -31,7 +31,17 @@ export interface RecallCacheEntry {
 const CACHE_FILE_NAME = "cache.jsonl";
 const DEFAULT_TTL_MS = 3 * 24 * 60 * 60 * 1000;
 const COMPACT_SIZE_BYTES = 64 * 1024 * 1024;
-const MAX_LINE_READ_BYTES = 8 * 1024 * 1024;
+/**
+ * 单条记录(一行 JSONL,不含换行)的硬上限。这是**写入与读取共用的唯一真源**:
+ * `putBatch` 拒绝超过它的条目,`readLineAt` 的读取预算由它推导 —— 两者不会各自漂移,
+ * 从而保证"凡写入的必然可读回"。
+ *
+ * 取值须覆盖 helix-compressor 的媒体上限 `MEDIA_CONTAINER_PARSE_MAX_CHARS`
+ * (16,000,000 字符;base64 属 ASCII,故 1 字符≈1 字节),留出结构开销后取 20MB。
+ */
+const MAX_ENTRY_BYTES = 20 * 1024 * 1024;
+/** 读取预算 = 条目上限 + 余量,确保任何合法写入(含结尾换行)都能读到行尾。 */
+const MAX_LINE_READ_BYTES = MAX_ENTRY_BYTES + 64 * 1024;
 
 /** 解析缓存目录:优先环境变量,否则抛错(调用方须显式提供)。 */
 export function resolveCacheDir(): string {
@@ -157,16 +167,21 @@ export function putBatch(entries: Array<[string, RecallCacheEntry]>, ttlMs: numb
 
   const idx = ensureIndex();
   let lines = "";
+  let written = 0;
   for (const [hash, content] of entries) {
     if (typeof hash !== "string" || !hash) continue;
-    lines += JSON.stringify({ h: hash, c: content, t: now, e: expiresAt }) + "\n";
+    const line = JSON.stringify({ h: hash, c: content, t: now, e: expiresAt }) + "\n";
+    // 与 readLineAt 共用 MAX_ENTRY_BYTES:超限条目宁可丢弃,也不写入一条永远读不回的记录。
+    if (Buffer.byteLength(line, "utf-8") > MAX_ENTRY_BYTES) continue;
+    lines += line;
+    written++;
   }
   if (!lines) return 0;
   appendFileSync(idx.file, lines, "utf-8");
   // 追加后使索引失效(下次读重建/续扫)
   index = undefined;
   maybeCompact(idx.dir);
-  return entries.length;
+  return written;
 }
 
 /** 读取单条(hash → 原文)。未命中 / 过期 → null。 */
@@ -237,7 +252,9 @@ function readLineAt(file: string, offset: number): string | undefined {
       pos += n;
       total += n;
     }
-    return chunks.length ? Buffer.concat(chunks).toString("utf-8") : undefined;
+    // 预算内未见换行 ⇒ 这不是一条完整记录(损坏/超限)。宁可判为未命中,
+    // 也不再返回半截 JSON —— 半截行只会让 parseEntry 静默失败,掩盖真实原因。
+    return undefined;
   } catch {
     return undefined;
   } finally {

@@ -176,3 +176,37 @@ test("empty putBatch is a no-op", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("multi-MB media entry round-trips (8-16MB regression)", () => {
+  const dir = freshDir();
+  try {
+    // The helix-compressor media ceiling is 16MB of chars; before the fix an 8MB+
+    // entry was accepted by putBatch but silently unreadable (readLineAt truncated
+    // at 8MB and returned half-JSON). Written must always be readable.
+    for (const mb of [6, 9, 16]) {
+      const hash = `media-${mb}mb`;
+      const data = "A".repeat(mb * 1024 * 1024);
+      assert.equal(putBatch([[hash, { q: "Q", a: "A", kind: "media", qMedia: [{ type: "image", data }] }]]), 1, `${mb}MB must be accepted`);
+      const got = get(hash);
+      assert.ok(got, `${mb}MB entry must be readable back`);
+      assert.equal(got.qMedia[0].data.length, data.length, `${mb}MB payload must be intact`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("oversized entry is rejected rather than silently unreadable", () => {
+  const dir = freshDir();
+  try {
+    // Beyond MAX_ENTRY_BYTES: must be refused (count 0), not appended and lost.
+    const data = "A".repeat(24 * 1024 * 1024);
+    assert.equal(putBatch([["too-big", { q: "Q", a: "A", qMedia: [{ type: "image", data }] }]]), 0);
+    assert.equal(get("too-big"), null);
+    // A normal entry alongside it still lands.
+    assert.equal(putBatch([["ok", { q: "Q1", a: "A1" }]]), 1);
+    assert.equal(get("ok").q, "Q1");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
