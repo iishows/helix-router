@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-20T00:54:51.921Z",
+  "generatedAt": "2026-10-20T23:49:58.986Z",
   "generatedBy": "scripts/generate-claude-code-config-options.mjs",
   "sourceUrls": {
     "envEn": "https://code.claude.com/docs/en/env-vars.md",
@@ -246,7 +246,7 @@
       "path": [
         "appendPlugins"
       ],
-      "scope": "User or managed. Claude Code reads the key from managed settings. It reads the key from user settings only on a machine with no managed settings, for a user who isn't signed in with a Team or Enterprise plan. It ignores the key in project and local settings and in a --settings file.",
+      "scope": "User or managed. Claude Code reads the key from managed settings. It reads the key from user settings only on a machine with no managed settings, in a session whose credential isn't a Team or Enterprise /login. It ignores the key in project and local settings and in a --settings file.",
       "type": "array of plugin-name@marketplace-name strings",
       "default": "unset",
       "example": "{\n  \"extraKnownMarketplaces\": {\n    \"acme-tools\": {\n      \"source\": { \"source\": \"directory\", \"path\": \"/opt/acme/claude-plugins\" }\n    }\n  },\n  \"enabledPlugins\": { \"acme-audit@acme-tools\": true },\n  \"appendPlugins\": [\"acme-audit@acme-tools\"]\n}",
@@ -878,8 +878,8 @@
       "valueKind": "boolean",
       "enumValues": [],
       "description": {
-        "en": "Use enableArtifact instead to turn off the Artifact tool, which publishes session output as a private web page on claude.ai. When you turn the Artifacts row off in /config, Claude Code writes enableArtifact to your user settings and clears this key.",
-        "zh": "Use enableArtifact instead to turn off the Artifact tool, which publishes session output as a private web page on claude.ai. When you turn the Artifacts row off in /config, Claude Code writes enableArtifact to your user settings and clears this key."
+        "en": "> [!WARNING] > > Deprecated, and replaced by enableArtifact. Claude Code still honors disableArtifact: true as equivalent to enableArtifact: false, and ignores disableArtifact: false.",
+        "zh": "> [!WARNING] > > Deprecated, and replaced by enableArtifact. Claude Code still honors disableArtifact: true as equivalent to enableArtifact: false, and ignores disableArtifact: false."
       }
     },
     {
@@ -1534,8 +1534,8 @@
       "valueKind": "boolean",
       "enumValues": [],
       "description": {
-        "en": "Idle compaction compacts a long conversation that you've stepped away from, shortly before its prompt cache expires. Your next message then sends a summary instead of the whole conversation. When you come back, the conversation shows Compacted while idle, before the prompt cache expired.",
-        "zh": "Idle compaction compacts a long conversation that you've stepped away from, shortly before its prompt cache expires. Your next message then sends a summary instead of the whole conversation. When you come back, the conversation shows Compacted while idle, before the prompt cache expired."
+        "en": "Idle compaction compacts a long conversation that you've stepped away from, shortly before its prompt cache expires. Your next message then sends a summary instead of the whole conversation. When you come back, the conversation shows a line that starts with Compacted while idle, before the prompt cache expired.",
+        "zh": "Idle compaction compacts a long conversation that you've stepped away from, shortly before its prompt cache expires. Your next message then sends a summary instead of the whole conversation. When you come back, the conversation shows a line that starts with Compacted while idle, before the prompt cache expired."
       }
     },
     {
@@ -1550,8 +1550,8 @@
       "valueKind": "boolean",
       "enumValues": [],
       "description": {
-        "en": "Use attribution instead, which replaces this key and lets you change or hide the commit trailer, the pull request text, and the session link separately. Claude Code still honors includeCoAuthoredBy: false from settings files that predate attribution, but ignores it once you set attribution.commit or attribution.pr.",
-        "zh": "Use attribution instead, which replaces this key and lets you change or hide the commit trailer, the pull request text, and the session link separately. Claude Code still honors includeCoAuthoredBy: false from settings files that predate attribution, but ignores it once you set attribution.commit or attribution.pr."
+        "en": "> [!WARNING] > > Deprecated since v2.0.62, when attribution replaced it. Claude Code still reads it, but new configurations should set attribution.",
+        "zh": "> [!WARNING] > > Deprecated since v2.0.62, when attribution replaced it. Claude Code still reads it, but new configurations should set attribution."
       }
     },
     {
@@ -1614,8 +1614,8 @@
       "valueKind": "string",
       "enumValues": [],
       "description": {
-        "en": "In v2.1.238 through v2.1.260, setting it to \"readline\" made Ctrl+W delete back to the previous whitespace instead of only the previous word.",
-        "zh": "In v2.1.238 through v2.1.260, setting it to \"readline\" made Ctrl+W delete back to the previous whitespace instead of only the previous word."
+        "en": "> [!WARNING] > > Deprecated since v2.1.261 and has no effect. The prompt's word-editing keys always follow readline conventions, as in Bash. Claude Code still accepts keybindingFlavor, so a settings file that sets it stays valid.",
+        "zh": "> [!WARNING] > > Deprecated since v2.1.261 and has no effect. The prompt's word-editing keys always follow readline conventions, as in Bash. Claude Code still accepts keybindingFlavor, so a settings file that sets it stays valid."
       }
     },
     {
@@ -2167,7 +2167,7 @@
       "path": [
         "prependPlugins"
       ],
-      "scope": "User or managed. Claude Code reads the key from managed settings. It reads the key from user settings only on a machine with no managed settings, for a user who isn't signed in with a Team or Enterprise plan. It ignores the key in project and local settings and in a --settings file.",
+      "scope": "User or managed. Claude Code reads the key from managed settings. It reads the key from user settings only on a machine with no managed settings, in a session whose credential isn't a Team or Enterprise /login. It ignores the key in project and local settings and in a --settings file.",
       "type": "array of plugin-name@marketplace-name strings",
       "default": "unset",
       "example": "{\n  \"extraKnownMarketplaces\": {\n    \"acme-tools\": {\n      \"source\": { \"source\": \"directory\", \"path\": \"/opt/acme/claude-plugins\" }\n    }\n  },\n  \"enabledPlugins\": { \"acme-guard@acme-tools\": true },\n  \"prependPlugins\": [\"acme-guard@acme-tools\", \"sec-default@builtin\"]\n}",
@@ -3338,8 +3338,8 @@
       "valueKind": "array",
       "enumValues": [],
       "description": {
-        "en": "Lock the hooks surface. Claude Code stops running hooks from user, project, and local settings.json, and keeps running plugin hooks and hooks in managed settings.",
-        "zh": "Lock the hooks surface. Claude Code stops running hooks from user, project, and local settings.json, and keeps running plugin hooks and hooks in managed settings."
+        "en": "Lock the hooks surface:",
+        "zh": "Lock the hooks surface:"
       }
     },
     {
@@ -3487,8 +3487,8 @@
       "valueKind": "string",
       "enumValues": [],
       "description": {
-        "en": "Through v2.1.276, you set this key to the number of characters of a background task's output that Claude received inline when it read the task with the TaskOutput tool.",
-        "zh": "Through v2.1.276, you set this key to the number of characters of a background task's output that Claude received inline when it read the task with the TaskOutput tool."
+        "en": "> [!WARNING] > > Removed in v2.1.277, together with the TaskOutput tool it sized. Setting it has no effect on current versions. Claude reads a background task's output file with Read instead.",
+        "zh": "> [!WARNING] > > Removed in v2.1.277, together with the TaskOutput tool it sized. Setting it has no effect on current versions. Claude reads a background task's output file with Read instead."
       }
     },
     {
@@ -3740,8 +3740,8 @@
       "valueKind": "boolean",
       "enumValues": [],
       "description": {
-        "en": "Turn voice dictation on with the single Boolean form that predates the voice object. When both are set, voice.enabled applies.",
-        "zh": "Turn voice dictation on with the single Boolean form that predates the voice object. When both are set, voice.enabled applies."
+        "en": "> [!WARNING] > > Deprecated since v2.1.92, when the voice object replaced it. Claude Code still reads it so older settings files keep working, but new configurations should set voice.enabled.",
+        "zh": "> [!WARNING] > > Deprecated since v2.1.92, when the voice object replaced it. Claude Code still reads it so older settings files keep working, but new configurations should set voice.enabled."
       }
     },
     {
