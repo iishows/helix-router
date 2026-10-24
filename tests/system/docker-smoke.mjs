@@ -13,10 +13,14 @@ const token = process.env.CCR_DOCKER_TEST_WEB_AUTH_TOKEN || "token+/&=#?";
 const testId = randomUUID().slice(0, 8);
 const containerName = `ccr-docker-smoke-${testId}`;
 const volumeName = `ccr-docker-smoke-${testId}`;
+const hardenedContainerName = `ccr-docker-smoke-hardened-${testId}`;
+const hardenedVolumeName = `ccr-docker-smoke-hardened-${testId}`;
 const startupTimeoutMs = 45_000;
 
 let containerStarted = false;
 let volumeCreated = false;
+let hardenedContainerStarted = false;
+let hardenedVolumeCreated = false;
 
 try {
   if (process.env.CCR_DOCKER_TEST_SKIP_BUILD !== "1") {
@@ -66,7 +70,7 @@ try {
   const page = await fetch(`${baseUrl}${redirectLocation}`);
   assert.equal(page.status, 200);
   const pageHtml = await page.text();
-  assert.match(pageHtml, /Claude Code Router/);
+  assert.match(pageHtml, /Helix Router/);
   assert.match(pageHtml, /web-client-bridge\.js/);
 
   const bridge = await fetch(`${baseUrl}/assets/web-client-bridge.js`);
@@ -172,14 +176,81 @@ try {
   assert.equal(Object.hasOwn(configStorage.persistedGateway ?? {}, "corePort"), false);
   assert.doesNotMatch(run("docker", ["logs", containerId]), /Using compatibility gateway server/);
 
+  await verifyHardenedAuthMode();
+
   console.log(`Docker smoke test passed for ${imageName} on ${baseUrl}`);
 } finally {
   if (containerStarted) {
     run("docker", ["rm", "-f", containerName], { allowFailure: true });
   }
+  if (hardenedContainerStarted) {
+    run("docker", ["rm", "-f", hardenedContainerName], { allowFailure: true });
+  }
+  if (hardenedVolumeCreated) {
+    run("docker", ["volume", "rm", "-f", hardenedVolumeName], { allowFailure: true });
+  }
   if (volumeCreated) {
     run("docker", ["volume", "rm", "-f", volumeName], { allowFailure: true });
   }
+}
+
+/**
+ * Verifies `CCR_WEB_INJECT_HEADER=1`: the management token must never appear in a
+ * URL, a tokenless client must still load the UI, and the RPC endpoint must fail
+ * closed when no caller-supplied token is present (the outer reverse proxy is the
+ * only component allowed to inject it).
+ */
+async function verifyHardenedAuthMode() {
+  const hostPort = await findAvailablePort();
+  run("docker", ["volume", "create", hardenedVolumeName]);
+  hardenedVolumeCreated = true;
+
+  run("docker", [
+    "run",
+    "-d",
+    "--name",
+    hardenedContainerName,
+    "-p",
+    `${hostPort}:8080`,
+    "-e",
+    `CCR_WEB_AUTH_TOKEN=${token}`,
+    "-e",
+    "CCR_WEB_INJECT_HEADER=1",
+    "-e",
+    "CCR_NO_GATEWAY=1",
+    "-v",
+    `${hardenedVolumeName}:/data`,
+    imageName
+  ]);
+  hardenedContainerStarted = true;
+
+  const baseUrl = `http://127.0.0.1:${hostPort}`;
+  await waitFor(async () => {
+    const response = await fetch(baseUrl, { redirect: "manual" }).catch(() => undefined);
+    return response?.status === 200;
+  }, "Docker hardened-mode entrypoint");
+
+  // No redirect, and no token anywhere in the delivered page.
+  const root = await fetch(baseUrl, { redirect: "manual" });
+  assert.equal(root.status, 200, "hardened mode must serve the page without a redirect");
+  assert.equal(root.headers.get("location"), null, "hardened mode must not redirect to a tokenized URL");
+  assert.doesNotMatch(await root.text(), /ccr_web_token/, "hardened mode page must not embed the token");
+
+  // Wait for the core management server behind Nginx before asserting on RPC.
+  await waitFor(async () => {
+    const response = await rpc(baseUrl, "getAppInfo", token).catch(() => undefined);
+    return response?.status === 200;
+  }, "Docker hardened-mode management RPC");
+
+  // No caller-supplied token => 401. This fail-closed behavior is what makes proxy
+  // header injection safe even if the container port leaks.
+  const unauthorized = await rpc(baseUrl, "getAppInfo");
+  assert.equal(unauthorized.status, 401, "hardened mode must reject RPC without the injected token");
+
+  // The injected token (as an outer proxy would send it) authorizes the RPC.
+  const authorized = await rpc(baseUrl, "getAppInfo", token);
+  assert.equal(authorized.status, 200);
+  assert.equal((await authorized.json()).ok, true);
 }
 
 function seedLegacyDockerConfig(volume) {

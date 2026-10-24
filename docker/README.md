@@ -100,7 +100,7 @@ Security guidance:
 
 - Bind the published port to `127.0.0.1` unless LAN or remote access is intentional.
 - Never expose the management UI over untrusted networks without TLS, a firewall/private network, and a fixed strong management token.
-- Treat tokenized management URLs as secrets; URLs may be recorded in browser history, proxy logs, screenshots, and support tickets.
+- Treat tokenized management URLs as secrets; URLs may be recorded in browser history, proxy logs, screenshots, and support tickets. The hardened reverse-proxy mode above removes the token from the URL entirely.
 - Create scoped CCR client API keys before exposing gateway routes. Do not reuse upstream provider credentials as client keys.
 - Protect `/data` and its backups because they contain configuration, provider credentials, CCR client keys, request data, and generated certificates.
 
@@ -133,6 +133,93 @@ services:
 ```
 
 Proxy all paths to Nginx and preserve streaming. The external proxy should allow long-lived responses and should not buffer SSE/model streams. Keep the host port private when the reverse proxy is the public entrypoint.
+
+## Reverse Proxy And TLS
+
+Put TLS termination and network gating in front of the container. Never publish the container port to the internet directly.
+
+```text
+browser -> host reverse proxy (443, TLS) -> 127.0.0.1:3458 (container Nginx)
+                                                        |-> management RPC: 127.0.0.1:3459
+                                                        `-> gateway:       127.0.0.1:3456
+```
+
+Keep the container's own Nginx in the path: it already multiplexes the UI, management RPC, gateway routes, and `/health` on one port. Forward every path to it instead of re-implementing routing in the outer proxy. Bind the published port to loopback first (see [Quick Start With Compose](#quick-start-with-compose)).
+
+### Generic Nginx Example
+
+```nginx
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+server {
+  listen 80;
+  server_name ccr.example.com;
+  return 301 https://$host$request_uri;
+}
+
+server {
+  listen 443 ssl;
+  server_name ccr.example.com;
+  ssl_certificate     /path/to/fullchain.pem;
+  ssl_certificate_key /path/to/privkey.pem;
+  add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+  location / {
+    proxy_pass http://127.0.0.1:3458;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # Model streams, SSE, and recall must not be buffered.
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+  }
+}
+```
+
+Set `CCR_PUBLIC_BASE_URL=https://ccr.example.com`. If the outer proxy defaults to buffering (Nginx does not), model streams arrive in one burst after a long pause. `proxy_buffering off` is required for `/v1/*` and other streaming routes.
+
+### BT Panel (宝塔)
+
+The container keeps its own Nginx; the panel's Nginx only terminates TLS and forwards.
+
+1. **Site**: add a site for `ccr.example.com` (a plain static site is enough; no PHP or database). Issue a Let's Encrypt certificate and enable **Force HTTPS**.
+2. **Reverse proxy**: add one with target `http://127.0.0.1:3458` and send domain `$host`.
+3. **Edit the generated proxy config** (Reverse proxy -> config file, typically `/www/server/panel/vhost/nginx/proxy/<domain>/<name>.conf`). The default template buffers responses and breaks model streaming, so replace its `location` body with the snippets above. Keep custom rules in this proxy file, not the site's main config, because re-saving the site can reset it.
+4. Run `nginx -t && nginx -s reload` (or the panel's **Reload** action).
+
+Keep the container port loopback-only and open only `443` in the host firewall.
+
+### Management Auth Modes
+
+**Default — token in URL.** Container Nginx 302-redirects `/` to `/pages/home/index.html?ccr_web_token=...`. The browser reads the token, removes it from the address bar before the app's main script runs, keeps it in `sessionStorage`, and sends it as the `x-ccr-web-auth` header on management RPC. The token appears once in the first redirect URL (and may therefore be recorded in browser history, screenshots, or support tickets).
+
+**Hardened — token never in the URL.** The reverse proxy injects the token header and the browser never receives it. Enable it with `CCR_WEB_INJECT_HEADER=1`, which stops the container Nginx from appending `ccr_web_token` to any URL, and inject the header on the host proxy:
+
+```nginx
+proxy_set_header x-ccr-web-auth "<CCR_WEB_AUTH_TOKEN>";
+```
+
+No application code changes are needed: when the browser has no token it simply omits the header, and the proxy-supplied header authorizes the RPC. Tokenless RPC still returns `401` from the core server, so a leaked container port fails closed.
+
+**The proxy must authenticate the caller first.** Because the proxy injects the token unconditionally, anyone who can reach the site becomes an administrator. Use HTTP Basic (BT: **Site -> Access restriction**), an SSO forward-auth service (oauth2-proxy, Cloudflare Access), or a private network / VPN. Without one of these, this mode exposes an unauthenticated admin console.
+
+The injected token is embedded in the container Nginx config, so it must not contain a double quote; base64url tokens are safe.
+
+Generate a strong token with the same algorithm the entrypoint uses:
+
+```sh
+node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))"
+```
+
+Store it in a mode-`600` env file, out of shell history and version control. This token is the management superuser credential; rotate it by changing the value and recreating the container.
 
 ## Persistent Data
 
@@ -200,6 +287,7 @@ Most deployments should set only `CCR_WEB_AUTH_TOKEN`, `CCR_PUBLIC_BASE_URL`, an
 | `CCR_GATEWAY_HOST` | `127.0.0.1` | Container-private gateway listener host. |
 | `CCR_GATEWAY_PORT` | `3456` | Container-private gateway listener port used by Nginx. |
 | `CCR_NO_GATEWAY` | `0` | Set to `1`, `true`, or `yes` to run the management UI without starting the gateway at boot. |
+| `CCR_WEB_INJECT_HEADER` | `0` | Set to `1`, `true`, `yes`, or `on` to stop putting the management token in URLs. The outer reverse proxy must then inject `x-ccr-web-auth` and authenticate the caller. See [Management Auth Modes](#management-auth-modes). |
 | `CCR_DOCKER_INIT_CONFIG` | `1` | Set to `0` to disable minimal first-run `config.json` bootstrap. |
 | `CCR_DOCKER_SYNC_PUBLIC_ENDPOINT` | `1` | Set to `0` to stop startup from syncing existing JSON/SQLite listener and public endpoint fields to Docker values. |
 
@@ -246,6 +334,14 @@ This is expected. Nginx redirects the root URL to the management page and URL-en
 ### The UI returns `401` after a token change
 
 Open the bare root URL again so Nginx creates a URL with the current token. Close stale tabs and avoid bookmarks that contain an old `ccr_web_token`.
+
+### Model responses arrive in one burst after a long pause
+
+The outer reverse proxy is buffering. Set `proxy_buffering off` (and `proxy_request_buffering off`) for the streaming routes, keep long `proxy_read_timeout`/`proxy_send_timeout` values, and reload the proxy. Restrict the change to this proxy's own config file, since re-saving a site in a panel like BT Panel can reset its main config.
+
+### HTTPS works but the app still uses http:// addresses
+
+Set `CCR_PUBLIC_BASE_URL` to the exact `https://` URL and recreate the container so CCR's stored public endpoint is re-synchronized at startup.
 
 ### Clients still use the old port or hostname
 
@@ -297,6 +393,93 @@ ports:
 
 根路径会重定向到包含 `ccr_web_token` 的管理 URL。请把该 URL 当作密码。远程部署至少应使用固定强 Token、TLS、主机防火墙或私网，并让反向代理把全部路径转发到 Nginx。流式响应和 SSE 不应被代理缓冲。
 
+### 反向代理与 TLS
+
+把 TLS 终止与网络准入放在容器前面，不要把容器端口直接暴露到公网。
+
+```text
+浏览器 -> 宿主反代(443, TLS) -> 127.0.0.1:3458(容器 Nginx)
+                                        |-> 管理 RPC: 127.0.0.1:3459
+                                        `-> 网关:    127.0.0.1:3456
+```
+
+保留容器自带的 Nginx：它已经把 UI、管理 RPC、网关路由和 `/health` 收敛在一个端口。把全部路径转发给它，不要在外部反代里重新实现路径分流。发布端口先绑回环（见「快速启动」）。
+
+通用 Nginx 示例：
+
+```nginx
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+server {
+  listen 80;
+  server_name ccr.example.com;
+  return 301 https://$host$request_uri;
+}
+
+server {
+  listen 443 ssl;
+  server_name ccr.example.com;
+  ssl_certificate     /path/to/fullchain.pem;
+  ssl_certificate_key /path/to/privkey.pem;
+  add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+  location / {
+    proxy_pass http://127.0.0.1:3458;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # 模型流、SSE、召回不应被缓冲
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+  }
+}
+```
+
+同时设置 `CCR_PUBLIC_BASE_URL=https://ccr.example.com`。若外部反代默认开启缓冲（Nginx 默认开），模型流会先长时间无输出、再一次性吐出；`/v1/*` 等流式路由必须 `proxy_buffering off`。
+
+#### 宝塔面板（BT Panel）
+
+容器保留自己的 Nginx，面板的 Nginx 只负责终止 TLS 与转发。
+
+1. **网站**：为 `ccr.example.com` 添加站点（纯静态即可，无需 PHP/数据库），申请 Let's Encrypt 证书并开启 **强制 HTTPS**。
+2. **反向代理**：目标 URL 填 `http://127.0.0.1:3458`，发送域名填 `$host`。
+3. **编辑生成的代理配置**（反向代理 → 配置文件，通常位于 `/www/server/panel/vhost/nginx/proxy/<域名>/<名称>.conf`）。面板默认模板会缓冲响应、中断模型流，请把其中的 `location` 主体替换为上面的片段。自定义规则放在这个代理配置里，不要混进站点主配置——重新保存站点可能重置它。
+4. 执行 `nginx -t && nginx -s reload`（或面板的「重载配置」）。
+
+容器端口保持只绑回环，宿主防火墙只放行 `443`。
+
+#### 管理端鉴权模式
+
+**默认 —— token 进 URL。** 容器 Nginx 把 `/` 302 到 `/pages/home/index.html?ccr_web_token=...`。浏览器取出 token、在应用主脚本运行前从地址栏抹掉、存入 `sessionStorage`，之后以 `x-ccr-web-auth` header 发管理 RPC。token 会在首次跳转 URL 里出现一次（因而可能被浏览器历史、截图或工单记录）。
+
+**加固 —— token 不进 URL。** 由反代注入 token header，浏览器根本拿不到 token。以 `CCR_WEB_INJECT_HEADER=1` 启用：容器 Nginx 不再向任何 URL 追加 `ccr_web_token`；再在宿主反代注入 header：
+
+```nginx
+proxy_set_header x-ccr-web-auth "<CCR_WEB_AUTH_TOKEN>";
+```
+
+无需改动应用代码：浏览器没有 token 时会省略 header，反代注入的 header 即可通过 RPC 鉴权。不带 header 的 RPC 仍由核心服务返回 `401`，容器端口意外暴露时失败关闭。
+
+**反代必须先认人。** 因为注入是无条件的，任何能访问该站点的人都等于管理员。请配合 HTTP Basic（宝塔：**网站 → 访问限制**）、SSO 前置认证（oauth2-proxy、Cloudflare Access）或私网/VPN。缺了这一环，此模式等于敞开一个无鉴权的管理后台。
+
+注入的 token 会被写进容器 Nginx 配置，因此不能包含双引号；base64url token 安全。
+
+用与 entrypoint 相同的算法生成强 token：
+
+```sh
+node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))"
+```
+
+存入权限 `600` 的 env 文件，避免进入 shell 历史与版本控制。该 token 即管理端超级凭据，轮换方式是改值并重建容器。
+
 外部端口、域名或协议变化时，必须同步设置公开地址：
 
 ```yaml
@@ -334,6 +517,8 @@ docker compose logs --tail=200 ccr
 - `/` 返回 `302`：正常，Nginx 正在跳转到带管理 Token 的页面。
 - `/health` 返回 `502`：它检查的是模型网关；首次启动尚未配置模型时属于预期行为。
 - 修改 Token 后 UI 返回 `401`：重新打开不带参数的根地址，关闭仍使用旧 Token 的标签页。
+- 模型响应长时间无输出后一次性吐出：外部反代开启了缓冲。对流式路由设置 `proxy_buffering off`（以及 `proxy_request_buffering off`），保留较长的 `proxy_read_timeout` / `proxy_send_timeout` 后重载代理。改动只放在该代理自己的配置文件里——在宝塔等面板里重新保存站点可能重置站点主配置。
+- HTTPS 可用但应用仍使用 `http://` 地址：把 `CCR_PUBLIC_BASE_URL` 设为精确的 `https://` 地址并重建容器，让 CCR 在启动时重新同步已存的公开地址。
 - 重建后配置消失：检查是否仍挂载同一个 `/data` 卷；`docker compose down --volumes` 会删除数据卷。
 - 容器健康但模型请求失败：继续检查服务状态、供应商连通性、CCR 客户端 Key、路由和请求日志；容器健康只表示 Nginx / UI 可访问。
 

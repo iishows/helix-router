@@ -11,11 +11,34 @@ CCR_PUBLIC_HOST="${CCR_PUBLIC_HOST:-127.0.0.1}"
 CCR_PUBLIC_PORT="${CCR_PUBLIC_PORT:-3458}"
 CCR_PUBLIC_BASE_URL="${CCR_PUBLIC_BASE_URL:-http://${CCR_PUBLIC_HOST}:${CCR_PUBLIC_PORT}}"
 CCR_NO_GATEWAY="${CCR_NO_GATEWAY:-0}"
+CCR_WEB_INJECT_HEADER="${CCR_WEB_INJECT_HEADER:-0}"
 
 if [ -z "${CCR_WEB_AUTH_TOKEN:-}" ]; then
   CCR_WEB_AUTH_TOKEN="$(node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))")"
 fi
 CCR_WEB_AUTH_TOKEN_QUERY="$(node -e "process.stdout.write(encodeURIComponent(process.argv[1] || ''))" "${CCR_WEB_AUTH_TOKEN}")"
+
+# Hardened mode (CCR_WEB_INJECT_HEADER=1): the management token is never placed in
+# a URL. The outer reverse proxy must inject `x-ccr-web-auth` and authenticate the
+# caller itself, otherwise the console is open to anyone who can reach the site.
+# Tokenless RPC still gets 401 from the core server (constant-time token check).
+# NOTE: the injected token must not contain `"` because it is embedded in the
+# nginx config when this mode is enabled; base64url tokens are safe.
+case "$(printf '%s' "${CCR_WEB_INJECT_HEADER}" | tr '[:upper:]' '[:lower:]')" in
+  1 | true | yes | on) CCR_WEB_INJECT_HEADER_ENABLED=1 ;;
+  *) CCR_WEB_INJECT_HEADER_ENABLED=0 ;;
+esac
+
+if [ "${CCR_WEB_INJECT_HEADER_ENABLED}" = "1" ]; then
+  NGINX_ROOT_LOCATION_BODY='    try_files /pages/home/index.html =404;'
+  NGINX_HOME_LOCATION_BODY='    try_files /pages/home/index.html =404;'
+else
+  NGINX_ROOT_LOCATION_BODY="    return 302 /pages/home/index.html?ccr_web_token=${CCR_WEB_AUTH_TOKEN_QUERY};"
+  NGINX_HOME_LOCATION_BODY="    if (\$arg_ccr_web_token = \"\") {
+      return 302 /pages/home/index.html?ccr_web_token=${CCR_WEB_AUTH_TOKEN_QUERY};
+    }
+    try_files /pages/home/index.html =404;"
+fi
 
 export HOME="${CCR_DATA_DIR}"
 export CCR_DATA_DIR
@@ -30,6 +53,7 @@ export CCR_WEB_AUTH_TOKEN
 export CCR_WEB_AUTH_TOKEN_QUERY
 export CCR_WEB_HOST
 export CCR_WEB_PORT
+export CCR_WEB_INJECT_HEADER
 
 CONFIG_DIR="${HOME}/.claude-code-router"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
@@ -142,14 +166,11 @@ server {
   client_max_body_size 8m;
 
   location = / {
-    return 302 /pages/home/index.html?ccr_web_token=${CCR_WEB_AUTH_TOKEN_QUERY};
+${NGINX_ROOT_LOCATION_BODY}
   }
 
   location = /pages/home/index.html {
-    if (\$arg_ccr_web_token = "") {
-      return 302 /pages/home/index.html?ccr_web_token=${CCR_WEB_AUTH_TOKEN_QUERY};
-    }
-    try_files /pages/home/index.html =404;
+${NGINX_HOME_LOCATION_BODY}
   }
 
   location = /api/ccr/rpc {
