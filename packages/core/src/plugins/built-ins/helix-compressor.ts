@@ -377,8 +377,12 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
   // 按模型门控 recall(2026-10-16):只有命中 recall 白名单的模型才做本地占位符压缩。
   //   未命中的模型 → 跳过 compressV3x(不产 ⟦QA:⟧/⟦HC:⟧、不落召回缓存、model 不改写),
   //   仅保留上面的安全预清理,后续只走主动 compact。空白名单 = 支持全部(向后兼容)。
+  //   白名单比对用**实际发往 provider 的模型**(虚拟别名解析后的 base model):
+  //   `recallModelPatterns` 由 recall-model-detect 从 provider 模型清单生成,不含
+  //   virtual profile 派生串(见 recall-model-detect.ts 顶部注释),拿别名去比会
+  //   误判为「不支持」而静默跳过压缩。
   const recallRoutableModel = resolveRecallRoutableModel(model, context.config);
-  const recallSupported = recallRoutableModel !== undefined && recallModelSupported(model, config);
+  const recallSupported = recallRoutableModel !== undefined && recallModelSupported(recallRoutableModel, config);
   if (recallSupported) {
     // 本地确定性 V3.x:移植自 helix-compressor/src/compress/hc.js,与其逐字节 parity。
     // 被替换的原文写入本地召回缓存(供 hc_recall/history_recall 工具读取)。

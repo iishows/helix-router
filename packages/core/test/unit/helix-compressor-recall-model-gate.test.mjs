@@ -280,3 +280,53 @@ test("非虚拟模型（无 profile 匹配）→ 保持原有行为：前缀 + �
   assert.equal(result.routedModel, `${HELIX_RECALL_MODEL_PREFIX}${TEST_MODEL}`, "非虚拟模型不受影响");
   assert.equal(bodyHasPlaceholder(result.body), true);
 });
+
+// ============== 白名单判据用「解析后的 base model」而非虚拟别名 ==============
+// `recallModelPatterns` 由 recall-model-detect 从 provider 模型清单生成,**不含**
+// virtual profile 派生串。若拿别名去比白名单,别名不在列表 → 误判「不支持」→
+// 静默跳过压缩(无报错、无收益)。故判据须用实际发往 provider 的模型。
+
+const VIRTUAL_APP_CONFIG = {
+  virtualModelProfiles: [fixedProfile("fusion-1", "Doitx", "autodl-3/DeepSeek-V4.1-Flash", { exactAliases: ["Doitx"] })]
+};
+
+test("白名单含 base model、不含别名 → 虚拟别名仍压缩（判据用 base model）", async () => {
+  const result = await runTransform(
+    "Fusion/Doitx",
+    { recallModelPatterns: ["DeepSeek-V4.1-Flash"], keepRecentPairs: 0 },
+    VIRTUAL_APP_CONFIG
+  );
+  assert.ok(result);
+  assert.equal(
+    result.routedModel,
+    `${HELIX_RECALL_MODEL_PREFIX}autodl-3/DeepSeek-V4.1-Flash`,
+    "base model 命中白名单即应压缩,别名不在白名单不得成为阻断理由"
+  );
+  assert.equal(bodyHasPlaceholder(result.body), true);
+  assert.equal(result.headers["x-helix-compressor-scenario"], "local");
+});
+
+test("白名单含别名、不含 base model → 跳过压缩（判据不是别名）", async () => {
+  const result = await runTransform(
+    "Fusion/Doitx",
+    { recallModelPatterns: ["Fusion/Doitx"], keepRecentPairs: 0 },
+    VIRTUAL_APP_CONFIG
+  );
+  assert.ok(result);
+  assert.equal(result.routedModel, undefined, "别名命中白名单不足以判定支持");
+  assert.equal(bodyHasPlaceholder(result.body), false);
+  assert.equal(result.headers["x-helix-compressor-scenario"], "skip-recall");
+  assert.equal(recallCacheLineCount(), 0);
+});
+
+test("base model 被 exclude 命中 → 虚拟别名同样跳过（exclude 作用于真实模型）", async () => {
+  const result = await runTransform(
+    "Fusion/Doitx",
+    { recallModelPatterns: [], recallModelExcludePatterns: ["DeepSeek-V4.1-Flash"], keepRecentPairs: 0 },
+    VIRTUAL_APP_CONFIG
+  );
+  assert.ok(result);
+  assert.equal(result.routedModel, undefined);
+  assert.equal(bodyHasPlaceholder(result.body), false);
+  assert.equal(result.headers["x-helix-compressor-scenario"], "skip-recall");
+});
