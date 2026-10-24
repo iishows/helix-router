@@ -45,9 +45,9 @@ const LONG_HISTORY = [
   { role: "user", content: "final question" }
 ];
 
-function mockContext(pluginConfig = {}) {
+function mockContext(pluginConfig = {}, appConfig = {}) {
   return {
-    config: {},
+    config: appConfig,
     logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
     paths: { configDir: "", dataDir: "", pluginDataDir: "" },
     permissions: [],
@@ -57,7 +57,7 @@ function mockContext(pluginConfig = {}) {
   };
 }
 
-function runTransform(model, pluginConfig) {
+function runTransform(model, pluginConfig, appConfig) {
   return helixCompressorTransform(
     {
       body: { model, messages: LONG_HISTORY },
@@ -68,7 +68,7 @@ function runTransform(model, pluginConfig) {
       routedModel: model,
       url: "/v1/messages"
     },
-    mockContext(pluginConfig)
+    mockContext(pluginConfig, appConfig)
   );
 }
 
@@ -205,5 +205,78 @@ test("provider 前缀模型在白名单命末段 → 有占位符", async () => 
   const result = await runTransform(model, { recallModelPatterns: ["MiniMax-M3"], keepRecentPairs: 0 });
   assert.ok(result);
   assert.equal(result.routedModel, `${HELIX_RECALL_MODEL_PREFIX}${model}`);
+  assert.equal(bodyHasPlaceholder(result.body), true);
+});
+
+// ============== 虚拟模型 (virtualModelProfiles) 别名解析 ==============
+// 回归:模型是虚拟别名(如 `Fusion/Doitx`)时,召回前缀必须写**真实 base model**,
+// 否则网关剥前缀后拿别名去校验 provider 白名单 → 400
+// `Model "<alias>" is not configured for target provider ...`。
+
+/** 构造一个 `baseModel.mode=fixed` 的虚拟模型 profile。 */
+function fixedProfile(profileKey, displayName, fixedModel, match = {}) {
+  return {
+    id: profileKey,
+    key: profileKey,
+    enabled: true,
+    displayName,
+    baseModel: { mode: "fixed", fixedModel },
+    match: { exactAliases: [], prefixes: [], suffixes: [], ...match }
+  };
+}
+
+test("虚拟别名（网关物化 Fusion/<alias>）→ 前缀写真实 base model", async () => {
+  const appConfig = {
+    virtualModelProfiles: [fixedProfile("fusion-1", "Doitx", "autodl-3/DeepSeek-V4.1-Flash", { exactAliases: ["Doitx"] })]
+  };
+  const result = await runTransform("Fusion/Doitx", { recallModelPatterns: [], keepRecentPairs: 0 }, appConfig);
+  assert.ok(result);
+  assert.equal(
+    result.routedModel,
+    `${HELIX_RECALL_MODEL_PREFIX}autodl-3/DeepSeek-V4.1-Flash`,
+    "虚拟别名必须解析成 base model 后才加召回前缀"
+  );
+  assert.equal(bodyHasPlaceholder(result.body), true, "解析成功后仍应压缩并召回");
+});
+
+test("裸别名（Doitx）同样解析成 base model", async () => {
+  const appConfig = {
+    virtualModelProfiles: [fixedProfile("fusion-1", "Doitx", "autodl-3/DeepSeek-V4.1-Flash", { exactAliases: ["Doitx"] })]
+  };
+  const result = await runTransform("Doitx", { recallModelPatterns: [], keepRecentPairs: 0 }, appConfig);
+  assert.ok(result);
+  assert.equal(result.routedModel, `${HELIX_RECALL_MODEL_PREFIX}autodl-3/DeepSeek-V4.1-Flash`);
+});
+
+test("虚拟模型但 baseModel 非 fixed（无法静态解析）→ 跳过压缩、不改写 model", async () => {
+  const appConfig = {
+    virtualModelProfiles: [
+      { id: "dynamic-1", key: "dynamic-1", enabled: true, displayName: "Dyn", baseModel: { mode: "request" }, match: { exactAliases: ["Dyn"], prefixes: [], suffixes: [] } }
+    ]
+  };
+  const result = await runTransform("Fusion/Dyn", { recallModelPatterns: [], keepRecentPairs: 0 }, appConfig);
+  assert.ok(result, "transform 仍应返回结果(透传)");
+  assert.equal(result.routedModel, undefined, "无法解析的虚拟模型不得改写 model(否则网关 400)");
+  assert.equal(bodyHasPlaceholder(result.body), false, "不得产生占位符");
+  assert.equal(result.headers["x-helix-compressor-scenario"], "skip-recall");
+  assert.equal(recallCacheLineCount(), 0, "跳过时不得写召回缓存");
+});
+
+test("虚拟模型命中 prefixes 匹配 → 同样解析 base model", async () => {
+  const appConfig = {
+    virtualModelProfiles: [
+      { id: "p1", key: "p1", enabled: true, displayName: "PX", baseModel: { mode: "fixed", fixedModel: "autodl-3/GLM-5.3-flash" }, match: { exactAliases: [], prefixes: ["ccr-px-"], suffixes: [] } }
+    ]
+  };
+  const result = await runTransform("ccr-px-anything", { recallModelPatterns: [], keepRecentPairs: 0 }, appConfig);
+  assert.ok(result);
+  assert.equal(result.routedModel, `${HELIX_RECALL_MODEL_PREFIX}autodl-3/GLM-5.3-flash`);
+});
+
+test("非虚拟模型（无 profile 匹配）→ 保持原有行为：前缀 + 原名", async () => {
+  const appConfig = { virtualModelProfiles: [fixedProfile("fusion-1", "Doitx", "autodl-3/DeepSeek-V4.1-Flash", { exactAliases: ["Doitx"] })] };
+  const result = await runTransform(TEST_MODEL, { recallModelPatterns: [], keepRecentPairs: 0 }, appConfig);
+  assert.ok(result);
+  assert.equal(result.routedModel, `${HELIX_RECALL_MODEL_PREFIX}${TEST_MODEL}`, "非虚拟模型不受影响");
   assert.equal(bodyHasPlaceholder(result.body), true);
 });

@@ -30,7 +30,7 @@ import {
   type RecallCacheEntry
 } from "@ccr/core/observability/helix-recall-local-store";
 import { HELIX_RECALL_DIR } from "@ccr/core/config/constants";
-import type { AppConfig } from "@ccr/core/contracts/app";
+import type { AppConfig, VirtualModelProfileConfig } from "@ccr/core/contracts/app";
 import { HELIX_RECALL_MODEL_PREFIX } from "@ccr/core/contracts/app";
 
 /**
@@ -64,6 +64,53 @@ function modelMatchesGlob(model: string, pattern: string): boolean {
   }
   const lastSlash = model.lastIndexOf("/");
   return lastSlash >= 0 && re.test(model.slice(lastSlash + 1));
+}
+
+/**
+ * 解析"召回改写"应写入前缀的**真实模型名**。
+ *
+ * 背景:召回触发时会把请求 model 改写成 `${HELIX_RECALL_MODEL_PREFIX}<model>`,
+ * 网关据此命中召回 virtual model profile 并剥掉前缀,但**不会**再解析内层的
+ * 虚拟模型 —— 若 `<model>` 是 `Fusion/Doitx` 这类虚拟别名,剥前缀后落到普通
+ * provider 白名单校验,即报
+ *   `Model "Fusion/Doitx" is not configured for target provider ...` → HTTP 400。
+ * 真实模型(`autodl-3/DeepSeek-V4.1-Flash`)剥前缀后仍合法,故此前只在使用
+ * **虚拟模型**、且请求大到触发压缩时才暴露。
+ *
+ * 返回:
+ *   - 非虚拟模型 → 原样返回;
+ *   - 虚拟模型且 `baseModel` 可静态解析(mode=fixed)→ 返回 `fixedModel`;
+ *   - 虚拟模型但无法静态解析(缺 baseModel / mode=request 等)→ undefined,
+ *     调用方据此**整体跳过压缩与改写**(宁可不召回,也不能 400)。
+ */
+function resolveRecallRoutableModel(
+  model: string,
+  appConfig: AppConfig | undefined
+): string | undefined {
+  const profiles = appConfig?.virtualModelProfiles;
+  if (!Array.isArray(profiles) || profiles.length === 0) return model;
+
+  const profile = profiles.find((candidate) => virtualProfileMatchesModel(candidate, model));
+  if (!profile) return model;
+
+  const fixed = typeof profile.baseModel?.fixedModel === "string" ? profile.baseModel.fixedModel.trim() : "";
+  return fixed.length > 0 ? fixed : undefined;
+}
+
+/** 虚拟模型 profile 是否匹配该模型名(exactAliases / prefixes / suffixes)。 */
+function virtualProfileMatchesModel(profile: VirtualModelProfileConfig, model: string): boolean {
+  const match = profile?.match;
+  if (!match) return false;
+  if (match.exactAliases.some((alias) => virtualAliasMatches(model, alias))) return true;
+  if (match.prefixes.some((prefix) => prefix.length > 0 && model.startsWith(prefix))) return true;
+  return match.suffixes.some((suffix) => suffix.length > 0 && model.endsWith(suffix));
+}
+
+/** 精确别名比对:`Doitx` 同时匹配 `Doitx` 与网关物化后的 `Fusion/Doitx`。 */
+function virtualAliasMatches(model: string, alias: string): boolean {
+  const trimmed = typeof alias === "string" ? alias.trim() : "";
+  if (trimmed.length === 0) return false;
+  return model === trimmed || model.toLowerCase() === `fusion/${trimmed}`.toLowerCase();
 }
 
 /**
@@ -330,7 +377,8 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
   // 按模型门控 recall(2026-10-16):只有命中 recall 白名单的模型才做本地占位符压缩。
   //   未命中的模型 → 跳过 compressV3x(不产 ⟦QA:⟧/⟦HC:⟧、不落召回缓存、model 不改写),
   //   仅保留上面的安全预清理,后续只走主动 compact。空白名单 = 支持全部(向后兼容)。
-  const recallSupported = recallModelSupported(model, config);
+  const recallRoutableModel = resolveRecallRoutableModel(model, context.config);
+  const recallSupported = recallRoutableModel !== undefined && recallModelSupported(model, config);
   if (recallSupported) {
     // 本地确定性 V3.x:移植自 helix-compressor/src/compress/hc.js,与其逐字节 parity。
     // 被替换的原文写入本地召回缓存(供 hc_recall/history_recall 工具读取)。
@@ -415,7 +463,7 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
   //   网关据此命中 helix virtualModelProfile → internal tool 循环(支持流式)兑现 recall。
   //   无占位符 → 不改写 → 不命中 profile → 保持原 live 直通(零 TTFB 回归,对齐 headroom #3071)。
   const recallNeeded = (hasHC || hasQA) && model.length > 0;
-  const routedModel = recallNeeded ? `${HELIX_RECALL_MODEL_PREFIX}${model}` : undefined;
+  const routedModel = recallNeeded ? `${HELIX_RECALL_MODEL_PREFIX}${recallRoutableModel}` : undefined;
 
   // 教学 prompt:告诉模型占位符的含义与何时调用 recall 工具。
   //   工具定义本身由 profile 提供(见 config-compiler 的 helixRecallVirtualModelProfile),
