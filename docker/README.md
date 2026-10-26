@@ -62,12 +62,12 @@ Build and run without Compose:
 ```sh
 npm run docker:build
 docker run -d \
-  --name claude-code-router \
+  --name ccr \
   --restart unless-stopped \
   -p 127.0.0.1:3458:8080 \
   -e CCR_PUBLIC_BASE_URL=http://127.0.0.1:3458 \
   -v ccr-data:/data \
-  claude-code-router:local
+  helix-compressor:local
 ```
 
 The temporary run script is also available:
@@ -236,7 +236,7 @@ Yes. Compression and recall are **server-side**: when a request still holds coll
 
 Two conditions must hold:
 
-1. The `helix-compressor` plugin must be enabled. It is **off by default** (`plugins: []`); add `helix-compressor` to the plugins list.
+1. The `helix-compressor` plugin must be enabled. It is **on by default**; existing deployments whose config predates this get the entry added automatically on load. To turn it off, add `{ "id": "helix-compressor", "enabled": false }` to the plugins list.
 2. Recall only rewrites tokens that were compressed *in the same session/account*. A brand-new caller's first request has nothing to recall, so it simply passes through; savings appear as a conversation grows.
 
 Because recall is internal, a generic OpenAI client behind one-api benefits from compression transparently. The one caveat is billing, below.
@@ -332,7 +332,7 @@ The Dockerfile builds native dependencies with `node:22-bookworm`, then copies p
 docker build \
   --build-arg NODE_IMAGE=node:22-bookworm \
   --build-arg RUNTIME_NODE_IMAGE=node:22-bookworm-slim \
-  -t claude-code-router:local .
+  -t helix-compressor:local .
 ```
 
 Run the isolated Docker smoke test:
@@ -536,7 +536,7 @@ CCR 网关同时支持 OpenAI 兼容（`POST /v1/chat/completions`、`GET /v1/mo
 
 两个前提：
 
-1. `helix-compressor` 插件必须启用。它**默认关闭**（`plugins: []`），需在插件列表里显式加入。
+1. `helix-compressor` 插件必须启用。它**默认开启**；早于该默认值的旧部署会在读取配置时自动补上该条目。如需关闭，在插件列表里加 `{ "id": "helix-compressor", "enabled": false }`。
 2. 召回只能还原**同一会话/账号**内被压缩的内容。全新调用方的首个请求无可召回内容，直接透传；收益随对话增长而显现。
 
 由于召回在网关内部完成，one-api 后面的普通 OpenAI 客户端可透明享受压缩。唯一需要注意的是计费，见下。

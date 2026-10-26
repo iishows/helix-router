@@ -86,12 +86,12 @@ Without Compose:
 ```sh
 npm run docker:build
 docker run -d \
-  --name claude-code-router \
+  --name ccr \
   --restart unless-stopped \
   -p 127.0.0.1:3458:8080 \
   -e CCR_PUBLIC_BASE_URL=http://127.0.0.1:3458 \
   -v ccr-data:/data \
-  claude-code-router:local
+  helix-compressor:local
 ```
 
 The repository also provides `npm run docker:run`. It uses `3458` and `ccr-data`, but the container runs with `--rm` and has no fixed name or restart policy, so it is better suited to temporary verification.
@@ -232,7 +232,7 @@ By default, native dependencies are built on `node:22-bookworm`, then production
 docker build \
   --build-arg NODE_IMAGE=node:22-bookworm \
   --build-arg RUNTIME_NODE_IMAGE=node:22-bookworm-slim \
-  -t claude-code-router:local .
+  -t helix-compressor:local .
 ```
 
 Run the Docker smoke test:

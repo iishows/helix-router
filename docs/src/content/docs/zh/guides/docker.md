@@ -86,12 +86,12 @@ services:
 ```sh
 npm run docker:build
 docker run -d \
-  --name claude-code-router \
+  --name ccr \
   --restart unless-stopped \
   -p 127.0.0.1:3458:8080 \
   -e CCR_PUBLIC_BASE_URL=http://127.0.0.1:3458 \
   -v ccr-data:/data \
-  claude-code-router:local
+  helix-compressor:local
 ```
 
 仓库也提供 `npm run docker:run`。它使用 `3458` 和 `ccr-data`，但容器带 `--rm`，没有固定名称和自动重启策略，更适合临时验证。
@@ -232,7 +232,7 @@ docker compose logs --tail=200 ccr
 docker build \
   --build-arg NODE_IMAGE=node:22-bookworm \
   --build-arg RUNTIME_NODE_IMAGE=node:22-bookworm-slim \
-  -t claude-code-router:local .
+  -t helix-compressor:local .
 ```
 
 运行 Docker 烟雾测试：

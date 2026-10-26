@@ -15,7 +15,8 @@
 
 services:
   ccr:
-    image: claude-code-router:local
+    # 仅用镜像, 不带 build: —— 服务器上没有源码, 避免 compose 误触发构建。
+    image: helix-compressor:local
     container_name: ccr
     restart: unless-stopped
     ports:
@@ -25,12 +26,12 @@ services:
       # 配置/日志/压缩缓存持久化在具名卷里。
       - ccr-data:/data
     environment:
-      CCR_PUBLIC_BASE_URL: ${CCR_PUBLIC_BASE_URL:?set in .env}
-      CCR_WEB_AUTH_TOKEN: ${CCR_WEB_AUTH_TOKEN:?set in .env}
+      CCR_WEB_AUTH_TOKEN: ${CCR_WEB_AUTH_TOKEN:?请在 .env 里设置 CCR_WEB_AUTH_TOKEN}
+      CCR_PUBLIC_BASE_URL: ${CCR_PUBLIC_BASE_URL:-http://127.0.0.1:3458}
       # 加固模式：管理 token 不进 URL，改由反代请求头注入。
       # 开启后必须在反代之前至少加一层访问限制（Basic / oauth2-proxy / VPN），
       # 否则任何能访问该站点的人都等于管理员。
-      CCR_WEB_INJECT_HEADER: ${CCR_WEB_INJECT_HEADER:-1}
+      CCR_WEB_INJECT_HEADER: ${CCR_WEB_INJECT_HEADER:-0}
     # 镜像已内置 ENTRYPOINT=ccr-docker-entrypoint，无需在此指定。
 
 volumes:

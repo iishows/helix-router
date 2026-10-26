@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { prepareLocalGatewayPackage, projectRoot } from "./docker-local-gateway.mjs";
 
-const imageName = process.env.CCR_DOCKER_IMAGE || "claude-code-router:local";
+const imageName = process.env.CCR_DOCKER_IMAGE || "helix-compressor:local";
 const args = process.argv.slice(2);
 
 prepareLocalGatewayPackage();

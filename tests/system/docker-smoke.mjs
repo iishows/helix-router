@@ -8,7 +8,7 @@ import { prepareLocalGatewayPackage } from "../../build/docker-local-gateway.mjs
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..", "..");
-const imageName = process.env.CCR_DOCKER_TEST_IMAGE || "claude-code-router:local";
+const imageName = process.env.CCR_DOCKER_TEST_IMAGE || "helix-compressor:local";
 const token = process.env.CCR_DOCKER_TEST_WEB_AUTH_TOKEN || "token+/&=#?";
 const testId = randomUUID().slice(0, 8);
 const containerName = `ccr-docker-smoke-${testId}`;

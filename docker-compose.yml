@@ -3,7 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: claude-code-router:local
+    image: helix-compressor:local
+    container_name: ccr
     entrypoint: ["/bin/sh", "/usr/local/bin/ccr-docker-entrypoint"]
     ports:
       # Publish only Nginx. Internal web/gateway listeners stay inside the container.
