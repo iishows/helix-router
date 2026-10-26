@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-20T23:49:58.986Z",
+  "generatedAt": "2026-10-24T02:31:28.951Z",
   "generatedBy": "scripts/generate-claude-code-config-options.mjs",
   "sourceUrls": {
     "envEn": "https://code.claude.com/docs/en/env-vars.md",
@@ -52,8 +52,8 @@
       "valueKind": "boolean",
       "enumValues": [],
       "description": {
-        "en": "Allow Claude to send a push notification to your phone when it decides one is worth sending, for example when a long task finishes. Claude Code syncs this choice to your account, and pushes arrive while Remote Control is connected. Appears in /config as Push when Claude decides.",
-        "zh": "Allow Claude to send a push notification to your phone when it decides one is worth sending, for example when a long task finishes. Claude Code syncs this choice to your account, and pushes arrive while Remote Control is connected. Appears in /config as Push when Claude decides."
+        "en": "Allow Claude to send a push notification to your phone when it decides one is worth sending, for example when a long task finishes. Claude can send one while Remote Control is connected. Appears in /config as Push when Claude decides. When you change it there, Claude Code also saves the value to your account.",
+        "zh": "Allow Claude to send a push notification to your phone when it decides one is worth sending, for example when a long task finishes. Claude can send one while Remote Control is connected. Appears in /config as Push when Claude decides. When you change it there, Claude Code also saves the value to your account."
       }
     },
     {
@@ -126,7 +126,7 @@
         "allowedMcpServers"
       ],
       "scope": "Any file. Entries from every file merge into one allowlist unless allowManagedMcpServersOnly is set. Deploy it in managed settings to enforce it.",
-      "type": "array of objects, each with exactly one key: serverName, a string limited to letters, numbers, hyphens, and underscores; serverCommand, an array of the command and its arguments matched exactly; or serverUrl, a URL pattern with * wildcards",
+      "type": "array of objects, each with exactly one key. Use serverName, a string limited to letters, numbers, hyphens, and underscores; serverCommand, an array of the command and its arguments matched exactly; or serverUrl, a URL pattern with * wildcards",
       "default": "unset, so every server is allowed; an empty array blocks every server users add",
       "example": "{\n  \"allowedMcpServers\": [\n    { \"serverCommand\": [\"npx\", \"-y\", \"@modelcontextprotocol/server-filesystem\"] }\n  ]\n}",
       "valueKind": "number",
@@ -576,7 +576,7 @@
       "path": [
         "axScreenReader"
       ],
-      "scope": "Any file",
+      "scope": "User or managed. You can also set the key in a file you pass with --settings. Claude Code ignores the key in project and local settings, so neither a repository nor your own .claude/settings.local.json can turn screen-reader mode on or off.",
       "type": "Boolean",
       "default": "unset, so screen-reader mode is off",
       "example": "{\n  \"axScreenReader\": true\n}",
@@ -2142,8 +2142,8 @@
         "notifications_disabled"
       ],
       "description": {
-        "en": "Choose how Claude Code notifies you when a task completes or a permission prompt is waiting. Appears in /config as Local notifications.",
-        "zh": "Choose how Claude Code notifies you when a task completes or a permission prompt is waiting. Appears in /config as Local notifications."
+        "en": "Choose how Claude Code notifies you when a task completes or a permission prompt is waiting. A mod's notifications use the same setting. Appears in /config as Local notifications.",
+        "zh": "Choose how Claude Code notifies you when a task completes or a permission prompt is waiting. A mod's notifications use the same setting. Appears in /config as Local notifications."
       }
     },
     {
@@ -2348,7 +2348,7 @@
         "sandbox"
       ],
       "scope": "Any file",
-      "type": "object with enabled, failIfUnavailable, autoAllowBashIfSandboxed, excludedCommands, allowUnsandboxedCommands, enableWeakerNestedSandbox, enableWeakerNetworkIsolation, allowAppleEvents, bwrapPath, socatPath, ignoreViolations, and ripgrep, plus the filesystem, network, and credentials objects",
+      "type": "object with enabled, failIfUnavailable, autoAllowBashIfSandboxed, excludedCommands, allowUnsandboxedCommands, enableWeakerNestedSandbox, enableWeakerNetworkIsolation, allowAppleEvents, allowNestedUserNamespaces, bwrapPath, socatPath, ignoreViolations, and ripgrep, plus the filesystem, network, and credentials objects",
       "default": "unset, so Claude Code runs commands without a sandbox",
       "example": "{\n  \"sandbox\": {\n    \"enabled\": true,\n    \"autoAllowBashIfSandboxed\": true,\n    \"excludedCommands\": [\"docker *\"],\n    \"filesystem\": {\n      \"allowWrite\": [\"/tmp/build\", \"~/.kube\"],\n      \"denyRead\": [\"~/.aws/credentials\"]\n    },\n    \"network\": {\n      \"allowedDomains\": [\"github.com\", \"*.npmjs.org\"]\n    }\n  }\n}",
       "valueKind": "object",
@@ -2373,6 +2373,23 @@
       "description": {
         "en": "Let sandboxed commands on macOS send Apple Events, which open, osascript, and tools that open URLs in a browser need; without it they fail with error -600. This removes code-execution isolation: sandboxed commands can launch other applications unsandboxed with no user prompt, and can send AppleScript commands to running applications such as Terminal, subject to the per-app macOS automation-consent prompt (TCC).",
         "zh": "Let sandboxed commands on macOS send Apple Events, which open, osascript, and tools that open URLs in a browser need; without it they fail with error -600. This removes code-execution isolation: sandboxed commands can launch other applications unsandboxed with no user prompt, and can send AppleScript commands to running applications such as Terminal, subject to the per-app macOS automation-consent prompt (TCC)."
+      }
+    },
+    {
+      "key": "sandbox.allowNestedUserNamespaces",
+      "path": [
+        "sandbox",
+        "allowNestedUserNamespaces"
+      ],
+      "scope": "User or managed. A true counts from ~/.claude/settings.json, JSON passed with --settings, or managed settings. Claude Code ignores a true in a project's .claude/settings.json or .claude/settings.local.json. In a session with CLAUDE_CODE_SUBPROCESS_ENV_SCRUB set to 1, Claude Code ignores a true from every source. A false counts from any file, by settings precedence.",
+      "type": "Boolean",
+      "default": "false",
+      "example": "{\n  \"sandbox\": {\n    \"enabled\": true,\n    \"allowNestedUserNamespaces\": true\n  }\n}",
+      "valueKind": "boolean",
+      "enumValues": [],
+      "description": {
+        "en": "Let sandboxed commands on Linux and WSL2 create user namespaces, which Chromium's and Electron's own sandbox, a nested bubblewrap, and unshare need. If you set this key to true, you turn off a security boundary: code from a sandboxed command can end up running outside the sandbox. For rootless Podman or Buildah, use excludedCommands instead, because the sandbox stops them in other ways too. Requires Claude Code v2.1.305 or later.",
+        "zh": "Let sandboxed commands on Linux and WSL2 create user namespaces, which Chromium's and Electron's own sandbox, a nested bubblewrap, and unshare need. If you set this key to true, you turn off a security boundary: code from a sandboxed command can end up running outside the sandbox. For rootless Podman or Buildah, use excludedCommands instead, because the sandbox stops them in other ways too. Requires Claude Code v2.1.305 or later."
       }
     },
     {
@@ -3040,8 +3057,8 @@
       "valueKind": "boolean",
       "enumValues": [],
       "description": {
-        "en": "See summaries of Claude's extended thinking in interactive sessions. Set it if you want the full summaries when you expand thinking with Ctrl+O. When unset or false, the Anthropic API redacts thinking blocks and Claude Code shows a collapsed stub; third-party providers don't redact.",
-        "zh": "See summaries of Claude's extended thinking in interactive sessions. Set it if you want the full summaries when you expand thinking with Ctrl+O. When unset or false, the Anthropic API redacts thinking blocks and Claude Code shows a collapsed stub; third-party providers don't redact."
+        "en": "See summaries of Claude's extended thinking in interactive sessions. Set it if you want the full summaries when you expand thinking with Ctrl+O. When unset or false, the Anthropic API redacts thinking blocks and Claude Code shows a collapsed stub.",
+        "zh": "See summaries of Claude's extended thinking in interactive sessions. Set it if you want the full summaries when you expand thinking with Ctrl+O. When unset or false, the Anthropic API redacts thinking blocks and Claude Code shows a collapsed stub."
       }
     },
     {
@@ -3261,6 +3278,22 @@
       }
     },
     {
+      "key": "sshHostCommands",
+      "path": [
+        "sshHostCommands"
+      ],
+      "scope": "User or managed. Only the desktop app reads this key. It reads managed entries from one managed settings file or MDM policy on the computer, and ignores the key in server-managed settings.",
+      "type": "array of objects, each with required id, name, and command and optional sshIdentityFile and startDirectory. Desktop starts command without a shell, so write it as a program and plain arguments.",
+      "default": "unset",
+      "example": "{\n  \"sshHostCommands\": [\n    {\n      \"id\": \"devbox\",\n      \"name\": \"Dev box\",\n      \"command\": \"acme-dev create\"\n    }\n  ]\n}",
+      "valueKind": "array",
+      "enumValues": [],
+      "description": {
+        "en": "Add SSH connections whose host comes from a command to the Desktop environment selector. When you create a connection or replace its host, Desktop runs the entry's command on your computer and connects to the host that the command prints. Requires Claude Desktop v3.6556.0 or later on macOS or Linux, signed in with a Claude account.",
+        "zh": "Add SSH connections whose host comes from a command to the Desktop environment selector. When you create a connection or replace its host, Desktop runs the entry's command on your computer and connects to the host that the command prints. Requires Claude Desktop v3.6556.0 or later on macOS or Linux, signed in with a Claude account."
+      }
+    },
+    {
       "key": "statusLine",
       "path": [
         "statusLine"
@@ -3321,8 +3354,8 @@
       "valueKind": "array",
       "enumValues": [],
       "description": {
-        "en": "Lock the agents surface. Claude Code stops loading agents from ~/.claude/agents/, .claude/agents/, and --add-dir directories. It keeps loading plugin agents, built-in agents, and agents in the managed policy directory.",
-        "zh": "Lock the agents surface. Claude Code stops loading agents from ~/.claude/agents/, .claude/agents/, and --add-dir directories. It keeps loading plugin agents, built-in agents, and agents in the managed policy directory."
+        "en": "Lock the agents surface. Claude Code stops loading agents from ~/.claude/agents/, .claude/agents/, and --add-dir directories. It keeps loading built-in agents, agents in the managed policy directory, and agents from plugins other than skills-directory plugins.",
+        "zh": "Lock the agents surface. Claude Code stops loading agents from ~/.claude/agents/, .claude/agents/, and --add-dir directories. It keeps loading built-in agents, agents in the managed policy directory, and agents from plugins other than skills-directory plugins."
       }
     },
     {
@@ -3355,8 +3388,8 @@
       "valueKind": "array",
       "enumValues": [],
       "description": {
-        "en": "Lock the mcp surface. Claude Code stops loading MCP servers from ~/.claude.json and .mcp.json, and keeps loading plugin MCP servers, managed-mcp.json servers, and servers from managedMcpServers.",
-        "zh": "Lock the mcp surface. Claude Code stops loading MCP servers from ~/.claude.json and .mcp.json, and keeps loading plugin MCP servers, managed-mcp.json servers, and servers from managedMcpServers."
+        "en": "Lock the mcp surface. Claude Code stops loading MCP servers from ~/.claude.json and .mcp.json. It keeps loading managed-mcp.json servers, servers from managedMcpServers, and MCP servers from plugins other than skills-directory plugins.",
+        "zh": "Lock the mcp surface. Claude Code stops loading MCP servers from ~/.claude.json and .mcp.json. It keeps loading managed-mcp.json servers, servers from managedMcpServers, and MCP servers from plugins other than skills-directory plugins."
       }
     },
     {
@@ -3372,8 +3405,8 @@
       "valueKind": "array",
       "enumValues": [],
       "description": {
-        "en": "Lock the skills surface. Claude Code stops loading skills from ~/.claude/skills/ and .claude/skills/, custom commands from ~/.claude/commands/ and .claude/commands/, skills and commands under --add-dir directories, and skills synced from your claude.ai account. It keeps loading plugin skills, bundled skills, and skills in the managed policy directory.",
-        "zh": "Lock the skills surface. Claude Code stops loading skills from ~/.claude/skills/ and .claude/skills/, custom commands from ~/.claude/commands/ and .claude/commands/, skills and commands under --add-dir directories, and skills synced from your claude.ai account. It keeps loading plugin skills, bundled skills, and skills in the managed policy directory."
+        "en": "Lock the skills surface. Claude Code stops loading skills from ~/.claude/skills/ and .claude/skills/, custom commands from ~/.claude/commands/ and .claude/commands/, skills and commands under --add-dir directories, and skills synced from your claude.ai account. It keeps loading bundled skills, skills in the managed policy directory, and skills from plugins other than skills-directory plugins.",
+        "zh": "Lock the skills surface. Claude Code stops loading skills from ~/.claude/skills/ and .claude/skills/, custom commands from ~/.claude/commands/ and .claude/commands/, skills and commands under --add-dir directories, and skills synced from your claude.ai account. It keeps loading bundled skills, skills in the managed policy directory, and skills from plugins other than skills-directory plugins."
       }
     },
     {
