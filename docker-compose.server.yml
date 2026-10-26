@@ -1,0 +1,37 @@
+# 服务器部署版（宝塔 / 任意 Linux 主机）。
+#
+# 与仓库根目录 docker-compose.yml 的区别：
+#   - 直接用 docker load 进来的镜像，不从源码构建
+#   - 端口只绑回环，公网由宿主 Nginx 终结 TLS（见 docker/README.md 的宝塔章节）
+#   - 公开地址与 Web 管理 token 通过 .env 注入
+#
+# 用法：
+#   1) docker load -i ccr-3.1.6-amd64.tar
+#   2) 在同一个目录建 .env（chmod 600），内容：
+#        CCR_PUBLIC_BASE_URL=https://ccr.example.com
+#        CCR_WEB_AUTH_TOKEN=<64 字符随机串，见下方生成命令>
+#      生成 token：node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))"
+#   3) docker compose -f docker-compose.server.yml up -d
+
+services:
+  ccr:
+    image: claude-code-router:local
+    container_name: ccr
+    restart: unless-stopped
+    ports:
+      # 只绑回环：公网拿不到 3458，必须经宿主 Nginx 反代。
+      - "127.0.0.1:3458:8080"
+    volumes:
+      # 配置/日志/压缩缓存持久化在具名卷里。
+      - ccr-data:/data
+    environment:
+      CCR_PUBLIC_BASE_URL: ${CCR_PUBLIC_BASE_URL:?set in .env}
+      CCR_WEB_AUTH_TOKEN: ${CCR_WEB_AUTH_TOKEN:?set in .env}
+      # 加固模式：管理 token 不进 URL，改由反代请求头注入。
+      # 开启后必须在反代之前至少加一层访问限制（Basic / oauth2-proxy / VPN），
+      # 否则任何能访问该站点的人都等于管理员。
+      CCR_WEB_INJECT_HEADER: ${CCR_WEB_INJECT_HEADER:-1}
+    # 镜像已内置 ENTRYPOINT=ccr-docker-entrypoint，无需在此指定。
+
+volumes:
+  ccr-data:

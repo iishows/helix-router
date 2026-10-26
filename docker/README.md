@@ -221,6 +221,37 @@ node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('b
 
 Store it in a mode-`600` env file, out of shell history and version control. This token is the management superuser credential; rotate it by changing the value and recreating the container.
 
+## Using CCR As An Upstream Provider
+
+CCR's gateway speaks OpenAI-compatible (`POST /v1/chat/completions`, `GET /v1/models`) and Anthropic-compatible (`POST /v1/messages`) protocols, so it can sit behind another router (one-api, new-api, LiteLLM) as a plain upstream channel.
+
+- **Channel type**: custom / OpenAI-compatible.
+- **Base URL**: your public URL, e.g. `https://ccr.example.com`. The container Nginx routes `^/(v1|v1beta|mcp|messages|chat/completions|responses|interactions)(/|$)` to the gateway.
+- **API key**: a CCR client key (`sk-ccr-...`) created under **API keys**. CCR accepts it as `Authorization: Bearer`, `x-api-key`, or `api-key`. Without one, `authorize` returns `403` ("CCR API key is not initialized").
+- **Models**: whatever you configured under **Providers**. `GET /v1/models` lists the available ids.
+
+### Does compression still work?
+
+Yes. Compression and recall are **server-side**: when a request still holds collapsible placeholders, the compressor rewrites the model to `ccr-helix-recall/<model>`, CCR matches a virtual profile and resolves recall through an internal tool loop, including for streaming responses. The caller never sees a placeholder and never calls a recall tool.
+
+Two conditions must hold:
+
+1. The `helix-compressor` plugin must be enabled. It is **off by default** (`plugins: []`); add `helix-compressor` to the plugins list.
+2. Recall only rewrites tokens that were compressed *in the same session/account*. A brand-new caller's first request has nothing to recall, so it simply passes through; savings appear as a conversation grows.
+
+Because recall is internal, a generic OpenAI client behind one-api benefits from compression transparently. The one caveat is billing, below.
+
+### Billing: what the caller's `usage` reports
+
+CCR returns the **post-compression** usage to the caller: the upstream provider is called with the compressed body, so the `usage` it reports already reflects the compressed prompt. A downstream router that bills from the returned `usage` therefore bills the compressed amount — and the upstream provider is billed the compressed amount too, so CCR's compression is a real cost reduction on both hops.
+
+Do **not** rely on the `x-helix-compressor-*` response headers for reconciliation. Measured behavior: they are only attached when a plugin transform was actually applied, so they appear on requests that were *not* compressed (where `baseline == compressed` and carry no signal) and are **absent on the requests that were compressed**. Verified: a large tool-result conversation compresses (baseline 11891 → post 5123) yet returns zero `x-helix-compressor-*` headers.
+
+To reconcile pre- vs post-compression volume, read CCR's own request log (`compression_baseline_tokens`, `compression_post_tokens`, `compression_recall_tokens`). Note the accounting scope, since the three numbers do not line up as "before vs after" on the same base:
+
+- `baseline` and `post` count **messages only** — they exclude `system` and `tools`.
+- `recall` is the original text the gateway re-injected during recall; a request can be net *larger* than baseline once system + tools + recall are added back.
+
 ## Persistent Data
 
 The entrypoint sets `HOME=/data`, so CCR stores files under:
@@ -489,6 +520,37 @@ environment:
 ```
 
 `CCR_PUBLIC_BASE_URL` 只负责写入客户端应使用的公开地址，不会自动发布 Docker 端口。
+
+### 把 CCR 当上游供应商
+
+CCR 网关同时支持 OpenAI 兼容（`POST /v1/chat/completions`、`GET /v1/models`）与 Anthropic 兼容（`POST /v1/messages`），可作为普通「自定义渠道」放在 one-api / new-api / LiteLLM 之后。
+
+- **渠道类型**：自定义 / OpenAI 兼容。
+- **Base URL**：你的公开地址，如 `https://ccr.example.com`。容器 Nginx 会把 `^/(v1|v1beta|mcp|messages|chat/completions|responses|interactions)(/|$)` 转给网关。
+- **密钥**：在**API 密钥**页创建的 CCR 客户端 key（`sk-ccr-...`）。CCR 接受 `Authorization: Bearer`、`x-api-key`、`api-key`；未配置任何 key 时 `authorize` 返回 `403`。
+- **模型**：填你在**供应商**里配好的模型；`GET /v1/models` 会列出可用 id。
+
+#### 压缩还生效吗？
+
+生效。压缩与召回都在**服务端**完成：只要请求里仍有可折叠的占位符，压缩器就把 model 改写成 `ccr-helix-recall/<模型>`，CCR 命中虚拟 profile 后经内部 tool 循环兑现召回，**流式响应同样支持**。调用方既看不到占位符，也无需调用任何召回工具。
+
+两个前提：
+
+1. `helix-compressor` 插件必须启用。它**默认关闭**（`plugins: []`），需在插件列表里显式加入。
+2. 召回只能还原**同一会话/账号**内被压缩的内容。全新调用方的首个请求无可召回内容，直接透传；收益随对话增长而显现。
+
+由于召回在网关内部完成，one-api 后面的普通 OpenAI 客户端可透明享受压缩。唯一需要注意的是计费，见下。
+
+#### 计费：调用方看到的 `usage` 是哪个
+
+CCR 回给调用方的 `usage` 是**压缩后**的：上游收到的本就是压缩后的 body，其上报的 `usage` 已反映压缩结果。因此若 one-api 按返回的 `usage` 给用户计费，计的就是**压缩后**的量；上游供应商同样按压缩后计费，压缩在**两跳**上都是真实降本。
+
+**不要**依赖 `x-helix-compressor-*` 响应头做对账。实测行为：这些头只在插件 transform 确实生效时才附加，于是它们出现在**未被压缩**的请求上（此时 `baseline == compressed`，没有信息量），而在**真正被压缩**的请求上**反而缺失**。已验证：一个含大段 tool_result 的会话确实被压缩（baseline 11891 → post 5123），却返回了 **0 个** `x-helix-compressor-*` 头。
+
+要对账压缩前后的量，请读 CCR 自己的请求日志（`compression_baseline_tokens`、`compression_post_tokens`、`compression_recall_tokens`）。注意口径，三者并非同一基准上的「前 vs 后」：
+
+- `baseline` 与 `post` 只统计 **messages**，不含 `system` 与 `tools`。
+- `recall` 是网关在召回时重新注入的原文；把 system + tools + recall 加回来后，一次请求可能比 baseline **更大**。
 
 ### 数据、备份与升级
 

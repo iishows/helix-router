@@ -1,0 +1,21 @@
+# Normalize line endings so files copied into Linux images are byte-predictable.
+#
+# Why: this repo is developed on Windows, where core.autocrlf=true rewrites LF to
+# CRLF on checkout. Dockerfile does `COPY docker/entrypoint.sh ...`, which copies
+# bytes verbatim, so a CRLF shebang becomes `#!/bin/sh\r` inside the image and the
+# kernel fails to find the interpreter:
+#     exec /usr/local/bin/ccr-docker-entrypoint: no such file or directory
+# Forcing LF for these paths removes the class of bug entirely.
+#
+# Deliberately not using `* text=auto` to avoid renormalizing the whole tree.
+
+# Shell scripts / container entrypoints: shebang must not carry a CR.
+*.sh            text eol=lf
+*.bash          text eol=lf
+
+# Container build inputs and scripts copied into images verbatim.
+Dockerfile      text eol=lf
+*.dockerfile    text eol=lf
+.dockerignore   text eol=lf
+*.cjs           text eol=lf
+*.mjs           text eol=lf
