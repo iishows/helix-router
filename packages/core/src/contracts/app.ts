@@ -889,6 +889,12 @@ export type GatewayPluginAppConfig = {
 
 export const CLAUDE_DESIGN_PLUGIN_ID = "claude-design";
 export const CLAUDE_SHIP_PLUGIN_ID = "claude-ship";
+/**
+ * helix-compressor 是编译进 core 的内置插件（transform 直接注册在 router-plugin，
+ * 没有 `module`，也不参与 plugin service 的模块加载）。
+ * 它默认启用（见 default-config）；显式 `enabled:false` 可关闭。
+ */
+export const HELIX_COMPRESSOR_PLUGIN_ID = "helix-compressor";
 export const DEFAULT_CLAUDE_DESIGN_APP: GatewayPluginAppConfig = {
   description: "Open Claude Design in a dedicated CCR Electron window.",
   icon: "palette",

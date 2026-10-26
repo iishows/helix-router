@@ -108,8 +108,17 @@ test("启用 helix 插件 → 挂载 helix-recall MCP server(网关工具 provid
   assert.ok(server.env?.HELIX_RECALL_CACHE_DIR, "MCP 子进程需共享 HELIX_RECALL_CACHE_DIR");
 });
 
-test("未配置 helix-compressor 插件 → 不追加 helix profile,不挂 recall MCP", async () => {
+test("默认配置(内置插件默认启用) → 追加 helix profile,挂 recall MCP", async () => {
   const config = createDefaultAppConfig();
+  const compiled = await compileCoreGatewayConfig(config, "raw-trace-token", "billing-token", "core-token");
+
+  assert.ok(helixRecallProfile(compiled));
+  assert.ok(helixRecallServer(compiled));
+});
+
+test("helix 插件被移除 → 不追加 helix profile,不挂 recall MCP", async () => {
+  const config = createDefaultAppConfig();
+  config.plugins = [];
   const compiled = await compileCoreGatewayConfig(config, "raw-trace-token", "billing-token", "core-token");
 
   assert.equal(helixRecallProfile(compiled), undefined);

@@ -4,6 +4,7 @@ import {
   DEFAULT_TRAY_COMPONENT_VARIANTS,
   DEFAULT_TRAY_WIDGETS,
   DEFAULT_TRAY_WINDOW_MODULES,
+  HELIX_COMPRESSOR_PLUGIN_ID,
   type AppConfig,
   type ProxyRouteTarget
 } from "@ccr/core/contracts/app";
@@ -125,7 +126,9 @@ export function createDefaultAppConfig(options: DefaultAppConfigOptions = {}): A
       requestLogs: false
     },
     preferredProvider: "",
-    plugins: [],
+    // helix-compressor 是编译进 core 的内置插件（无 `module`），默认启用；
+    // 显式 `enabled:false` 关闭。老部署由 config.ts 的迁移补齐。
+    plugins: [{ enabled: true, id: HELIX_COMPRESSOR_PLUGIN_ID }],
     profile: {
       claudeCode: {
         enabled: true,

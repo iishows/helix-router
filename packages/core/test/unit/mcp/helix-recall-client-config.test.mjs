@@ -26,6 +26,12 @@ function configWithHelixPlugin(pluginConfig) {
   return config;
 }
 
+function configWithoutHelixPlugin() {
+  const config = createDefaultAppConfig();
+  config.plugins = [];
+  return config;
+}
+
 // ---------- helixLocalRecallEnabled 真值表 ----------
 
 test("helixLocalRecallEnabled: 插件存在且启用 → true", () => {
@@ -33,8 +39,12 @@ test("helixLocalRecallEnabled: 插件存在且启用 → true", () => {
   assert.equal(helixLocalRecallEnabled(configWithHelixPlugin({ keepRecentPairs: 1 })), true);
 });
 
-test("helixLocalRecallEnabled: 无插件 / 插件禁用 → false", () => {
-  assert.equal(helixLocalRecallEnabled(createDefaultAppConfig()), false);
+test("helixLocalRecallEnabled: 默认配置(内置插件默认启用) → true", () => {
+  assert.equal(helixLocalRecallEnabled(createDefaultAppConfig()), true);
+});
+
+test("helixLocalRecallEnabled: 插件被移除 / 显式禁用 → false", () => {
+  assert.equal(helixLocalRecallEnabled(configWithoutHelixPlugin()), false);
   assert.equal(helixLocalRecallEnabled(undefined), false);
   const disabled = configWithHelixPlugin({});
   disabled.plugins[0].enabled = false;
@@ -62,10 +72,10 @@ test("启用 helix 插件 → 产出客户端形状的 helix-recall server,与 g
   assert.equal("name" in client, false);
 });
 
-test("未启用本地召回(无插件/禁用) → undefined(不注入客户端 MCP)", () => {
+test("未启用本地召回(插件移除/禁用) → undefined(不注入客户端 MCP)", () => {
   const disabled = configWithHelixPlugin({});
   disabled.plugins[0].enabled = false;
   assert.equal(claudeCodeHelixRecallMcpConfig(disabled), undefined);
-  assert.equal(claudeCodeHelixRecallMcpConfig(createDefaultAppConfig()), undefined);
+  assert.equal(claudeCodeHelixRecallMcpConfig(configWithoutHelixPlugin()), undefined);
   assert.equal(claudeCodeHelixRecallMcpConfig(undefined), undefined);
 });

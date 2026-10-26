@@ -999,12 +999,13 @@ async function applyHelixCompressorTransform(
   const routedModel = requestInput.model;
 
   // 查找 helix-compressor plugin config（v1.1 评估边界由插件配置）
+  // 判据与 `helixLocalRecallEnabled` 保持一致：只看 `enabled !== false`。
+  // 之前额外要求 `isRecord(helixPlugin.config)`，导致 `{id, enabled:true}` 这种
+  // 「按 README 启用」的写法出现最坏组合：召回开启(注入 recall MCP + 改写虚拟模型)
+  // 但压缩静默关闭。`parseConfig` 对缺失 config 已回退 HELIX_COMPRESSOR_DEFAULTS，
+  // 因此该字段不是启用前提。
   const helixPlugin = (config.plugins ?? []).find((plugin) => plugin.id === "helix-compressor");
-  if (!helixPlugin || !isRecord(helixPlugin.config)) {
-    return undefined;
-  }
-  const helixEnabled = helixPlugin.enabled !== false;
-  if (!helixEnabled) {
+  if (!helixPlugin || helixPlugin.enabled === false) {
     return undefined;
   }
 

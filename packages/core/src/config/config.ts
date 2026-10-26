@@ -15,7 +15,7 @@ import { LEGACY_ACTIVE_CONFIG_FILE, LEGACY_CONFIG_FILE, LEGACY_WINDOWS_CONFIG_FI
 import { normalizeCodexProviderAccountConfig } from "@ccr/core/agents/local-providers/codex";
 import { normalizeGrokProviderAccountConfig, normalizeGrokProviderMediaCapabilities } from "@ccr/core/agents/local-providers/grok";
 import { removeOpenCodeProviderAccountConfig } from "@ccr/core/agents/local-providers/opencode";
-import { CLAUDE_CODE_DEFAULT_ENV, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY_ENV, CLAUDE_DESIGN_PLUGIN_ID, CLAUDE_SHIP_PLUGIN_ID, DEFAULT_TRAY_COMPONENT_VARIANTS, GATEWAY_PLUGIN_PERMISSION_IDS, GATEWAY_PLUGIN_SURFACE_IDS, OVERVIEW_WIDGET_SIZE_VALUES, ROUTER_FALLBACK_MAX_RETRY_COUNT, ROUTER_SCRIPT_API_VERSION, ROUTER_SCRIPT_DEFAULT_TIMEOUT_MS, ROUTER_SCRIPT_MAX_TIMEOUT_MS, TRAY_SINGLETON_WIDGET_TYPES, TRAY_TOP_WIDGET_TYPES, TRAY_WINDOW_MODULE_IDS, enforceSingleEnabledGlobalProfilePerAgent, isEnabledGlobalProfile, knownGatewayPluginDefaultApps, knownGatewayPluginDefaultPermissions, knownGatewayPluginDefaultSurfaces } from "@ccr/core/contracts/app";
+import { CLAUDE_CODE_DEFAULT_ENV, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY_ENV, CLAUDE_DESIGN_PLUGIN_ID, CLAUDE_SHIP_PLUGIN_ID, DEFAULT_TRAY_COMPONENT_VARIANTS, HELIX_COMPRESSOR_PLUGIN_ID, GATEWAY_PLUGIN_PERMISSION_IDS, GATEWAY_PLUGIN_SURFACE_IDS, OVERVIEW_WIDGET_SIZE_VALUES, ROUTER_FALLBACK_MAX_RETRY_COUNT, ROUTER_SCRIPT_API_VERSION, ROUTER_SCRIPT_DEFAULT_TIMEOUT_MS, ROUTER_SCRIPT_MAX_TIMEOUT_MS, TRAY_SINGLETON_WIDGET_TYPES, TRAY_TOP_WIDGET_TYPES, TRAY_WINDOW_MODULE_IDS, enforceSingleEnabledGlobalProfilePerAgent, isEnabledGlobalProfile, knownGatewayPluginDefaultApps, knownGatewayPluginDefaultPermissions, knownGatewayPluginDefaultSurfaces } from "@ccr/core/contracts/app";
 import { createDefaultAppConfig } from "@ccr/core/config/default-config";
 import { maxRequestLogBodyBytes } from "@ccr/core/observability/request-log-limits";
 import { findProviderPresetByBaseUrl, primaryProviderPresetEndpoint, providerApiKeySafetyIssue, providerEndpointCanReceiveProviderApiKey } from "@ccr/core/providers/presets/index";
@@ -2733,9 +2733,26 @@ function migrateKnownGatewayPluginConfigs(plugins: GatewayPluginConfig[] | undef
     }
   }
 
+  const helixMigration = migrateHelixCompressorPluginConfig(migrated);
+  return { changed: changed || helixMigration.changed, plugins: helixMigration.plugins };
+}
+
+/**
+ * 让已有部署补上 helix-compressor 条目。
+ *
+ * 背景：插件默认启用（`default-config.ts`），但 DB 里已存在的 `plugins` 数组
+ * 会整个覆盖默认值（`picked.plugins ?? DEFAULT_CONFIG.plugins`），所以仅改
+ * 默认模板对老部署无效。这里在读取配置时补一条最小条目。
+ * 该 id 已存在（无论启用或显式 `enabled:false`）则保持原样，避免把用户
+ * 关掉的插件"复活"。
+ */
+function migrateHelixCompressorPluginConfig(plugins: GatewayPluginConfig[]): { changed: boolean; plugins: GatewayPluginConfig[] } {
+  if (plugins.some((plugin) => plugin.id === HELIX_COMPRESSOR_PLUGIN_ID)) {
+    return { changed: false, plugins };
+  }
   return {
-    changed,
-    plugins: migrated
+    changed: true,
+    plugins: [...plugins, { enabled: true, id: HELIX_COMPRESSOR_PLUGIN_ID }]
   };
 }
 

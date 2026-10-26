@@ -46,7 +46,7 @@ test("legacy combined Claude Design plugin config migrates to split Design and S
     }]);
 
     assert.equal(result.changed, true);
-    assert.deepEqual(result.plugins.map((plugin) => plugin.id), ["claude-design", "claude-ship"]);
+    assert.deepEqual(result.plugins.map((plugin) => plugin.id), ["claude-design", "claude-ship", "helix-compressor"]);
     assert.equal(result.plugins[0].module, bundledPluginModule("claude-design"));
     assert.deepEqual(result.plugins[0].apps?.map((app) => app.id), ["claude-design"]);
     assert.equal(result.plugins[0].apps?.[0]?.url, "https://claude-design.ccrdesk.top/design");
@@ -90,7 +90,7 @@ test("legacy Claude Design migration does not duplicate an existing Claude Ship 
     ]);
 
     assert.equal(result.changed, true);
-    assert.deepEqual(result.plugins.map((plugin) => plugin.id), ["claude-design", "claude-ship"]);
+    assert.deepEqual(result.plugins.map((plugin) => plugin.id), ["claude-design", "claude-ship", "helix-compressor"]);
   } finally {
     restoreEnv("CCR_EXTENSIONS_DIR", previousExtensionsDir);
     rmSync(extensionsRoot, { force: true, recursive: true });
@@ -128,6 +128,26 @@ test("Claude Design runtime plugin config resolves from the bundled plugin in CC
   } finally {
     restoreEnv(CCR_DESKTOP_APP_ENV, previousDesktopApp);
   }
+});
+
+test("legacy config without helix-compressor gets the built-in enabled by migration", () => {
+  const result = migrateKnownGatewayPluginConfigsForTest([]);
+  assert.equal(result.changed, true);
+  assert.deepEqual(result.plugins, [{ enabled: true, id: "helix-compressor" }]);
+});
+
+test("an explicitly disabled helix-compressor is never resurrected by migration", () => {
+  const disabled = [{ enabled: false, id: "helix-compressor" }];
+  const result = migrateKnownGatewayPluginConfigsForTest(disabled);
+  assert.equal(result.changed, false);
+  assert.deepEqual(result.plugins, disabled);
+});
+
+test("an existing helix-compressor entry is left untouched by migration", () => {
+  const existing = [{ enabled: true, config: { tokenBudget: 5000 }, id: "helix-compressor" }];
+  const result = migrateKnownGatewayPluginConfigsForTest(existing);
+  assert.equal(result.changed, false);
+  assert.deepEqual(result.plugins, existing);
 });
 
 test("Claude Design runtime plugin config is unavailable outside CCR Desktop", () => {
