@@ -282,6 +282,9 @@ export class ConfigRepository {
   }
 
   private async open(): Promise<SqlDatabase> {
+    // open() 会建表、跑 migration 并清理 legacy 文件,所以护栏放在这里,
+    // 而不是只挡写方法(读同样可能改写真实用户数据)。
+    assertConfigDatabaseAccessAllowed(this.dbFile);
     const dbDir = dirname(this.dbFile);
     mkdirSync(dbDir, { mode: privateDirMode, recursive: true });
     securePathPermissions(dbDir, privateDirMode);
@@ -301,6 +304,53 @@ export class ConfigRepository {
     secureDatabaseFilePermissions(this.dbFile);
     return database;
   }
+}
+
+/**
+ * 护栏:测试进程绝不能打开**真实**用户配置库。
+ *
+ * 背景(2026-10-29):`node --test` 直接跑单测(绕过 `npm test` 的临时 HOME)
+ * 时,任何 import 了 config 仓库的测试都会落到 %APPDATA%/claude-code-router/
+ * config.sqlite —— `open()` 里还会执行 schema/migration 与 legacy 文件清理。
+ * 典型事故:`theme-preference.test.mjs` 把 `HOST` 写成了
+ * `theme-preference-stale-save.test`,并在运行中的网关热重载配置时,使
+ * `Doitx/<model>` 的 provider 解析短暂失配,请求被判 400
+ * `Model "..." is not configured for target provider ...`。
+ *
+ * 判据:
+ *   - 非测试进程(`NODE_TEST_CONTEXT` 未设置)→ 放行;
+ *   - 测试进程但已隔离(runner 注入的 CCR_INTERNAL_* 临时路径)→ 放行;
+ *   - 测试进程显式使用**非**真实库路径(临时 db)→ 放行,便于仓库单测自建实例。
+ */
+const testContextEnv = "NODE_TEST_CONTEXT";
+const isolatedPathEnvs = ["CCR_INTERNAL_HOME_DIR", "CCR_INTERNAL_APP_DATA_DIR", "CCR_INTERNAL_USER_DATA_DIR"] as const;
+const unisolatedTestWriteMessage =
+  "[config] Refusing to open the user configuration from a test process that is not isolated. "
+  + "Run tests via `npm test` (temporary home), or point "
+  + `${isolatedPathEnvs.join(" / ")} at a temporary directory.`;
+
+export class ConfigStoreTestIsolationError extends Error {
+  constructor() {
+    super(unisolatedTestWriteMessage);
+    this.name = "ConfigStoreTestIsolationError";
+  }
+}
+
+function hasIsolatedTestPaths(): boolean {
+  return isolatedPathEnvs.some((key) => Boolean(process.env[key]?.trim()));
+}
+
+export function assertConfigDatabaseAccessAllowed(dbFile: string): void {
+  if (!process.env[testContextEnv]?.trim()) {
+    return;
+  }
+  if (hasIsolatedTestPaths()) {
+    return;
+  }
+  if (!samePath(dbFile, APP_CONFIG_DB_FILE)) {
+    return;
+  }
+  throw new ConfigStoreTestIsolationError();
 }
 
 export const configRepository = new ConfigRepository(APP_CONFIG_DB_FILE);
