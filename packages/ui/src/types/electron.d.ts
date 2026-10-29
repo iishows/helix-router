@@ -88,6 +88,7 @@ import type {
   UsageStatsResetResult,
   UsageStatsSnapshot
 } from "@ccr/core/contracts/app";
+import type { ProviderEndpointLockState } from "@ccr/core/providers/endpoint-lock";
 import type { ProviderPreset } from "@ccr/core/providers/presets/types";
 
 declare global {
@@ -121,6 +122,7 @@ declare global {
       getProviderCatalogModels: (request: ProviderCatalogModelsRequest) => Promise<ProviderCatalogModelsResult>;
       getOpenRouterProviderCatalog: (request: OpenRouterProviderCatalogRequest) => Promise<OpenRouterProviderCatalogResult>;
       getProviderPresets: () => Promise<ProviderPreset[]>;
+      getProviderEndpointLock: () => Promise<ProviderEndpointLockState>;
       getPluginMarketplace: () => Promise<PluginMarketplaceEntry[]>;
       getProxyCertificateStatus: () => Promise<ProxyCertificateStatus>;
       getProxyNetworkCaptures: () => Promise<ProxyNetworkSnapshot>;

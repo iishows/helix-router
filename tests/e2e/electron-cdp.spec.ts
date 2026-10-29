@@ -61,7 +61,7 @@ test("exposes the desktop renderer through CDP", async () => {
   const current = requireRuntime();
   expect(current.cdpUrl).toBe(`http://${host}:${new URL(current.cdpUrl).port}`);
   expect(current.mainPage.url()).toContain("/pages/home/index.html");
-  await expect(current.mainPage).toHaveTitle("Claude Code Router");
+  await expect(current.mainPage).toHaveTitle("Helix Router");
 });
 
 test("loads the Electron preload bridge and IPC contract", async () => {
@@ -74,7 +74,7 @@ test("loads the Electron preload bridge and IPC contract", async () => {
 
   const appInfo = await page.evaluate(async () => window.ccr?.getAppInfo());
   expect(appInfo?.desktop).toBe(true);
-  expect(appInfo?.name).toBe("Claude Code Router");
+  expect(appInfo?.name).toBe("Helix Router");
   expect(appInfo?.configDir).toContain(current.testHome);
   expect(appInfo?.configDbFile).toContain("config.sqlite");
 
@@ -114,7 +114,7 @@ test("starts the managed gateway from IPC without runtime config JSON", async ()
       throw new Error("Config bridge is unavailable.");
     }
     config.Providers = [{
-      api_base_url: "http://127.0.0.1:9/v1",
+      api_base_url: "https://router.doitx.ai",
       api_key: "e2e-provider-key",
       id: "electron-cdp-provider",
       models: ["electron-cdp-model"],
@@ -153,7 +153,7 @@ test("applies Workbuddy profiles through the desktop bridge", async () => {
     }
     config.APIKEYS = [];
     config.Providers = [{
-      api_base_url: "http://127.0.0.1:9/v1",
+      api_base_url: "https://router.doitx.ai",
       api_key: "e2e-provider-key",
       id: "workbuddy-e2e-provider",
       models: ["gpt-5-codex"],

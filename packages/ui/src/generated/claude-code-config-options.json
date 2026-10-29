@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-24T02:31:28.951Z",
+  "generatedAt": "2026-10-28T14:58:37.003Z",
   "generatedBy": "scripts/generate-claude-code-config-options.mjs",
   "sourceUrls": {
     "envEn": "https://code.claude.com/docs/en/env-vars.md",
@@ -953,7 +953,7 @@
       ],
       "scope": "Managed",
       "type": "Boolean",
-      "default": "unset, so Claude Code follows allowManagedHooksOnly: an organization that restricts hook execution to managed settings gets command sources disabled too",
+      "default": "unset, so Claude Code follows allowManagedHooksOnly: an organization that restricts hook execution to managed settings gets command sources disabled too. An application that passes disableAllHooks: true in the Agent SDK's managedSettings option doesn't by itself disable command sources.",
       "example": "{\n  \"disableCommandPluginSources\": true\n}",
       "valueKind": "boolean",
       "enumValues": [],
@@ -1534,8 +1534,8 @@
       "valueKind": "boolean",
       "enumValues": [],
       "description": {
-        "en": "Idle compaction compacts a long conversation that you've stepped away from, shortly before its prompt cache expires. Your next message then sends a summary instead of the whole conversation. When you come back, the conversation shows a line that starts with Compacted while idle, before the prompt cache expired.",
-        "zh": "Idle compaction compacts a long conversation that you've stepped away from, shortly before its prompt cache expires. Your next message then sends a summary instead of the whole conversation. When you come back, the conversation shows a line that starts with Compacted while idle, before the prompt cache expired."
+        "en": "Idle compaction compacts a long conversation that you've stepped away from. Your next message then sends a summary instead of the whole conversation. Once compacted, the conversation shows a notice:",
+        "zh": "Idle compaction compacts a long conversation that you've stepped away from. Your next message then sends a summary instead of the whole conversation. Once compacted, the conversation shows a notice:"
       }
     },
     {
@@ -2759,8 +2759,8 @@
       "valueKind": "boolean",
       "enumValues": [],
       "description": {
-        "en": "Skip filesystem isolation while keeping network isolation. Sandboxed commands get unrestricted read and write access to the host filesystem, and their network egress stays confined to network.allowedDomains. Use it when you sandbox to control where commands connect rather than what they write. Requires Claude Code v2.1.216 or later.",
-        "zh": "Skip filesystem isolation while keeping network isolation. Sandboxed commands get unrestricted read and write access to the host filesystem, and their network egress stays confined to network.allowedDomains. Use it when you sandbox to control where commands connect rather than what they write. Requires Claude Code v2.1.216 or later."
+        "en": "Skip filesystem isolation while keeping network isolation. Sandboxed commands get unrestricted read and write access to the host filesystem, and their network egress stays confined to network.allowedDomains. Use it when you sandbox to control where commands connect rather than what they write.",
+        "zh": "Skip filesystem isolation while keeping network isolation. Sandboxed commands get unrestricted read and write access to the host filesystem, and their network egress stays confined to network.allowedDomains. Use it when you sandbox to control where commands connect rather than what they write."
       }
     },
     {
@@ -2861,7 +2861,7 @@
       "scope": "Any file, with limits on project and local settings",
       "type": "array of strings, each a service name; a single trailing matches a prefix, and \"\" alone matches every service",
       "default": "unset",
-      "example": "{\n  \"sandbox\": {\n    \"network\": {\n      \"allowMachLookup\": [\"com.apple.coresimulator.*\"]\n    }\n  }\n}",
+      "example": "{\n  \"sandbox\": {\n    \"network\": {\n      \"allowMachLookup\": [\"com.apple.CoreSimulator.*\"]\n    }\n  }\n}",
       "valueKind": "array",
       "enumValues": [],
       "description": {
@@ -3826,8 +3826,8 @@
         "large"
       ],
       "description": {
-        "en": "Set the agent count Claude aims for in the dynamic workflows it writes. Claude Code sends the value to Claude as advice, not an enforced cap: \"small\" asks for fewer than 5 agents, \"medium\" fewer than 10, and \"large\" fewer than 50. Choose \"small\" when you want to bound what a workflow spends. Requires Claude Code v2.1.219 or later.",
-        "zh": "Set the agent count Claude aims for in the dynamic workflows it writes. Claude Code sends the value to Claude as advice, not an enforced cap: \"small\" asks for fewer than 5 agents, \"medium\" fewer than 10, and \"large\" fewer than 50. Choose \"small\" when you want to bound what a workflow spends. Requires Claude Code v2.1.219 or later."
+        "en": "Set the agent count Claude aims for in the dynamic workflows it writes. Claude Code sends the value to Claude as advice, not an enforced cap: \"small\" asks for fewer than 5 agents, \"medium\" fewer than 10, and \"large\" fewer than 50. Choose \"small\" when you want to bound what a workflow spends.",
+        "zh": "Set the agent count Claude aims for in the dynamic workflows it writes. Claude Code sends the value to Claude as advice, not an enforced cap: \"small\" asks for fewer than 5 agents, \"medium\" fewer than 10, and \"large\" fewer than 50. Choose \"small\" when you want to bound what a workflow spends."
       }
     },
     {
@@ -3912,7 +3912,7 @@
       "scope": "Any file",
       "type": "array of strings, directory paths relative to the repository root",
       "default": "unset, so each worktree checks out the whole tree",
-      "example": "{\n  \"worktree\": {\n    \"sparsePaths\": [\"packages/my-app\", \"shared/utils\"]\n  }\n}",
+      "example": "{\n  \"worktree\": {\n    \"sparsePaths\": [\".claude\", \"packages/my-app\", \"shared/utils\"]\n  }\n}",
       "valueKind": "array",
       "enumValues": [],
       "description": {

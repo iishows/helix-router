@@ -135,9 +135,10 @@ Do not edit or copy live SQLite files while CCR is writing to them. Use the UI e
 | --- | --- |
 | `CCR_WEB_HOST` | Default management listener when `--host` is omitted. |
 | `CCR_WEB_PORT` | Default management port when `--port` is omitted. |
-| `CCR_WEB_AUTH_TOKEN` | Fixes the management UI/RPC token instead of generating a random token for the process. |
+| `CCR_WEB_LOGIN_PASSWORD` | Enables a login page for the management console; a correct password issues an `HttpOnly` session cookie. No login page when unset. |
+| `CCR_WEB_AUTH_TOKEN` | Fixes the management RPC token instead of generating a random token for the process. Used by non-browser callers. |
 
-The authenticated management URL contains `ccr_web_token` in its query string. Treat that URL like a password and avoid copying it into logs, tickets, or shell history. Bind to `127.0.0.1` unless remote access is intentional. For remote access, use a firewall or private network plus TLS at a trusted reverse proxy.
+When `CCR_WEB_LOGIN_PASSWORD` is set, visiting the console while signed out redirects to a login page, and browsers never receive a token. `ccr ui` opens the console from a `?ccr_web_token=...` URL; upstream of that, treat the token (and the password) like a secret and avoid copying them into logs, tickets, or shell history. Bind to `127.0.0.1` unless remote access is intentional. For remote access, use a firewall or private network plus TLS at a trusted reverse proxy.
 
 Do not expose the gateway without creating CCR client API keys. Upstream provider credentials are stored in CCR's local data directory, so protect that directory and its backups.
 

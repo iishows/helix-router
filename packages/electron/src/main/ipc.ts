@@ -36,6 +36,7 @@ import { applyRecallDetection, detectRecallModelsForConfig } from "@ccr/core/pro
 import { fetchProviderManifest } from "@ccr/core/providers/manifest-service";
 import { getLocalAgentProviderCandidates, importLocalAgentProvider, probeLocalAgentProvider } from "@ccr/core/agents/local-providers/service";
 import { isLaunchAtLoginSupported, syncLaunchAtLogin } from "./launch-at-login";
+import { isProviderEndpointLocked, lockedProviderEndpointOriginsText } from "@ccr/core/providers/endpoint-lock";
 import { getProviderCatalogModels } from "@ccr/core/providers/model-catalog";
 import { getOpenRouterProviderCatalog } from "@ccr/core/providers/openrouter-provider-catalog";
 import { getProviderPresets } from "@ccr/core/providers/presets/index";
@@ -116,6 +117,10 @@ ipcMain.handle(IPC_CHANNELS.appGetProviderAccountSnapshots, (_event, provider?: 
 ipcMain.handle(IPC_CHANNELS.appGetProviderCatalogModels, (_event, request: ProviderCatalogModelsRequest) => getProviderCatalogModels(request));
 ipcMain.handle(IPC_CHANNELS.appGetOpenRouterProviderCatalog, (_event, request: OpenRouterProviderCatalogRequest) => getOpenRouterProviderCatalog(request));
 ipcMain.handle(IPC_CHANNELS.appGetProviderPresets, () => getProviderPresets());
+ipcMain.handle(IPC_CHANNELS.appGetProviderEndpointLock, () => ({
+  endpoint: lockedProviderEndpointOriginsText(),
+  locked: isProviderEndpointLocked()
+}));
 ipcMain.handle(IPC_CHANNELS.appGetAgentAnalysis, (_event, filter?: AgentAnalysisFilter) => getAgentAnalysis(filter));
 ipcMain.handle(IPC_CHANNELS.appGetAgentTracePayload, (_event, request: AgentAnalysisTracePayloadRequest) => getAgentTracePayload(request));
 ipcMain.handle(IPC_CHANNELS.appGetGatewayStatus, () => gatewayService.getStatus());

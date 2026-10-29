@@ -10,6 +10,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..", "..");
 const imageName = process.env.CCR_DOCKER_TEST_IMAGE || "helix-compressor:local";
 const token = process.env.CCR_DOCKER_TEST_WEB_AUTH_TOKEN || "token+/&=#?";
+const loginPassword = process.env.CCR_DOCKER_TEST_WEB_LOGIN_PASSWORD || "pa ss+/&=#?word";
 const testId = randomUUID().slice(0, 8);
 const containerName = `ccr-docker-smoke-${testId}`;
 const volumeName = `ccr-docker-smoke-${testId}`;
@@ -43,6 +44,8 @@ try {
     "-e",
     `CCR_WEB_AUTH_TOKEN=${token}`,
     "-e",
+    `CCR_WEB_LOGIN_PASSWORD=${loginPassword}`,
+    "-e",
     "CCR_PUBLIC_HOST=127.0.0.1",
     "-e",
     `CCR_PUBLIC_PORT=${hostPort}`,
@@ -62,16 +65,48 @@ try {
   assert.ok(ports["8080/tcp"], "Docker container must publish only the Nginx port");
   assert.equal(ports["3456/tcp"], undefined, "Docker container must not publish the internal gateway port");
 
+  // Default mode: unauthenticated browsers are redirected to the login page and
+  // no credential ever appears in a URL.
   const redirect = await fetch(baseUrl, { redirect: "manual" });
   assert.equal(redirect.status, 302);
   const redirectLocation = redirect.headers.get("location");
-  assert.equal(redirectLocation, `/pages/home/index.html?ccr_web_token=${encodeURIComponent(token)}`);
+  assert.equal(redirectLocation, "/pages/login/index.html");
+  assert.doesNotMatch(redirectLocation, /ccr_web_token/);
 
-  const page = await fetch(`${baseUrl}${redirectLocation}`);
+  const loginPage = await fetch(`${baseUrl}${redirectLocation}`);
+  assert.equal(loginPage.status, 200);
+  const loginHtml = await loginPage.text();
+  assert.match(loginHtml, /api\/ccr\/login/);
+  assert.doesNotMatch(loginHtml, /ccr_web_token/);
+
+  const authStatusAnonymous = await fetch(`${baseUrl}/api/ccr/auth-status`);
+  assert.equal(authStatusAnonymous.status, 200);
+  assert.deepEqual(await authStatusAnonymous.json(), { authenticated: false, loginRequired: true, ok: true });
+
+  const wrongPassword = await login(baseUrl, "not-the-password");
+  assert.equal(wrongPassword.status, 401);
+  assert.equal((await wrongPassword.json()).ok, false);
+
+  const loginResponse = await login(baseUrl, loginPassword);
+  assert.equal(loginResponse.status, 200);
+  const sessionCookie = sessionCookieFrom(loginResponse);
+  assert.ok(sessionCookie, "successful login must set a session cookie");
+  assert.match(loginResponse.headers.get("set-cookie"), /HttpOnly/i);
+  assert.match(loginResponse.headers.get("set-cookie"), /SameSite=Lax/i);
+
+  const authStatusSignedIn = await fetch(`${baseUrl}/api/ccr/auth-status`, { headers: { cookie: sessionCookie } });
+  assert.deepEqual(await authStatusSignedIn.json(), { authenticated: true, loginRequired: true, ok: true });
+
+  const page = await fetch(baseUrl, { headers: { cookie: sessionCookie } });
   assert.equal(page.status, 200);
   const pageHtml = await page.text();
   assert.match(pageHtml, /Helix Router/);
   assert.match(pageHtml, /web-client-bridge\.js/);
+
+  // The token query param still bootstraps non-browser callers (e.g. `ccr ui`).
+  const tokenized = await fetch(`${baseUrl}/?ccr_web_token=${encodeURIComponent(token)}`, { redirect: "manual" });
+  assert.equal(tokenized.status, 200);
+  assert.match(await tokenized.text(), /Helix Router/);
 
   const bridge = await fetch(`${baseUrl}/assets/web-client-bridge.js`);
   assert.equal(bridge.status, 200);
@@ -96,7 +131,7 @@ try {
   assert.equal(presets.status, 200);
   const presetsPayload = await presets.json();
   assert.equal(presetsPayload.ok, true);
-  assert.ok(presetsPayload.value.some((preset) => preset.id === "openai"));
+  assert.deepEqual(presetsPayload.value.map((preset) => preset.id), ["doitx"]);
 
   const usageStatsWithNullFilter = await rpc(baseUrl, "getUsageStats", token, ["7d", null]);
   assert.equal(usageStatsWithNullFilter.status, 200);
@@ -118,25 +153,25 @@ try {
   const gatewayHealth = await fetch(`${baseUrl}/health`);
   assert.equal(gatewayHealth.status, 502, "Gateway health should be proxied by Nginx and fail while no models are configured");
 
-  const openRouterConfig = {
+  const doitxConfig = {
     ...configPayload.value,
     Providers: [
       {
-        apiKey: "test-openrouter-key",
-        baseUrl: "https://openrouter.ai/api/v1",
+        apiKey: "test-doitx-key",
+        baseUrl: "https://router.doitx.ai",
         capabilities: [
-          { baseUrl: "https://openrouter.ai/api/v1", source: "preset", type: "openai_chat_completions" },
-          { baseUrl: "https://openrouter.ai/api/v1", source: "preset", type: "openai_responses" },
-          { baseUrl: "https://openrouter.ai/api", endpoint: "https://openrouter.ai/api/v1/messages", source: "detected", type: "anthropic_messages" }
+          { baseUrl: "https://router.doitx.ai", source: "preset", type: "openai_chat_completions" },
+          { baseUrl: "https://router.doitx.ai", source: "preset", type: "openai_responses" },
+          { baseUrl: "https://router.doitx.ai", source: "preset", type: "anthropic_messages" }
         ],
-        models: ["qwen/qwen3.5-122b-a10b"],
-        name: "OpenRouter",
+        models: ["claude-sonnet-5-5"],
+        name: "DoitX",
         type: "openai_responses"
       }
     ],
-    preferredProvider: "OpenRouter"
+    preferredProvider: "DoitX"
   };
-  const savedConfig = await rpc(baseUrl, "saveConfig", token, [openRouterConfig, { applyProfile: false }]);
+  const savedConfig = await rpc(baseUrl, "saveConfig", token, [doitxConfig, { applyProfile: false }]);
   assert.equal(savedConfig.status, 200);
   assert.equal((await savedConfig.json()).ok, true);
 
@@ -287,6 +322,25 @@ async function rpc(baseUrl, method, authToken, args = []) {
     },
     method: "POST"
   });
+}
+
+function login(baseUrl, password) {
+  return fetch(`${baseUrl}/api/ccr/login`, {
+    body: JSON.stringify({ password }),
+    headers: { "content-type": "application/json" },
+    method: "POST"
+  });
+}
+
+function sessionCookieFrom(response) {
+  const setCookie = response.headers.getSetCookie?.() ?? [];
+  for (const cookie of setCookie) {
+    const pair = cookie.split(";")[0];
+    if (pair.startsWith("ccr_web_session=")) {
+      return pair;
+    }
+  }
+  return undefined;
 }
 
 function dockerPorts(containerId) {

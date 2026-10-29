@@ -1206,7 +1206,9 @@ test("profile service injects Context Archive MCP for managed Claude Code profil
   assert.equal(result.clients[0].ok, true);
   const mcpConfigFile = path.join(CONFIGDIR, "profiles", profileId, "claude", "toolhub-mcp.json");
   const mcpConfig = JSON.parse(readFileSync(mcpConfigFile, "utf8"));
-  assert.deepEqual(Object.keys(mcpConfig.mcpServers), ["ccr-context-archive"]);
+  assert.deepEqual(Object.keys(mcpConfig.mcpServers), ["ccr-helix-recall", "ccr-context-archive"]);
+  assert.equal(mcpConfig.mcpServers["ccr-helix-recall"].type, "stdio");
+  assert.equal(mcpConfig.mcpServers["ccr-helix-recall"].env.ELECTRON_RUN_AS_NODE, "1");
   assert.equal(mcpConfig.mcpServers["ccr-context-archive"].type, "http");
   assert.equal(mcpConfig.mcpServers["ccr-context-archive"].url, `http://127.0.0.1:${config.gateway.port}/__ccr/context-archive/mcp`);
   assert.equal(mcpConfig.mcpServers["ccr-context-archive"].headers.Authorization, "Bearer ccr-managed-claude-profile-test");
@@ -1320,7 +1322,8 @@ test("profile service injects Context Archive MCP for managed Claude Code withou
   assert.equal(result.clients[0].ok, true);
   const mcpConfigFile = path.join(CONFIGDIR, "profiles", profileId, "claude", "toolhub-mcp.json");
   const mcpConfig = JSON.parse(readFileSync(mcpConfigFile, "utf8"));
-  assert.deepEqual(Object.keys(mcpConfig.mcpServers), ["ccr-context-archive"]);
+  assert.deepEqual(Object.keys(mcpConfig.mcpServers), ["ccr-helix-recall", "ccr-context-archive"]);
+  assert.equal(mcpConfig.mcpServers["ccr-helix-recall"].type, "stdio");
   assert.equal(mcpConfig.mcpServers["ccr-context-archive"].type, "http");
   assert.equal(mcpConfig.mcpServers["ccr-context-archive"].headers.Authorization, "Bearer ccr-context-archive-profile-test");
 });

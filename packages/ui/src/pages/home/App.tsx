@@ -40,6 +40,7 @@ import {
   AppDialogStack, FeedbackStack, LightToast, MainLayout, OnboardingLayout, PersistenceFeedback
 } from "./components/index";
 import { hasAvailableGatewayModels } from "@ccr/core/contracts/app";
+import type { ProviderEndpointLockState } from "@ccr/core/providers/endpoint-lock";
 
 type ProfileOpenDialogState = {
   busy?: "" | "cli" | "app";
@@ -59,24 +60,6 @@ type ConfigSaveFeedbackTarget = "global" | "form" | "silent";
 const providerNamePlaceholder = "__CCR_PROVIDER_NAME__";
 const providerNameSlugPlaceholder = "__CCR_PROVIDER_NAME_SLUG__";
 const providerInternalNamePlaceholder = "__CCR_PROVIDER_INTERNAL_NAME__";
-const localAgentProviderApiKey = "ccr-local-agent-login";
-const localCodexDefaultBaseUrl = "https://chatgpt.com/backend-api/codex";
-const localCodexProviderId = "codex-api";
-
-function isLocalCodexProviderDraft(draft: AddProviderDraft): boolean {
-  return (
-    draft.apiKey.trim() === localAgentProviderApiKey &&
-    normalizeProviderBaseUrl(draft.baseUrl) === normalizeProviderBaseUrl(localCodexDefaultBaseUrl)
-  );
-}
-
-function localCodexProviderDraftProbeKey(draft: AddProviderDraft): string {
-  return JSON.stringify([
-    draft.apiKey.trim(),
-    normalizeProviderBaseUrl(draft.baseUrl),
-    draft.protocol
-  ]);
-}
 
 function overviewUsageStatsFilter(range: UsageStatsRange, providerFilter: string, modelFilter: string): UsageStatsFilter {
   return {
@@ -189,6 +172,7 @@ function App() {
   const [configLoaded, setConfigLoaded] = useState(() => !window.ccr);
   const [onboardingStatusLoaded, setOnboardingStatusLoaded] = useState(() => !window.ccr);
   const [providerPresetsLoaded, setProviderPresetsLoaded] = useState(() => !window.ccr);
+  const [providerEndpointLock, setProviderEndpointLock] = useState<ProviderEndpointLockState>({ locked: false });
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>(fallbackGatewayStatus);
   const [proxyNetworkSnapshot, setProxyNetworkSnapshot] = useState<ProxyNetworkSnapshot>(fallbackProxyNetworkSnapshot);
   const [proxyStatus, setProxyStatus] = useState<ProxyStatus>(fallbackProxyStatus);
@@ -346,6 +330,9 @@ function App() {
       .then(setProviderPresets)
       .catch(() => setProviderPresets([]))
       .finally(() => setProviderPresetsLoaded(true));
+    void window.ccr.getProviderEndpointLock()
+      .then(setProviderEndpointLock)
+      .catch(() => setProviderEndpointLock({ locked: false }));
     void window.ccr.getConfig()
       .then(syncConfigState)
       .catch(() => {
@@ -1396,62 +1383,6 @@ function App() {
       setProviderProbeLoading(false);
       return;
     }
-    if (isLocalCodexProviderDraft(providerDraft)) {
-      providerProbeRequestId.current += 1;
-      const requestId = providerProbeRequestId.current;
-      const inputKey = localCodexProviderDraftProbeKey(providerDraft);
-
-      setProviderProbeError("");
-      if (!window.ccr.probeLocalAgentProvider) {
-        setProviderProbe(undefined);
-        setProviderProbeLoading(false);
-        return undefined;
-      }
-      setProviderProbeLoading(true);
-
-      const timer = window.setTimeout(() => {
-        void window.ccr?.probeLocalAgentProvider?.({ id: localCodexProviderId })
-          .then((result) => {
-            if (providerProbeRequestId.current !== requestId) {
-              return;
-            }
-            setProviderProbe(result.probe);
-            setProviderDraft((current) => {
-              if (!isLocalCodexProviderDraft(current) || localCodexProviderDraftProbeKey(current) !== inputKey) {
-                return current;
-              }
-              return applyProviderProbeResult(current, result.probe);
-            });
-          })
-          .catch((error) => {
-            if (providerProbeRequestId.current === requestId) {
-              setProviderProbe(undefined);
-              setProviderProbeError(formatError(error));
-            }
-          })
-          .finally(() => {
-            if (providerProbeRequestId.current === requestId) {
-              setProviderProbeLoading(false);
-            }
-          });
-      }, 350);
-
-      return () => {
-        window.clearTimeout(timer);
-        if (providerProbeRequestId.current === requestId) {
-          providerProbeRequestId.current += 1;
-          setProviderProbeLoading(false);
-        }
-      };
-    }
-    if (providerDraft.providerPlugins.length > 0) {
-      providerProbeRequestId.current += 1;
-      setProviderProbe(undefined);
-      setProviderProbeError("");
-      setProviderProbeLoading(false);
-      return;
-    }
-
     providerProbeRequestId.current += 1;
     const requestId = providerProbeRequestId.current;
     const candidates = providerProbeCandidates(providerDraft).filter(isProviderProbeCandidateReady);
@@ -1548,28 +1479,6 @@ function App() {
     setProviderProbeLoading(true);
 
     try {
-      if (isLocalCodexProviderDraft(providerDraft)) {
-        if (!window.ccr.probeLocalAgentProvider) {
-          setProviderProbe(undefined);
-          return;
-        }
-        const result = await window.ccr.probeLocalAgentProvider({ forceRefresh: true, id: localCodexProviderId });
-        if (providerProbeRequestId.current !== requestId) {
-          return;
-        }
-        setProviderProbe(result.probe);
-        setProviderDraft((current) => {
-          const currentProtocols = current.protocolDetectionMode === "manual"
-            ? uniqueProviderProtocols(current.selectedProtocols.length > 0 ? current.selectedProtocols : [current.protocol])
-            : undefined;
-          if (!isLocalCodexProviderDraft(current) || providerRefreshModelsInputKey(current, currentProtocols) !== refreshInputKey) {
-            return current;
-          }
-          return applyProviderProbeResult(current, result.probe);
-        });
-        return;
-      }
-
       const candidates = providerProbeCandidates(providerDraft).filter(isProviderProbeCandidateReady);
       if (candidates.length === 0) {
         setProviderProbe(undefined);
@@ -3238,6 +3147,7 @@ function App() {
               shouldReduceMotion={shouldReduceMotion}
               sidebarOpen={sidebarOpen}
               toggleGatewayService={toggleGatewayService}
+              version={appInfo.version}
               visibleNavigation={visibleNavigation}
               viewProps={{
                 apiKeys: {
@@ -3328,6 +3238,7 @@ function App() {
                   accountSnapshots: providerAccountSnapshots,
                   addProvider: openAddProviderDialog,
                   editProvider: openEditProviderDialog,
+                  endpointLock: providerEndpointLock,
                   notify: showToast,
                   providers,
                   removeProvider: setProviderDeleteIndex,
@@ -3518,7 +3429,6 @@ function App() {
               onSubmit: submitProviderDraft,
               probe: providerProbe,
               probeLoading: providerProbeLoading,
-              providerPlugins: draftConfig.providerPlugins ?? [],
               providers: draftConfig.Providers,
               submitLabel: providerImportOpen ? t("Import") : undefined,
               title: providerImportOpen ? t("Import Provider") : undefined

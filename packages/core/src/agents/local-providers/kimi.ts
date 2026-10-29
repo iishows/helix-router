@@ -11,7 +11,6 @@ import type {
   ProviderModelMetadata
 } from "@ccr/core/contracts/app";
 import { fetchWithSystemProxy } from "@ccr/core/proxy/system-proxy-fetch";
-import { findProviderPresetByBaseUrl } from "@ccr/core/providers/presets/index";
 import {
   bearerAuthPlugin,
   cloneProviderAccountConfig,
@@ -33,6 +32,59 @@ const kimiOauthClientId = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const kimiDefaultModels = ["kimi-for-coding"];
 const kimiOauthRefreshTimeoutMs = 30_000;
 const kimiRefreshInFlight = new Map<string, Promise<KimiTokenSet>>();
+const kimiCodingUsageEndpoint = "https://api.kimi.com/coding/v1/usages";
+const kimiPlatformBalanceEndpoint = "https://api.moonshot.ai/v1/users/me/balance";
+
+const kimiCodingProviderAccountConfig: ProviderAccountConfig = {
+  connectors: [
+    {
+      auth: "provider-api-key",
+      endpoint: kimiCodingUsageEndpoint,
+      mapping: {
+        meters: []
+      },
+      parser: "kimi-code-usages",
+      type: "http-json"
+    }
+  ],
+  enabled: true
+};
+
+const kimiPlatformProviderAccountConfig: ProviderAccountConfig = {
+  connectors: [
+    {
+      auth: "provider-api-key",
+      endpoint: kimiPlatformBalanceEndpoint,
+      mapping: {
+        meters: [
+          {
+            id: "balance",
+            kind: "balance",
+            label: "Balance",
+            remaining: "$.data.available_balance",
+            unit: "CNY"
+          },
+          {
+            id: "voucher_balance",
+            kind: "balance",
+            label: "Voucher balance",
+            remaining: "$.data.voucher_balance",
+            unit: "CNY"
+          },
+          {
+            id: "cash_balance",
+            kind: "balance",
+            label: "Cash balance",
+            remaining: "$.data.cash_balance",
+            unit: "CNY"
+          }
+        ]
+      },
+      type: "http-json"
+    }
+  ],
+  enabled: true
+};
 
 type KimiTomlSection = {
   path: string[];
@@ -358,7 +410,14 @@ function kimiModelsForProvider(
 }
 
 function kimiProviderAccountConfig(baseUrl: string): ProviderAccountConfig | undefined {
-  return cloneProviderAccountConfig(findProviderPresetByBaseUrl(baseUrl)?.account);
+  const normalized = baseUrl.trim().replace(/\/+$/, "");
+  if (normalized === kimiPlatformBaseUrl) {
+    return cloneProviderAccountConfig(kimiPlatformProviderAccountConfig);
+  }
+  if (normalized === kimiDefaultBaseUrl) {
+    return cloneProviderAccountConfig(kimiCodingProviderAccountConfig);
+  }
+  return undefined;
 }
 
 function kimiAuthPlugin(

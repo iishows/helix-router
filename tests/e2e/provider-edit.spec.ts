@@ -12,7 +12,7 @@ const cliWebAuthToken = "playwright-provider-edit-token";
 // A provider shaped like a hand-written config entry: the dialog renders none of
 // extraBody, extraHeaders or transformer, so saving must not drop them.
 const configOnlyProvider = {
-  api_base_url: "http://127.0.0.1:9/v1",
+  api_base_url: "https://router.doitx.ai",
   api_key: "sk-config-only",
   extraBody: { default: { reasoning_effort: "high" } },
   extraHeaders: { "x-tenant": "acme" },

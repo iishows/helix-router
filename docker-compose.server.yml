@@ -6,12 +6,22 @@
 #   - 公开地址与 Web 管理 token 通过 .env 注入
 #
 # 用法：
-#   1) docker load -i ccr-3.1.6-amd64.tar
+#   1) docker load -i ccr-<版本>-image.tar.gz   （包内唯一的镜像归档）
 #   2) 在同一个目录建 .env（chmod 600），内容：
 #        CCR_PUBLIC_BASE_URL=https://ccr.example.com
 #        CCR_WEB_AUTH_TOKEN=<64 字符随机串，见下方生成命令>
-#      生成 token：node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))"
+#      生成 token：openssl rand -hex 32
 #   3) docker compose -f docker-compose.server.yml up -d
+#
+# 若走完整发布包，以上三步已由包内 install.sh 自动完成。
+# 归档文件名刻意不写死版本号：写死会随发版漂移，而 install.sh 是按
+# ccr-*-image.tar.gz 模式查找的。
+
+# 固定 compose 项目名。否则项目名取自所在目录名，而发布包解压出来的目录是
+# ccr-<版本>-release —— 换个版本解压到新目录，具名卷就会变成
+# ccr-<新版本>-release_ccr-data，与旧卷对不上，容器以空 /data 启动、看起来
+# 像是"配置全丢了"。固定成 ccr 后，跨版本升级永远复用同一个卷。
+name: ccr
 
 services:
   ccr:
@@ -36,3 +46,5 @@ services:
 
 volumes:
   ccr-data:
+    # 同上：固定卷名，避免随解压目录改名而"丢配置"。
+    name: ccr-data

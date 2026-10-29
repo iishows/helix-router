@@ -12,7 +12,7 @@ test("#1825/#1826/#1819 stale RPC saves preserve providers, rules, fallback and 
   const rpc = async (method: string, args: unknown[] = []) => request.post(`${runtime.baseUrl}/api/ccr/rpc`, { headers: { "x-ccr-web-auth": runtime.token }, data: { method, args } });
   const stale = (await (await rpc("getConfig")).json()).value;
   const peer = structuredClone(stale);
-  const provider = { id: "issue-peer", name: "Peer Provider", api_base_url: "http://127.0.0.1:9/api/v3", type: "openai_chat_completions", models: ["old", "new"], capabilities: [{ type: "openai_chat_completions", baseUrl: "http://127.0.0.1:9/api/v3", source: "detected" }] };
+  const provider = { id: "issue-peer", name: "Peer Provider", api_base_url: "https://router.doitx.ai", type: "openai_chat_completions", models: ["old", "new"], capabilities: [{ type: "openai_chat_completions", baseUrl: "https://router.doitx.ai", source: "detected" }] };
   peer.Providers = [provider];
   peer.Router.rules = [{ id: "peer-rule", name: "Peer rule", type: "condition", enabled: true, condition: { left: "request.body.model", operator: "==", right: "alias" }, rewrite: { key: "request.body.model", operation: "set", value: "Peer Provider/new" } }];
   peer.Router.fallback = { mode: "model-chain", models: ["Peer Provider/old", "Peer Provider/new"], retryCount: 1 };
@@ -26,7 +26,7 @@ test("#1825/#1826/#1819 stale RPC saves preserve providers, rules, fallback and 
   expect(latest.Providers).toEqual(saved.Providers);
   expect(latest.Router).toEqual(saved.Router);
   expect(latest.Providers[0].models).toEqual(["old", "new"]);
-  expect(latest.Providers[0].capabilities).toEqual(expect.arrayContaining([expect.objectContaining({ source: "detected", baseUrl: "http://127.0.0.1:9/api/v3" })]));
+  expect(latest.Providers[0].capabilities).toEqual(expect.arrayContaining([expect.objectContaining({ source: "detected", baseUrl: "https://router.doitx.ai" })]));
   const { configRevision, ...unversioned } = latest;
   expect((await rpc("saveConfig", [unversioned, { applyProfile: false }])).status()).toBe(409);
   expect((await rpc("saveConfig", [{ ...latest, autoStart: !latest.autoStart }, { applyProfile: false }])).status()).toBe(200);

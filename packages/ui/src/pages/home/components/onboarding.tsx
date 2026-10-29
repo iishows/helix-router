@@ -272,7 +272,6 @@ export function OnboardingView({
                       }}
                       probe={providerProbe}
                       probeLoading={providerProbeLoading}
-                      providerPlugins={config.providerPlugins ?? []}
                       providers={config.Providers}
                     />
                   </div>

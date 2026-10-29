@@ -21,3 +21,8 @@ blob-report
 .tmp
 .test-dist
 docker/local-ai-gateway/*.tgz
+
+# 发布包产物（体积大、可重新生成，由 npm run docker:release 输出到 release/）
+ccr-*-image.tar.gz
+ccr-*-release.tar.gz
+*.tar.gz.sha256

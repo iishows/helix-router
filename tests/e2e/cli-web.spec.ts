@@ -25,17 +25,17 @@ test("uses CCR_WEB_AUTH_TOKEN for CLI web authentication", async () => {
 test("serves the management UI in a browser", async ({ page }) => {
   const current = requireRuntime();
   await page.goto(`${current.baseUrl}/?ccr_web_token=${current.token}`);
-  await expect(page).toHaveTitle("Claude Code Router");
+  await expect(page).toHaveTitle("Helix Router");
   await expect(page.locator("#root")).toBeAttached();
   await expect(page.locator("body")).toContainText(/Configure provider|Connect agent|Let's start/, { timeout: 15_000 });
   await expect(page.evaluate(() => Boolean(window.ccr?.getAppInfo))).resolves.toBe(true);
   await expect(page.evaluate(async () => {
     const presets = await window.ccr?.getProviderPresets?.();
     return presets?.map((preset) => preset.id) ?? [];
-  })).resolves.toContain("openai");
+  })).resolves.toEqual(["doitx"]);
 
   await page.getByRole("button", { name: /Select preset provider|选择 预设供应商/ }).first().click();
-  await expect(page.getByRole("option", { name: "OpenAI" })).toBeVisible();
+  await expect(page.getByRole("option", { name: "DoitX" })).toBeVisible();
 });
 
 test("serves static assets used by the web UI", async ({ request }) => {
@@ -57,7 +57,7 @@ test("handles authenticated web RPC requests", async ({ request }) => {
 
   expect(response.status()).toBe(200);
   expect(payload.ok).toBe(true);
-  expect(payload.value.name).toBe("Claude Code Router");
+  expect(payload.value.name).toBe("Helix Router");
   expect(payload.value.configDir).toContain(current.testHome);
   expect(payload.value.configDbFile).toContain("config.sqlite");
   expect(payload.value.usageDbFile).toContain("usage.sqlite");

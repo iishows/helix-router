@@ -1,6 +1,6 @@
 {
   "name": "claude-code-router-monorepo",
-  "version": "3.1.6",
+  "version": "3.1.7",
   "private": true,
   "license": "MIT",
   "description": "Local Claude Code Router gateway with CLI and web management UI.",
@@ -58,6 +58,7 @@
     "docker:compose:build": "node build/docker-compose.mjs build",
     "docker:compose:up": "node build/docker-compose.mjs up -d --build",
     "docker:run": "docker run --rm -p 3458:8080 -v ccr-data:/data helix-compressor:local",
+    "docker:release": "node build/docker-release.mjs",
     "test": "npm run test:packages && npm run test:architecture",
     "test:packages": "npm run test --workspaces --if-present",
     "test:core": "npm test -w @claude-code-router/core",

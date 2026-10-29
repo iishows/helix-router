@@ -16,6 +16,7 @@ import {
   zcodeDefaultBaseUrl
 } from "@ccr/core/agents/local-providers/service";
 import { grokAccessTokenExpired } from "@ccr/core/agents/local-providers/grok";
+import { openCodeProviderAccountConfig } from "@ccr/core/agents/local-providers/opencode";
 import { pluginService } from "@ccr/core/plugins/service";
 import { getUsageTotalsSince } from "@ccr/core/usage/store";
 import { findProviderPresetByBaseUrl, providerEndpointCanReceiveProviderApiKey } from "@ccr/core/providers/presets/index";
@@ -575,7 +576,9 @@ function effectiveProviderAccountConfig(
     return account;
   }
 
-  const presetAccount = findProviderPresetByBaseUrl(providerBaseUrl(provider))?.account;
+  const presetAccount =
+    findProviderPresetByBaseUrl(providerBaseUrl(provider))?.account ??
+    openCodeProviderAccountConfig(providerBaseUrl(provider));
   if (!presetAccount?.enabled) {
     return undefined;
   }

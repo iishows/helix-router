@@ -89,6 +89,7 @@ import type {
   UsageStatsResetResult,
   UsageStatsSnapshot
 } from "@ccr/core/contracts/app";
+import type { ProviderEndpointLockState } from "@ccr/core/providers/endpoint-lock";
 import type { ProviderPreset } from "@ccr/core/providers/presets/types";
 
 function invoke(channel: string, ...args: unknown[]): Promise<unknown> {
@@ -133,6 +134,7 @@ contextBridge.exposeInMainWorld("ccr", {
   getProviderCatalogModels: (request: ProviderCatalogModelsRequest) => invoke(IPC_CHANNELS.appGetProviderCatalogModels, request) as Promise<ProviderCatalogModelsResult>,
   getOpenRouterProviderCatalog: (request: OpenRouterProviderCatalogRequest) => invoke(IPC_CHANNELS.appGetOpenRouterProviderCatalog, request) as Promise<OpenRouterProviderCatalogResult>,
   getProviderPresets: () => invoke(IPC_CHANNELS.appGetProviderPresets) as Promise<ProviderPreset[]>,
+  getProviderEndpointLock: () => invoke(IPC_CHANNELS.appGetProviderEndpointLock) as Promise<ProviderEndpointLockState>,
   getPluginMarketplace: () => invoke(IPC_CHANNELS.appGetPluginMarketplace) as Promise<PluginMarketplaceEntry[]>,
   getProxyCertificateStatus: () => invoke(IPC_CHANNELS.appGetProxyCertificateStatus) as Promise<ProxyCertificateStatus>,
   getProxyNetworkCaptures: () => invoke(IPC_CHANNELS.appGetProxyNetworkCaptures) as Promise<ProxyNetworkSnapshot>,

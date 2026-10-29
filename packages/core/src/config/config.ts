@@ -19,6 +19,7 @@ import { CLAUDE_CODE_DEFAULT_ENV, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY_ENV
 import { createDefaultAppConfig } from "@ccr/core/config/default-config";
 import { maxRequestLogBodyBytes } from "@ccr/core/observability/request-log-limits";
 import { findProviderPresetByBaseUrl, primaryProviderPresetEndpoint, providerApiKeySafetyIssue, providerEndpointCanReceiveProviderApiKey } from "@ccr/core/providers/presets/index";
+import { isProviderEndpointLocked, providerEndpointLockIssue } from "@ccr/core/providers/endpoint-lock";
 import { isDesktopAppRuntime } from "@ccr/core/runtime/desktop-app";
 import type {
   AppConfig,
@@ -340,9 +341,9 @@ export async function loadAppConfig(): Promise<AppConfig> {
       }
     });
     const shouldPersistApiKeys = loadedApiKeys.length === 0 || hasConfigFileApiKeys(rawValue) || configFileApiKeys.length > 0;
-    const shouldRepairProviderCapabilities = hasUnsupportedNvidiaCapabilities(value.Providers);
     const shouldRepairKnownPlugins = pluginMigration.changed;
-    if (loadedRawConfig.source !== "sqlite" || shouldPersistApiKeys || shouldRepairProviderCapabilities || shouldRepairKnownPlugins) {
+    const shouldDropRetiredProviders = providers.length !== config.Providers.length;
+    if (loadedRawConfig.source !== "sqlite" || shouldPersistApiKeys || shouldRepairKnownPlugins || shouldDropRetiredProviders) {
       const sanitized = sanitizeConfigForDisk(config);
       await replacePersistedConfigSnapshot(sanitized, apiKeys, appConfigRevision(loadedRawConfig.source === "sqlite" ? rawValue : undefined));
       config.configRevision = appConfigRevision(sanitized);
@@ -395,6 +396,7 @@ export async function saveAppThemePreference(theme: unknown): Promise<AppConfig[
 async function saveAppConfigNow(config: AppConfig): Promise<AppConfig> {
   const normalizedConfig = withSingleEnabledGlobalProfiles(config);
   assertProviderApiKeysAreSafe(normalizedConfig);
+  assertProviderEndpointsAllowed(normalizedConfig);
   const pluginMigration = migrateKnownGatewayPluginConfigs(normalizedConfig.plugins);
   // Credentials have their own save operation. A settings snapshot may predate
   // a key revocation or rotation, so it must never replace the credential table.
@@ -423,14 +425,30 @@ function enqueueAppConfigWrite<T>(operation: () => Promise<T>): Promise<T> {
 
 function withSingleEnabledGlobalProfiles(config: AppConfig): AppConfig {
   const profiles = enforceSingleEnabledGlobalProfilePerAgent(config.profile.profiles);
+  const providers = removeRetiredProviderPresets(config.Providers);
   return {
     ...config,
-    Providers: config.Providers.map(normalizeProviderPresetCapabilities),
+    Providers: providers.map(normalizeProviderPresetCapabilities),
+    preferredProvider: providers.some((provider) => provider.name === config.preferredProvider)
+      ? config.preferredProvider
+      : providers[0]?.name ?? config.preferredProvider,
     profile: synchronizeLegacyProfileConfig({
       ...config.profile,
       profiles
     })
   };
+}
+
+/**
+ * 这个 fork 只内置 DoitX 一个 provider 预设。旧配置里指向已下线预设
+ * （openai / gemini / deepseek / anthropic 等）的 provider 一律丢弃，
+ * 否则 UI 无法编辑、网关也无从解析它们。
+ */
+function removeRetiredProviderPresets(providers: GatewayProviderConfig[]): GatewayProviderConfig[] {
+  return providers.filter((provider) => {
+    const baseUrl = providerBaseUrl(provider);
+    return Boolean(baseUrl) && Boolean(findProviderPresetByBaseUrl(baseUrl));
+  });
 }
 
 function synchronizeLegacyProfileConfig(profile: AppConfig["profile"]): AppConfig["profile"] {
@@ -529,32 +547,14 @@ export function normalizeProviderPresetCapabilitiesForTest(
   return normalizeProviderPresetCapabilities(provider);
 }
 
-export function parseProvidersForTest(value: unknown): GatewayProviderConfig[] | undefined {
-  return parseProviders(value);
+export function removeRetiredProviderPresetsForTest(
+  providers: GatewayProviderConfig[]
+): GatewayProviderConfig[] {
+  return removeRetiredProviderPresets(providers);
 }
 
-function hasUnsupportedNvidiaCapabilities(value: unknown): boolean {
-  if (!Array.isArray(value)) {
-    return false;
-  }
-  return value.some((item) => {
-    if (!isObject(item)) {
-      return false;
-    }
-    const baseUrl = readString(item.api_base_url) || readString(item.baseUrl) || readString(item.baseurl);
-    if (!baseUrl || findProviderPresetByBaseUrl(baseUrl)?.id !== "nvidia" || !Array.isArray(item.capabilities)) {
-      return false;
-    }
-    return item.capabilities.some((capability) => {
-      if (!isObject(capability)) {
-        return false;
-      }
-      const protocol = parseProviderCapabilityProtocol(
-        readString(capability.type) || readString(capability.protocol)
-      );
-      return Boolean(protocol && protocol !== "openai_chat_completions");
-    });
-  });
+export function parseProvidersForTest(value: unknown): GatewayProviderConfig[] | undefined {
+  return parseProviders(value);
 }
 
 function assertProviderApiKeysAreSafe(config: AppConfig): void {
@@ -602,6 +602,28 @@ function assertProviderAccountApiKeyTargetsAreSafe(provider: GatewayProviderConf
       });
       if (issue) {
         throw new Error(issue.message);
+      }
+    }
+  }
+}
+
+/**
+ * 端点硬锁定：`CCR_LOCK_PROVIDER_ENDPOINT` 生效时，拒绝保存指向其他端点的 provider。
+ *
+ * 逐个检查 provider 的全部 URL 别名（baseurl / baseUrl / api_base_url），不依赖读取优先级，
+ * 避免用低优先级字段夹带非白名单端点绕过锁定。
+ */
+function assertProviderEndpointsAllowed(config: AppConfig): void {
+  if (!isProviderEndpointLocked()) {
+    return;
+  }
+
+  for (const provider of config.Providers ?? []) {
+    const label = provider.name || provider.id || "<unnamed provider>";
+    for (const candidate of [provider.baseurl, provider.baseUrl, provider.api_base_url]) {
+      const issue = providerEndpointLockIssue(candidate);
+      if (issue) {
+        throw new Error(`Provider "${label}": ${issue.message}`);
       }
     }
   }

@@ -95,7 +95,7 @@ ccr start [--host <host>] [--port <port>] [--open|--no-open] [--gateway|--no-gat
 ccr ui [--host <host>] [--port <port>] [--open|--no-open] [--gateway|--no-gateway]
 ```
 
-`ui` 与 `start` 使用同一个后台服务，但默认会打开浏览器。管理 URL 包含 `ccr_web_token` 查询参数；请把完整 URL 当作密码，不要粘贴到日志、工单或公开截图。
+`ui` 与 `start` 使用同一个后台服务，但默认会打开浏览器。`ccr ui` 通过带 `ccr_web_token` 查询参数的 URL 打开管理台（等价于一次免密登录）；请把该 URL 当作密码，不要粘贴到日志、工单或公开截图。设置了 `CCR_WEB_LOGIN_PASSWORD` 后，直接在浏览器访问管理台会跳到登录页，凭密码换取会话 Cookie。
 
 ## `ccr serve`
 
@@ -180,15 +180,16 @@ ccr profile-id -- --help
 | --- | --- |
 | `CCR_WEB_HOST` | 省略 `--host` 时使用的管理服务监听地址。 |
 | `CCR_WEB_PORT` | 省略 `--port` 时使用的管理服务端口。 |
-| `CCR_WEB_AUTH_TOKEN` | 固定管理 UI / RPC Token；不设置时进程会生成随机 Token。 |
+| `CCR_WEB_LOGIN_PASSWORD` | 为管理台开启密码登录页；密码正确时签发 `HttpOnly` 会话 Cookie。不设置则没有登录页（仅凭 Token 鉴权）。 |
+| `CCR_WEB_AUTH_TOKEN` | 固定管理 RPC Token；不设置时进程会生成随机 Token。供脚本、`ccr ui` 等非浏览器调用使用。 |
 
-监听到 `0.0.0.0` 会让管理界面进入局域网或外部网络。只有在确实需要时才这样配置，并同时使用固定强 Token、主机防火墙或私网，以及可信反向代理提供的 TLS。
+监听到 `0.0.0.0` 会让管理界面进入局域网或外部网络。只有在确实需要时才这样配置，并同时使用固定强密码与 Token、主机防火墙或私网，以及可信反向代理提供的 TLS。
 
 模型网关还需要单独创建 CCR 客户端 Key。上游供应商凭据保存在本地数据目录，因此目录和备份都应按敏感数据保护。
 
 ## 进程管理器示例
 
-生产环境应使用 `ccr serve --no-open`，让外部管理器负责重启和日志。启动命令至少应固定工作用户、`HOME`、监听地址和 `CCR_WEB_AUTH_TOKEN`。不要同时运行由 `ccr start` 创建的后台服务，否则可能得到两个管理端口或竞争同一套配置。
+生产环境应使用 `ccr serve --no-open`，让外部管理器负责重启和日志。启动命令至少应固定工作用户、`HOME`、监听地址和 `CCR_WEB_LOGIN_PASSWORD`（以及给脚本用的 `CCR_WEB_AUTH_TOKEN`）。不要同时运行由 `ccr start` 创建的后台服务，否则可能得到两个管理端口或竞争同一套配置。
 
 ## 常见问题
 

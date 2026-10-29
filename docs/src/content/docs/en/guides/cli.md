@@ -95,7 +95,7 @@ If the preferred port is occupied, CCR keeps trying following ports and prints t
 ccr ui [--host <host>] [--port <port>] [--open|--no-open] [--gateway|--no-gateway]
 ```
 
-`ui` uses the same background service as `start`, but opens a browser by default. The management URL contains the `ccr_web_token` query parameter; treat the full URL as a password and do not paste it into logs, tickets, or public screenshots.
+`ui` uses the same background service as `start`, but opens a browser by default. `ccr ui` opens the console from a URL carrying the `ccr_web_token` query parameter (equivalent to a one-time passwordless sign-in); treat that URL as a password and do not paste it into logs, tickets, or public screenshots. With `CCR_WEB_LOGIN_PASSWORD` set, browsing to the console directly redirects to a login page that exchanges the password for a session cookie.
 
 ## `ccr serve`
 
@@ -180,15 +180,16 @@ The public management authentication variables are:
 | --- | --- |
 | `CCR_WEB_HOST` | Management service listen address used when `--host` is omitted. |
 | `CCR_WEB_PORT` | Management service port used when `--port` is omitted. |
-| `CCR_WEB_AUTH_TOKEN` | Fixed management UI / RPC token; without it the process generates a random token. |
+| `CCR_WEB_LOGIN_PASSWORD` | Enables a password login page for the console; a correct password issues an `HttpOnly` session cookie. Without it there is no login page (token-only authentication). |
+| `CCR_WEB_AUTH_TOKEN` | Fixed management RPC token; without it the process generates a random one. Used by non-browser callers such as scripts and `ccr ui`. |
 
-Listening on `0.0.0.0` exposes the management UI to the LAN or external networks. Only configure this when genuinely needed, and combine it with a fixed strong token, a host firewall or private network, and TLS provided by a trusted reverse proxy.
+Listening on `0.0.0.0` exposes the management UI to the LAN or external networks. Only configure this when genuinely needed, and combine it with a fixed strong password and token, a host firewall or private network, and TLS provided by a trusted reverse proxy.
 
 The model gateway additionally requires separately created CCR client keys. Upstream provider credentials are stored in the local data directory, so both the directory and its backups should be protected as sensitive data.
 
 ## Process manager example
 
-In production, use `ccr serve --no-open` and let an external manager handle restarts and logs. The start command should at least pin the working user, `HOME`, the listen address, and `CCR_WEB_AUTH_TOKEN`. Do not also run a background service created by `ccr start`, otherwise you may end up with two management ports or two processes competing for the same configuration.
+In production, use `ccr serve --no-open` and let an external manager handle restarts and logs. The start command should at least pin the working user, `HOME`, the listen address, and `CCR_WEB_LOGIN_PASSWORD` (plus `CCR_WEB_AUTH_TOKEN` for scripts). Do not also run a background service created by `ccr start`, otherwise you may end up with two management ports or two processes competing for the same configuration.
 
 ## Troubleshooting
 

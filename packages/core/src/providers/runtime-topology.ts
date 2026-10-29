@@ -3,6 +3,7 @@
  */
 import { isGatewayProviderEnabled } from "@ccr/core/contracts/app";
 import type { AppConfig, GatewayProviderCapability, GatewayProviderCapabilityProtocol, GatewayProviderConfig, GatewayProviderProtocol, ProviderCredentialConfig } from "@ccr/core/contracts/app";
+import { assertProviderEndpointAllowed } from "@ccr/core/providers/endpoint-lock";
 import { findProviderPresetByBaseUrl, providerApiKeySafetyIssue } from "@ccr/core/providers/presets/index";
 import { normalizeProviderBaseUrl as normalizeProviderBaseUrlInput } from "@ccr/core/providers/url";
 import { modelRegistryForConfig, parseProviderModelSelector, providerRuntimeId } from "@ccr/core/routing/model-registry";
@@ -18,6 +19,11 @@ export function providerCapabilityForClientProtocol(
       /^https:\/\/openrouter\.ai\/api\/v1(?:\/|$)/i.test(item.baseUrl || readBaseUrl(provider) || ""));
     if (openRouterChat) {
       return { ...openRouterChat, type: "openai_chat_completions" };
+    }
+    const doitxChat = capabilities.find((item) => item.type === "openai_chat_completions" &&
+      findProviderPresetByBaseUrl(item.baseUrl || readBaseUrl(provider) || "")?.id === "doitx");
+    if (doitxChat) {
+      return { ...doitxChat, type: "anthropic_messages" };
     }
   }
   for (const protocol of providerProtocolPreferenceForClient(clientProtocol)) {
@@ -161,6 +167,10 @@ function toCoreGatewayProvider(
     throw new Error(safetyIssue.message);
   }
 
+  // 端点硬锁定：这是本仓库能控制的最后一站（核心网关是外部包）。
+  // 即使有人直接改 config.json 绕过 UI 校验，这里仍会拒绝编译。
+  assertProviderEndpointAllowed(baseurl);
+
   return {
     apikey,
     baseurl,
@@ -211,61 +221,7 @@ export function normalizedProviderCapabilities(provider: GatewayProviderConfig):
       normalized.push(selected);
     }
   }
-  return applyPresetProtocolLock(provider, normalized);
-}
-
-function applyPresetProtocolLock(
-  provider: GatewayProviderConfig,
-  capabilities: GatewayProviderCapability[]
-): GatewayProviderCapability[] {
-  const lockedProtocols = lockedProviderPresetProtocols(provider, capabilities);
-  if (lockedProtocols.length === 0) {
-    return capabilities;
-  }
-
-  const lockedProtocolSet = new Set(lockedProtocols);
-  const lockedCapabilities = capabilities.filter((capability) => {
-    const protocol = normalizeProviderProtocol(capability.type);
-    return Boolean(protocol && lockedProtocolSet.has(protocol));
-  });
-  if (lockedCapabilities.length > 0) {
-    return lockedCapabilities;
-  }
-
-  const lockedProtocol = lockedProtocols[0];
-  const baseUrl = readBaseUrl(provider);
-  const normalizedBaseUrl = normalizeProviderRuntimeBaseUrl(baseUrl, lockedProtocol);
-  return normalizedBaseUrl
-    ? [{ baseUrl: normalizedBaseUrl, source: "preset", type: lockedProtocol }]
-    : [];
-}
-
-function lockedProviderPresetProtocols(
-  provider: GatewayProviderConfig,
-  capabilities: GatewayProviderCapability[]
-): GatewayProviderProtocol[] {
-  const baseUrls = [
-    readBaseUrl(provider),
-    ...capabilities.map((capability) => capability.baseUrl)
-  ].filter((value): value is string => Boolean(value?.trim()));
-
-  const hasGeminiOpenAiEndpoint = baseUrls.some((url) =>
-    /^https:\/\/generativelanguage\.googleapis\.com\/v1beta\/openai(?:\/|$)/i.test(url.trim())
-  );
-  for (const baseUrl of baseUrls) {
-    const presetId = findProviderPresetByBaseUrl(baseUrl)?.id;
-    if (presetId === "gemini" && !hasGeminiOpenAiEndpoint) {
-      return ["gemini_generate_content", "gemini_interactions"];
-    }
-    if (presetId === "nvidia") {
-      // NVIDIA NIM exposes OpenAI Chat Completions at this official endpoint,
-      // but not the Responses API. Ignore stale or auth-only probe results that
-      // would otherwise route Codex directly to a non-existent /responses path.
-      return ["openai_chat_completions"];
-    }
-  }
-
-  return [];
+  return normalized;
 }
 
 function providerCapabilityPriority(capability: GatewayProviderCapability): number {

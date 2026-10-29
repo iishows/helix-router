@@ -100,20 +100,30 @@ The repository also provides `npm run docker:run`. It uses `3458` and `ccr-data`
 
 | Credential | Purpose | Where configured |
 | --- | --- | --- |
-| `CCR_WEB_AUTH_TOKEN` | Management UI / RPC authentication | Container environment variable |
+| `CCR_WEB_LOGIN_PASSWORD` | Browser sign-in for the management console (issues a session cookie) | Container environment variable |
+| `CCR_WEB_AUTH_TOKEN` | Management RPC authentication (scripts, proxy header injection) | Container environment variable |
 | CCR client API key | Model gateway request authentication | **API Keys** page in the UI |
 | Upstream provider credential | CCR calling model providers | **Providers** page in the UI |
 
-Without `CCR_WEB_AUTH_TOKEN`, the entrypoint generates a new random token on every container start. Opening the root address still works because Nginx redirects to a URL containing the current token; but persistent and remote deployments should pin a sufficiently long, strong token.
+Visiting the console while signed out redirects to a login page. Submitting `CCR_WEB_LOGIN_PASSWORD` makes the server issue an `HttpOnly` session cookie (12 hours), so the credential never appears in a URL, browser history, or a screenshot.
 
-Do not write the token directly into shell history. Create an environment file that stays out of version control:
+Without `CCR_WEB_LOGIN_PASSWORD`, the entrypoint generates a random password on first start, persists it in the `.claude-code-router/web-login-password` file inside the data volume, and prints it in the startup log:
+
+```sh
+docker logs ccr | grep 'login password'
+```
+
+`CCR_WEB_AUTH_TOKEN` still works for non-browser callers: they can send the `x-ccr-web-auth` header to RPC, or open the console from a URL carrying `?ccr_web_token=...` (which is what `ccr ui` does). When unset it is regenerated at random on every start.
+
+Do not write the password or token directly into shell history. Create an environment file that stays out of version control:
 
 ```dotenv
+CCR_WEB_LOGIN_PASSWORD=replace-with-a-long-random-value
 CCR_WEB_AUTH_TOKEN=replace-with-a-long-random-value
 CCR_PUBLIC_BASE_URL=http://127.0.0.1:3458
 ```
 
-Use it via `docker run --env-file`, or map the same variables into the Compose service `environment`. The complete management URL containing `ccr_web_token` should also be protected like a password, because it can appear in browser history, reverse proxy logs, screenshots, and tickets.
+Use it via `docker run --env-file`, or map the same variables into the Compose service `environment`.
 
 ## Change the external port or address
 
@@ -126,6 +136,7 @@ services:
       - "127.0.0.1:8088:8080"
     environment:
       CCR_PUBLIC_BASE_URL: http://127.0.0.1:8088
+      CCR_WEB_LOGIN_PASSWORD: ${CCR_WEB_LOGIN_PASSWORD:?set CCR_WEB_LOGIN_PASSWORD}
       CCR_WEB_AUTH_TOKEN: ${CCR_WEB_AUTH_TOKEN:?set CCR_WEB_AUTH_TOKEN}
 ```
 
@@ -142,6 +153,7 @@ services:
       - "127.0.0.1:3458:8080"
     environment:
       CCR_PUBLIC_BASE_URL: https://ccr.example.com
+      CCR_WEB_LOGIN_PASSWORD: ${CCR_WEB_LOGIN_PASSWORD:?set CCR_WEB_LOGIN_PASSWORD}
       CCR_WEB_AUTH_TOKEN: ${CCR_WEB_AUTH_TOKEN:?set CCR_WEB_AUTH_TOKEN}
 ```
 
@@ -204,11 +216,12 @@ Upgrades run the migrations the current version needs against the persisted data
 
 ## Environment variable reference
 
-A typical deployment only needs `CCR_WEB_AUTH_TOKEN`, `CCR_PUBLIC_BASE_URL`, and the Docker port mapping. The internal listener variables normally do not need changing.
+A typical deployment only needs `CCR_WEB_LOGIN_PASSWORD`, `CCR_PUBLIC_BASE_URL`, and the Docker port mapping. The internal listener variables normally do not need changing.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `CCR_WEB_AUTH_TOKEN` | Randomly generated per start | Management UI / RPC token. Persistent or remote deployments should set a fixed strong value. |
+| `CCR_WEB_LOGIN_PASSWORD` | Randomly generated on first start, then persisted | Browser sign-in password for the console. Persistent or remote deployments should set a fixed strong value; see above for reading an auto-generated one. |
+| `CCR_WEB_AUTH_TOKEN` | Randomly generated per start | Management RPC token for scripts or proxy header injection; never handed to the browser. |
 | `CCR_PUBLIC_BASE_URL` | `http://127.0.0.1:3458` | Full public address written into CCR configuration; takes precedence over Public Host / Port once set. |
 | `CCR_PUBLIC_HOST` | `127.0.0.1` | Only used to compose the public address when no full public URL is set; does not change the Docker port binding. |
 | `CCR_PUBLIC_PORT` | `3458` | Only used to compose the public address when no full public URL is set. |
@@ -264,9 +277,9 @@ This is expected behavior. Nginx is redirecting the root address to a page URL c
 
 It checks the model gateway, not Nginx or the UI. A fresh volume without a configured provider / model returns `502`. Open the UI, finish the configuration, and start the gateway first.
 
-### The UI returns `401` after a token change
+### The UI returns `401` after a credential change
 
-Reopen the bare root address so Nginx generates a URL containing the new token; close tabs and bookmarks that still use the old `ccr_web_token`.
+The session cookie expired (12 hours), or the password changed without recreating the container. Sign in again; if you changed `CCR_WEB_LOGIN_PASSWORD`, also run `docker compose up -d` so the container picks it up. Close tabs and bookmarks that still use the old `ccr_web_token`.
 
 ### Clients still use the old port or domain
 

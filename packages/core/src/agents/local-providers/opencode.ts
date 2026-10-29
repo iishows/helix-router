@@ -8,7 +8,8 @@ import type {
   LocalAgentProviderCandidate,
   LocalAgentProviderImportResult,
   ProviderAccountConfig,
-  ProviderAccountConnectorConfig
+  ProviderAccountConnectorConfig,
+  ProviderAccountMappingConfig
 } from "@ccr/core/contracts/app";
 import {
   apiKeyAuthPlugin,
@@ -27,7 +28,6 @@ import {
   uniqueProviderName,
   uniqueStrings
 } from "@ccr/core/agents/local-providers/shared";
-import { findProviderPresetByBaseUrl } from "@ccr/core/providers/presets/index";
 import { openCodePublicFreeTierPlugin } from "@ccr/core/agents/local-providers/opencode-freetier";
 
 type OpenCodeCredential = {
@@ -60,6 +60,55 @@ const openCodeDefaultBaseUrls: Record<OpenCodeProviderId, string> = {
 const openCodeDefaultNames: Record<OpenCodeProviderId, string> = {
   opencode: "OpenCode Zen",
   "opencode-go": "OpenCode Go"
+};
+const openCodeGoUsageEndpoint = "https://opencode.ai/zen/go/v1/usage";
+const openCodeGoUsageMapping: ProviderAccountMappingConfig = {
+  meters: [
+    {
+      id: "opencode_go_5h",
+      kind: "quota",
+      label: "5h limit",
+      limit: 100,
+      remaining: "100 - $.usage.rolling.percent",
+      resetAt: "$.usage.rolling.resetsAt",
+      unit: "%",
+      used: "$.usage.rolling.percent",
+      window: "5h"
+    },
+    {
+      id: "opencode_go_weekly",
+      kind: "quota",
+      label: "Weekly limit",
+      limit: 100,
+      remaining: "100 - $.usage.weekly.percent",
+      resetAt: "$.usage.weekly.resetsAt",
+      unit: "%",
+      used: "$.usage.weekly.percent",
+      window: "weekly"
+    },
+    {
+      id: "opencode_go_monthly",
+      kind: "quota",
+      label: "Monthly limit",
+      limit: 100,
+      remaining: "100 - $.usage.monthly.percent",
+      resetAt: "$.usage.monthly.resetsAt",
+      unit: "%",
+      used: "$.usage.monthly.percent",
+      window: "monthly"
+    }
+  ]
+};
+const openCodeGoProviderAccountConfig: ProviderAccountConfig = {
+  connectors: [
+    {
+      auth: "provider-api-key",
+      endpoint: openCodeGoUsageEndpoint,
+      mapping: openCodeGoUsageMapping,
+      type: "http-json"
+    }
+  ],
+  enabled: true
 };
 const openCodeProtocolOrder: OpenCodeProtocol[] = [
   "openai_responses",
@@ -228,8 +277,12 @@ export function removeOpenCodeProviderAccountConfig(provider: GatewayProviderCon
   };
 }
 
-function openCodeProviderAccountConfig(baseUrl: string): ProviderAccountConfig | undefined {
-  return cloneProviderAccountConfig(findProviderPresetByBaseUrl(baseUrl)?.account);
+export function openCodeProviderAccountConfig(baseUrl: string): ProviderAccountConfig | undefined {
+  const normalized = baseUrl.trim().replace(/\/+$/, "");
+  if (normalized === openCodeDefaultBaseUrls["opencode-go"]) {
+    return cloneProviderAccountConfig(openCodeGoProviderAccountConfig);
+  }
+  return undefined;
 }
 
 function isGeneratedOpenCodeAccountConnector(connector: ProviderAccountConnectorConfig): boolean {

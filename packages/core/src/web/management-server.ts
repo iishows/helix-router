@@ -31,6 +31,7 @@ import { fetchProviderManifest } from "@ccr/core/providers/manifest-service";
 import { getLocalAgentProviderCandidates, importLocalAgentProvider, probeLocalAgentProvider } from "@ccr/core/agents/local-providers/service";
 import { getProviderCatalogModels } from "@ccr/core/providers/model-catalog";
 import { getOpenRouterProviderCatalog } from "@ccr/core/providers/openrouter-provider-catalog";
+import { isProviderEndpointLocked, lockedProviderEndpointOriginsText } from "@ccr/core/providers/endpoint-lock";
 import { getProviderPresets } from "@ccr/core/providers/presets/index";
 import { checkGatewayProviderConnectivity, probeGatewayProvider, probeGatewayProviderCandidates } from "@ccr/core/providers/probe";
 import { applyRecallDetection, detectRecallModelsForConfig } from "@ccr/core/providers/recall-model-detect";
@@ -96,6 +97,7 @@ const gatewayPluginSurfaceIdSet = new Set<string>(GATEWAY_PLUGIN_SURFACE_IDS);
 export type WebManagementServerOptions = {
   authToken?: string;
   host?: string;
+  loginPassword?: string;
   open?: boolean;
   port?: number;
   startGateway?: boolean;
@@ -118,14 +120,121 @@ type WebManagementSecurityContext = {
   allowIpLiteralHosts: boolean;
   allowedHostnames: Set<string>;
   authToken: string;
+  loginPassword?: string;
   port: number;
+  /** Session id -> expiry epoch ms, keyed by the value of the session cookie. */
+  sessions: Map<string, number>;
 };
 
 const defaultWebHost = "127.0.0.1";
 const defaultWebPort = 3458;
 const maxRpcBodyBytes = 8 * 1024 * 1024;
+const maxLoginBodyBytes = 64 * 1024;
 const webAuthHeader = "x-ccr-web-auth";
 const webAuthQueryParam = "ccr_web_token";
+const webSessionCookieName = "ccr_web_session";
+const webSessionTtlMs = 12 * 60 * 60 * 1000;
+const loginFailureDelayMs = 300;
+
+const loginHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Sign in - CCR</title>
+    <style>
+      :root { color-scheme: light dark; }
+      * { box-sizing: border-box; }
+      body {
+        align-items: center;
+        background: #0f1115;
+        color: #e6e8eb;
+        display: flex;
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        justify-content: center;
+        margin: 0;
+        min-height: 100vh;
+      }
+      form {
+        background: #171a21;
+        border: 1px solid #262b35;
+        border-radius: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        padding: 28px;
+        width: min(360px, calc(100vw - 32px));
+      }
+      h1 { font-size: 18px; margin: 0 0 4px; }
+      p { color: #9aa3af; font-size: 13px; margin: 0; }
+      input {
+        background: #0f1115;
+        border: 1px solid #303643;
+        border-radius: 8px;
+        color: inherit;
+        font-size: 14px;
+        padding: 10px 12px;
+        width: 100%;
+      }
+      input:focus { border-color: #4c8dff; outline: none; }
+      button {
+        background: #2f6feb;
+        border: none;
+        border-radius: 8px;
+        color: #fff;
+        cursor: pointer;
+        font-size: 14px;
+        padding: 10px 12px;
+      }
+      button:disabled { cursor: default; opacity: 0.6; }
+      .error { color: #ff7b72; font-size: 13px; min-height: 18px; }
+    </style>
+  </head>
+  <body>
+    <form id="login-form">
+      <h1>CCR management console</h1>
+      <p>Enter the password to continue.</p>
+      <input id="password" type="password" autocomplete="current-password" autofocus placeholder="Password" />
+      <div class="error" id="error" role="alert" aria-live="polite"></div>
+      <button id="submit" type="submit">Sign in</button>
+    </form>
+    <script>
+      (function () {
+        var form = document.getElementById("login-form");
+        var input = document.getElementById("password");
+        var error = document.getElementById("error");
+        var button = document.getElementById("submit");
+        form.addEventListener("submit", function (event) {
+          event.preventDefault();
+          error.textContent = "";
+          button.disabled = true;
+          fetch("/api/ccr/login", {
+            body: JSON.stringify({ password: input.value }),
+            credentials: "same-origin",
+            headers: { "content-type": "application/json" },
+            method: "POST"
+          })
+            .then(function (response) {
+              if (response.ok) {
+                window.location.replace("/");
+                return;
+              }
+              return response
+                .json()
+                .catch(function () { return {}; })
+                .then(function (payload) {
+                  error.textContent = (payload && payload.error && payload.error.message) || "Sign in failed.";
+                });
+            })
+            .catch(function () { error.textContent = "Sign in failed."; })
+            .then(function () { button.disabled = false; });
+        });
+      })();
+    </script>
+  </body>
+</html>
+`;
 const staticRoot = path.resolve(__dirname, "..", "renderer");
 const homeHtmlFile = path.join(staticRoot, "pages", "home", "index.html");
 const rendererAssetsRoot = path.join(staticRoot, "assets");
@@ -136,6 +245,7 @@ export async function startWebManagementServer(options: WebManagementServerOptio
   const host = options.host?.trim() || readEnvString("CCR_WEB_HOST") || defaultWebHost;
   const requestedPort = options.port ?? readEnvPort("CCR_WEB_PORT") ?? defaultWebPort;
   const authToken = options.authToken?.trim() || readEnvString("CCR_WEB_AUTH_TOKEN") || randomBytes(32).toString("base64url");
+  const loginPassword = options.loginPassword?.trim() || readEnvString("CCR_WEB_LOGIN_PASSWORD");
   let security: WebManagementSecurityContext | undefined;
   const server = createServer((request, response) => {
     if (!security) {
@@ -152,7 +262,7 @@ export async function startWebManagementServer(options: WebManagementServerOptio
   const port = typeof address === "object" && address ? address.port : listenedPort;
   const baseUrl = `http://${formatListenHost(host)}:${port}/`;
   const url = urlWithWebAuthToken(baseUrl, authToken);
-  security = createWebManagementSecurityContext(host, port, authToken);
+  security = createWebManagementSecurityContext(host, port, authToken, loginPassword);
 
   if (options.startGateway !== false) {
     await startConfiguredServices("web startup");
@@ -199,12 +309,42 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     await handleRpcRequest(request, response, security);
     return;
   }
+  if (url.pathname === "/api/ccr/login" && request.method === "POST") {
+    await handleWebLogin(request, response, security);
+    return;
+  }
+  if (url.pathname === "/api/ccr/logout" && request.method === "POST") {
+    handleWebLogout(request, response, security);
+    return;
+  }
+  if (url.pathname === "/api/ccr/auth-status" && (request.method === "GET" || request.method === "HEAD")) {
+    const authenticated = hasValidWebSession(request, security) || hasValidWebAuthToken(request, security);
+    const body = JSON.stringify({ authenticated, loginRequired: Boolean(security.loginPassword), ok: true });
+    response.writeHead(200, {
+      "cache-control": "no-store",
+      "content-length": Buffer.byteLength(body),
+      "content-type": "application/json; charset=utf-8"
+    });
+    response.end(request.method === "HEAD" ? undefined : body);
+    return;
+  }
   if (request.method !== "GET" && request.method !== "HEAD") {
     sendText(response, 405, "Method not allowed");
     return;
   }
   if (url.pathname === "/" || url.pathname === "/pages/home/index.html") {
+    // When a login password is configured, the shell is not served to
+    // unauthenticated visitors: the browser is redirected to the login page.
+    // The token header/query param still works for non-browser callers.
+    if (security.loginPassword && !hasValidWebSession(request, security) && !hasValidWebAuthToken(request, security)) {
+      redirectToLogin(response);
+      return;
+    }
     sendHomeHtml(response, request.method === "HEAD");
+    return;
+  }
+  if (url.pathname === "/pages/login/index.html") {
+    sendLoginHtml(response, request.method === "HEAD");
     return;
   }
   if (url.pathname.startsWith("/assets/")) {
@@ -223,8 +363,8 @@ async function handleRpcRequest(request: IncomingMessage, response: ServerRespon
     sendJson(response, 415, { error: { message: "RPC requests must use application/json." }, ok: false });
     return;
   }
-  if (!hasValidWebAuthToken(request, security)) {
-    sendJson(response, 401, { error: { message: "CCR web authentication token is missing or invalid." }, ok: false });
+  if (!hasValidWebAuthToken(request, security) && !hasValidWebSession(request, security)) {
+    sendJson(response, 401, { error: { message: "CCR web authentication is missing or invalid." }, ok: false });
     return;
   }
 
@@ -346,6 +486,10 @@ const rpcHandlers: Record<string, RpcHandler> = {
   getProviderCatalogModels: (request) => getProviderCatalogModels(request as ProviderCatalogModelsRequest),
   getOpenRouterProviderCatalog: (request) => getOpenRouterProviderCatalog(request as OpenRouterProviderCatalogRequest),
   getProviderPresets: () => getProviderPresets(),
+  getProviderEndpointLock: () => ({
+    endpoint: lockedProviderEndpointOriginsText(),
+    locked: isProviderEndpointLocked()
+  }),
   getProxyCertificateStatus: () => proxyService.getCertificateStatus(),
   getProxyNetworkCaptures: () => proxyService.getNetworkCaptures(),
   getProxyStatus: () => proxyService.getStatus(),
@@ -596,6 +740,18 @@ function sendHomeHtml(response: ServerResponse, headOnly: boolean): void {
   sendBuffer(response, 200, Buffer.from(html, "utf8"), "text/html; charset=utf-8", headOnly);
 }
 
+function sendLoginHtml(response: ServerResponse, headOnly: boolean): void {
+  sendBuffer(response, 200, Buffer.from(loginHtml, "utf8"), "text/html; charset=utf-8", headOnly);
+}
+
+function redirectToLogin(response: ServerResponse): void {
+  response.writeHead(302, {
+    "cache-control": "no-store",
+    location: "/pages/login/index.html"
+  });
+  response.end();
+}
+
 function sendStaticFile(response: ServerResponse, root: string, relativePath: string, headOnly: boolean): void {
   const normalizedRelativePath = relativePath.replace(/^[/\\]+/, "");
   const file = path.resolve(root, normalizedRelativePath);
@@ -644,7 +800,12 @@ function requestUrl(request: IncomingMessage): URL {
   return new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
 }
 
-function createWebManagementSecurityContext(host: string, port: number, authToken: string): WebManagementSecurityContext {
+function createWebManagementSecurityContext(
+  host: string,
+  port: number,
+  authToken: string,
+  loginPassword?: string
+): WebManagementSecurityContext {
   const normalizedHost = normalizeHostname(host);
   const allowedHostnames = new Set<string>(["localhost", "127.0.0.1", "::1", "0:0:0:0:0:0:0:1"]);
   if (normalizedHost) {
@@ -654,7 +815,9 @@ function createWebManagementSecurityContext(host: string, port: number, authToke
     allowIpLiteralHosts: isWildcardBindHost(normalizedHost),
     allowedHostnames,
     authToken,
-    port
+    loginPassword: loginPassword && loginPassword.length > 0 ? loginPassword : undefined,
+    port,
+    sessions: new Map<string, number>()
   };
 }
 
@@ -731,7 +894,111 @@ function isJsonRequest(request: IncomingMessage): boolean {
 
 function hasValidWebAuthToken(request: IncomingMessage, security: WebManagementSecurityContext): boolean {
   const token = readHeaderValue(request.headers[webAuthHeader]);
-  return constantTimeEquals(token, security.authToken);
+  if (constantTimeEquals(token, security.authToken)) {
+    return true;
+  }
+  // Non-browser callers (CLI `ccr ui`, docs setup wizard) bootstrap the shell
+  // from a URL carrying ?ccr_web_token=..., then switch to the header for RPC.
+  return constantTimeEquals(requestUrl(request).searchParams.get(webAuthQueryParam) ?? undefined, security.authToken);
+}
+
+function hasValidWebSession(request: IncomingMessage, security: WebManagementSecurityContext): boolean {
+  const sessionId = readSessionCookie(request);
+  if (!sessionId) {
+    return false;
+  }
+  const expiresAt = security.sessions.get(sessionId);
+  if (!expiresAt) {
+    return false;
+  }
+  if (expiresAt <= Date.now()) {
+    security.sessions.delete(sessionId);
+    return false;
+  }
+  return true;
+}
+
+async function handleWebLogin(
+  request: IncomingMessage,
+  response: ServerResponse,
+  security: WebManagementSecurityContext
+): Promise<void> {
+  if (!security.loginPassword) {
+    sendJson(response, 400, { error: { message: "Password login is not enabled on this server." }, ok: false });
+    return;
+  }
+  let password: string | undefined;
+  try {
+    const body = await readRequestBody(request, maxLoginBodyBytes);
+    const parsed: unknown = body.length === 0 ? {} : JSON.parse(body.toString("utf8"));
+    const candidate = parsed && typeof parsed === "object" ? (parsed as { password?: unknown }).password : undefined;
+    // Not trimmed: a passphrase may legitimately contain leading/trailing spaces.
+    password = typeof candidate === "string" ? candidate : undefined;
+  } catch {
+    sendJson(response, 400, { error: { message: "Invalid login request." }, ok: false });
+    return;
+  }
+  if (!constantTimeEquals(password, security.loginPassword)) {
+    // Small fixed delay to slow down online guessing without punishing the
+    // interactive user noticeably.
+    await new Promise((resolve) => setTimeout(resolve, loginFailureDelayMs));
+    sendJson(response, 401, { error: { message: "Incorrect password." }, ok: false });
+    return;
+  }
+  const sessionId = randomBytes(32).toString("base64url");
+  pruneExpiredSessions(security);
+  security.sessions.set(sessionId, Date.now() + webSessionTtlMs);
+  response.writeHead(200, {
+    "cache-control": "no-store",
+    "content-type": "application/json; charset=utf-8",
+    "set-cookie": `${webSessionCookieName}=${sessionId}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${Math.floor(webSessionTtlMs / 1000)}`,
+    "x-content-type-options": "nosniff"
+  });
+  response.end(JSON.stringify({ ok: true }));
+}
+
+function handleWebLogout(
+  request: IncomingMessage,
+  response: ServerResponse,
+  security: WebManagementSecurityContext
+): void {
+  const sessionId = readSessionCookie(request);
+  if (sessionId) {
+    security.sessions.delete(sessionId);
+  }
+  response.writeHead(200, {
+    "cache-control": "no-store",
+    "content-type": "application/json; charset=utf-8",
+    "set-cookie": `${webSessionCookieName}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0`,
+    "x-content-type-options": "nosniff"
+  });
+  response.end(JSON.stringify({ ok: true }));
+}
+
+function readSessionCookie(request: IncomingMessage): string | undefined {
+  const header = readHeaderValue(request.headers.cookie);
+  if (!header) {
+    return undefined;
+  }
+  for (const part of header.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator === -1) {
+      continue;
+    }
+    if (part.slice(0, separator).trim() === webSessionCookieName) {
+      return readString(part.slice(separator + 1).trim());
+    }
+  }
+  return undefined;
+}
+
+function pruneExpiredSessions(security: WebManagementSecurityContext): void {
+  const now = Date.now();
+  for (const [sessionId, expiresAt] of security.sessions) {
+    if (expiresAt <= now) {
+      security.sessions.delete(sessionId);
+    }
+  }
 }
 
 function constantTimeEquals(value: string | undefined, expected: string): boolean {

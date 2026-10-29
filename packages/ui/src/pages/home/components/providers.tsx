@@ -1,4 +1,5 @@
 import { useDraftClose } from "./unsaved-changes";
+import type { ProviderEndpointLockState } from "@ccr/core/providers/endpoint-lock";
 import {
   AddProviderDraft, AnimatedDisclosure, AnimatedIconSwap, AnimatedListItem, AnimatedPopover, AnimatePresence, AppConfig, Badge,
   Box, Braces, Button, Card, CardContent, CardHeader, CardTitle,
@@ -7,7 +8,7 @@ import {
   customProviderPresetId, defaultProviderAccountConfigForPreset, Dialog, DialogBody, DialogContent, DialogFooter,
   DialogHeader, DialogTitle, ExternalLink, Eye, EyeOff, Field, findProviderPreset, formatProviderAccountMeterValue, GatewayProviderConfig,
   GatewayProviderProbeResult, getProviderPresets, Globe, inferProviderNameFromBaseUrl, Info, Input, KeyRound, KeyValueRowsControl, Label,
-  Layers3, LoaderCircle, localAgentProviderIconUrls, mergeProviderModelLists, modelCatalogItemMatchesQuery, motion,
+  Layers3, LoaderCircle, mergeProviderModelLists, modelCatalogItemMatchesQuery, motion,
   Pencil, Plus, PopoverContent, primaryProviderAccountMeter, primaryProviderPresetEndpoint,
   providerAccountConnectorApiKeySafetyIssue, providerAccountConnectorExample, ProviderAccountDraftMode, providerAccountModeOptions, ProviderAccountSnapshot,
   providerAccountConnectorsTextWithNewApiUserBalanceTemplate, providerAccountSnapshotCredentialLabel, providerAccountSnapshotLabel, ProviderAccountTestPath,
@@ -22,22 +23,26 @@ import {
 import { PopoverPortal } from "@/components/ui/popover";
 import { Tooltip, TooltipPortal } from "@/components/ui/tooltip";
 import { providerUrlWithDefaultScheme } from "@ccr/core/providers/url";
-import type { ChromeLoginImportJob, LocalAgentProviderCandidate, OpenRouterProviderCatalogItem, OpenRouterProviderCatalogRequest, ProviderAccountHttpJsonConnectorConfig, ProviderAccountWebContentJsonConnectorConfig } from "@ccr/core/contracts/app";
+import type { ChromeLoginImportJob, OpenRouterProviderCatalogItem, OpenRouterProviderCatalogRequest, ProviderAccountHttpJsonConnectorConfig, ProviderAccountWebContentJsonConnectorConfig } from "@ccr/core/contracts/app";
 import type { ReactNode } from "react";
 
 const useClientLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
-const emptyProviderPlugins: unknown[] = [];
 
-export function ProvidersView({ accountSnapshots, addProvider, editProvider, notify, providers, removeProvider, setProviderEnabled }: {
+export function ProvidersView({ accountSnapshots, addProvider, editProvider, endpointLock, notify, providers, removeProvider, setProviderEnabled }: {
   accountSnapshots: ProviderAccountSnapshot[];
   addProvider: () => void;
   editProvider: (index: number) => void;
+  endpointLock: ProviderEndpointLockState;
   notify: (message: string) => void;
   providers: Array<{ provider: GatewayProviderConfig; index: number }>;
   removeProvider: (index: number) => void;
   setProviderEnabled: (index: number, enabled: boolean) => void;
 }) {
   const t = useAppText();
+  const endpointLocked = endpointLock.locked;
+  const lockNotice = endpointLocked
+    ? `${t("Provider editing is locked to")} ${endpointLock.endpoint ?? ""}`.trim()
+    : undefined;
   const [query, setQuery] = useState("");
   const [expandedProviders, setExpandedProviders] = useState<Set<string>>(() => new Set());
   const normalizedQuery = query.trim().toLowerCase();
@@ -110,7 +115,13 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, not
               value={query}
             />
           </div>
-          <Button aria-label={t("Add provider")} onClick={addProvider} title={t("Add provider")} type="button">
+          <Button
+            aria-label={t("Add provider")}
+            disabled={endpointLocked}
+            onClick={addProvider}
+            title={lockNotice ?? t("Add provider")}
+            type="button"
+          >
             <Plus className="h-4 w-4" />
             {t("Add")}
           </Button>
@@ -139,6 +150,7 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, not
                         expanded={expanded}
                         index={index}
                         key={itemKey}
+                        locked={endpointLocked}
                         onCopyModel={copyModel}
                         onEdit={editProvider}
                         onRemove={removeProvider}
@@ -243,12 +255,13 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, not
                                 </div>
                                 <Button
                                   aria-label={`${t("Edit")} ${provider.name || t("provider")}`}
+                                  disabled={endpointLocked}
                                   onClick={(event) => {
                                     event.stopPropagation();
                                     editProvider(index);
                                   }}
                                   size="iconSm"
-                                  title={t("Edit provider")}
+                                  title={endpointLocked ? t("Provider editing is locked") : t("Edit provider")}
                                   type="button"
                                   variant="ghost"
                                 >
@@ -256,12 +269,13 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, not
                                 </Button>
                                 <Button
                                   aria-label={`${t("Remove")} ${provider.name || t("provider")}`}
+                                  disabled={endpointLocked}
                                   onClick={(event) => {
                                     event.stopPropagation();
                                     removeProvider(index);
                                   }}
                                   size="iconSm"
-                                  title={t("Remove provider")}
+                                  title={endpointLocked ? t("Provider editing is locked") : t("Remove provider")}
                                   type="button"
                                   variant="ghost"
                                 >
@@ -326,6 +340,7 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, not
 function ProviderMobileCard({
   expanded,
   index,
+  locked,
   onCopyModel,
   onEdit,
   onRemove,
@@ -336,6 +351,7 @@ function ProviderMobileCard({
 }: {
   expanded: boolean;
   index: number;
+  locked: boolean;
   onCopyModel: (model: string) => void | Promise<void>;
   onEdit: (index: number) => void;
   onRemove: (index: number) => void;
@@ -372,9 +388,10 @@ function ProviderMobileCard({
             />
             <Button
               aria-label={`${t("Edit")} ${provider.name || t("provider")}`}
+              disabled={locked}
               onClick={() => onEdit(index)}
               size="iconSm"
-              title={t("Edit provider")}
+              title={locked ? t("Provider editing is locked") : t("Edit provider")}
               type="button"
               variant="ghost"
             >
@@ -382,9 +399,10 @@ function ProviderMobileCard({
             </Button>
             <Button
               aria-label={`${t("Remove")} ${provider.name || t("provider")}`}
+              disabled={locked}
               onClick={() => onRemove(index)}
               size="iconSm"
-              title={t("Remove provider")}
+              title={locked ? t("Provider editing is locked") : t("Remove provider")}
               type="button"
               variant="ghost"
             >
@@ -1369,233 +1387,6 @@ function providerNameMatchesGeneratedPresetName(name: string, baseName: string):
   return /^\d+$/.test(normalizedName.slice(normalizedBaseName.length + 1));
 }
 
-function LocalAgentProviderImportPanel({
-  mode,
-  onChange,
-  providerPlugins,
-  providers
-}: {
-  mode: "add" | "edit";
-  onChange: (patch: Partial<AddProviderDraft>, resetProbe?: boolean) => void;
-  providerPlugins: unknown[];
-  providers: GatewayProviderConfig[];
-}) {
-  const t = useAppText();
-  const formatError = useAppErrorText();
-  const [candidates, setCandidates] = useState<LocalAgentProviderCandidate[]>([]);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [importingId, setImportingId] = useState("");
-  const [scanAttempt, setScanAttempt] = useState(0);
-
-  useEffect(() => {
-    if (mode !== "add" || !window.ccr?.getLocalAgentProviderCandidates) {
-      return;
-    }
-    let cancelled = false;
-    setLoading(true);
-    setError("");
-    void window.ccr.getLocalAgentProviderCandidates()
-      .then((items) => {
-        if (!cancelled) {
-          setCandidates(items.filter((item) =>
-            item.status !== "missing" &&
-            !localAgentProviderAlreadyImported(item, providers, providerPlugins)
-          ));
-        }
-      })
-      .catch((scanError) => {
-        if (!cancelled) {
-          setError(formatError(scanError));
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setLoading(false);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [mode, providerPlugins, providers, scanAttempt]);
-
-  if (mode !== "add" || (candidates.length === 0 && !error)) {
-    return null;
-  }
-
-  async function importCandidate(candidate: LocalAgentProviderCandidate) {
-    if (!window.ccr?.importLocalAgentProvider || !candidate.importable) {
-      return;
-    }
-    setImportingId(candidate.id);
-    setError("");
-    try {
-      const result = await window.ccr.importLocalAgentProvider({
-        id: candidate.id,
-        providerNames: providers.map((provider) => provider.name)
-      });
-      const accountDraft = createProviderAccountDraftFromConfig(result.provider.account);
-      const protocol = result.provider.protocol ?? "openai_chat_completions";
-      onChange({
-        ...accountDraft,
-        apiKey: result.provider.apiKey ?? "",
-        baseUrl: result.provider.baseUrl,
-        capabilities: result.provider.capabilities ?? [],
-        credentialMode: "apiKey",
-        credentials: [],
-        icon: result.provider.icon?.trim() || localAgentProviderIconUrls[candidate.kind] || "",
-        modelDescriptions: result.provider.modelDescriptions,
-        modelDisplayNames: result.provider.modelDisplayNames,
-        modelMetadata: result.provider.modelMetadata,
-        modelSearch: "",
-        modelsText: result.provider.models.join("\n"),
-        name: result.provider.name?.trim() || inferProviderNameFromBaseUrl(result.provider.baseUrl),
-        presetId: customProviderPresetId,
-        providerPlugins: result.providerPlugins,
-        protocol,
-        selectedModels: [],
-        selectedProtocols: [protocol]
-      }, true);
-    } catch (importError) {
-      setError(formatError(importError));
-    } finally {
-      setImportingId("");
-    }
-  }
-
-  return (
-    <div className="sm:col-span-2 rounded-md border border-border bg-muted/20 p-3">
-      <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
-        <div className="min-w-0">
-          <div className="truncate text-[12px] font-semibold text-foreground">{t("Import local agent provider")}</div>
-          <div className="mt-0.5 text-[12px] leading-5 text-muted-foreground">{t("CCR scanned this computer for local Claude Code, Codex, Grok CLI, Kimi CLI, OpenCode CLI, and ZCode providers. Click Import to add one as a gateway provider.")}</div>
-        </div>
-        <Button aria-label={t("Scan local providers again")} disabled={loading || Boolean(importingId)} onClick={() => setScanAttempt((value) => value + 1)} size="sm" variant="outline">
-          {loading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-          {t("Scan again")}
-        </Button>
-      </div>
-
-      {candidates.length > 0 ? (
-        <div className="grid grid-cols-1 gap-2">
-          {candidates.map((candidate) => {
-            const iconUrl = localAgentProviderIconUrls[candidate.kind];
-            const importing = importingId === candidate.id;
-            return (
-              <div
-                className="grid min-h-12 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2"
-                key={candidate.id}
-              >
-                <div className="flex min-w-0 items-center gap-2">
-                  <span className="flex h-7 w-7 shrink-0 items-center justify-center overflow-hidden rounded-md border border-border bg-muted">
-                    <img alt="" className="h-full w-full object-cover" draggable={false} src={iconUrl} />
-                  </span>
-                  <div className="min-w-0">
-                    <div className="flex min-w-0 items-center gap-2">
-                      <span className="min-w-0 truncate text-[12px] font-semibold">{candidate.name}</span>
-                      <Badge variant={candidate.importable ? "success" : candidate.status === "locked" ? "warning" : "outline"}>
-                        {candidate.importable ? t("Ready") : t("Login unavailable")}
-                      </Badge>
-                    </div>
-                    {candidate.importable ? (
-                      <div className="mt-1 truncate text-[12px] text-muted-foreground" title={candidate.sourceFile || candidate.detail}>
-                        {candidate.detail ? t(candidate.detail) : candidate.sourceFile}
-                      </div>
-                    ) : (
-                      <div className="mt-1 space-y-2 text-[12px] leading-5 text-muted-foreground">
-                        <p>{t(candidate.detail || "Cannot read local login information. Sign in to the agent and scan again, or configure an API key manually.")}</p>
-                        <Button onClick={() => onChange({ presetId: customProviderPresetId }, true)} size="sm" variant="outline">{t("Configure API key manually")}</Button>
-                      </div>
-                    )}
-                  </div>
-                </div>
-                <Button
-                  className="h-8 px-2"
-                  disabled={!candidate.importable || Boolean(importingId)}
-                  onClick={() => void importCandidate(candidate)}
-                  type="button"
-                  variant={candidate.importable ? "default" : "outline"}
-                >
-                  <AnimatedIconSwap iconKey={importing ? "importing" : "import"}>
-                    {importing ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
-                  </AnimatedIconSwap>
-                  {t("Import")}
-                </Button>
-              </div>
-            );
-          })}
-        </div>
-      ) : loading ? (
-        <div className="rounded-md border border-dashed border-border bg-background px-3 py-4 text-center text-[12px] text-muted-foreground">
-          {t("Scanning local agent logins")}
-        </div>
-      ) : null}
-
-      {error ? (
-        <div className="mt-2 flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
-          <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          <div><p>{t("Local provider import failed. Scan again or configure an API key manually.")}</p><details className="mt-2"><summary className="cursor-pointer">{t("Technical details")}</summary><p className="mt-1 break-all">{error}</p></details></div>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-const localAgentProviderApiKey = "ccr-local-agent-login";
-const localAgentProviderPluginSuffixes: Record<Exclude<LocalAgentProviderCandidate["kind"], "opencode">, string[]> = {
-  "claude-code": ["-claude-code-oauth", "-claude-code-oauth-internal"],
-  codex: ["-codex-oauth", "-codex-oauth-internal"],
-  grok: ["-grok-cli-oauth", "-grok-cli-oauth-internal"],
-  kimi: ["-kimi-cli-oauth", "-kimi-cli-oauth-internal", "-kimi-cli-api-key", "-kimi-cli-api-key-internal"],
-  zcode: ["-zcode-api-key", "-zcode-api-key-internal"]
-};
-
-export function localAgentProviderPluginSuffixesForCandidate(candidate: LocalAgentProviderCandidate): string[] {
-  if (candidate.kind === "opencode") {
-    const providerId = candidate.id.startsWith("opencode-go-") ? "opencode-go" : "opencode";
-    const baseSuffix = `-${providerId}-${candidate.protocol.replaceAll("_", "-")}-api-key`;
-    return [baseSuffix, `${baseSuffix}-internal`];
-  }
-  return localAgentProviderPluginSuffixes[candidate.kind];
-}
-
-export function localAgentProviderAlreadyImported(
-  candidate: LocalAgentProviderCandidate,
-  providers: GatewayProviderConfig[],
-  providerPlugins: unknown[]
-): boolean {
-  const suffixes = localAgentProviderPluginSuffixesForCandidate(candidate);
-  const localProviderNames = new Set(providers
-    .filter((provider) => provider.api_key === localAgentProviderApiKey)
-    .flatMap((provider) => [
-      provider.name,
-      provider.type ? `${provider.name}::${provider.type}` : ""
-    ])
-    .map((name) => name.trim().toLowerCase())
-    .filter(Boolean));
-  if (localProviderNames.size === 0) {
-    return false;
-  }
-
-  const candidateProviderExists = providers.some((provider) =>
-    provider.api_key === localAgentProviderApiKey &&
-    provider.name.trim().toLowerCase().startsWith(candidate.name.toLowerCase())
-  );
-  if (candidateProviderExists) {
-    return true;
-  }
-
-  return providerPlugins.some((plugin) => {
-    const key = isPlainRecord(plugin) && typeof plugin.key === "string" ? plugin.key : "";
-    const providerName = isPlainRecord(plugin) && typeof plugin.providerName === "string" ? plugin.providerName : "";
-    return (
-      key.startsWith("ccr-local-agent-") &&
-      suffixes.some((suffix) => key.endsWith(suffix)) &&
-      localProviderNames.has(providerName.trim().toLowerCase())
-    );
-  });
-}
-
 export type ProviderSetupStepId = "provider" | "credentials" | "models" | "verify";
 
 export const providerSetupStepIds: ProviderSetupStepId[] = ["provider", "credentials", "models", "verify"];
@@ -1741,7 +1532,6 @@ function ProviderConnectionStatusPanel({
   connectivityLoading,
   connectivityProbe,
   hasConnectivityCheckInputs,
-  localAgentImport,
   onCheck,
   probe,
   probeLoading
@@ -1750,7 +1540,6 @@ function ProviderConnectionStatusPanel({
   connectivityLoading: boolean;
   connectivityProbe?: GatewayProviderProbeResult;
   hasConnectivityCheckInputs: boolean;
-  localAgentImport: boolean;
   onCheck?: () => Promise<unknown>;
   probe?: GatewayProviderProbeResult;
   probeLoading: boolean;
@@ -1760,11 +1549,9 @@ function ProviderConnectionStatusPanel({
   const connectionVerified = providerProbeHasSupportedProtocol(connectivityProbe);
   const protocolTitle = probeLoading
     ? "Detecting protocols"
-    : localAgentImport
-      ? "Local login provider"
-      : protocolDetected
-        ? "Protocols detected"
-        : "Waiting for provider details";
+    : protocolDetected
+      ? "Protocols detected"
+      : "Waiting for provider details";
   const protocolDescription = probeLoading
     ? "CCR is checking which API protocols this endpoint supports."
     : protocolDetected
@@ -1772,22 +1559,18 @@ function ProviderConnectionStatusPanel({
       : "Choose a provider endpoint so CCR can detect compatible protocols.";
   const requestTitle = connectivityLoading
     ? "Checking connection"
-    : localAgentImport
-      ? "Available after saving"
-      : connectionVerified
-        ? "Connection verified"
-        : hasConnectivityCheckInputs
-          ? "Not verified yet"
-          : "Waiting for required fields";
+    : connectionVerified
+      ? "Connection verified"
+      : hasConnectivityCheckInputs
+        ? "Not verified yet"
+        : "Waiting for required fields";
   const requestDescription = connectivityLoading
     ? "CCR is sending a limited real model request."
-    : localAgentImport
-      ? "The imported local agent login is connected when this provider is saved."
-      : connectionVerified
-        ? "A real model request succeeded with the selected provider settings."
-        : hasConnectivityCheckInputs
-          ? "Optional. Check Connection sends a real model request and may consume provider credits."
-          : "API endpoint, API key, and at least one model are required before verification.";
+    : connectionVerified
+      ? "A real model request succeeded with the selected provider settings."
+      : hasConnectivityCheckInputs
+        ? "Optional. Check Connection sends a real model request and may consume provider credits."
+        : "API endpoint, API key, and at least one model are required before verification.";
 
   return (
     <div className={cn("rounded-md border border-border bg-muted/20 p-3", className)}>
@@ -1795,7 +1578,7 @@ function ProviderConnectionStatusPanel({
         <ProviderConnectionStatusRow
           description={t(protocolDescription)}
           loading={probeLoading}
-          state={protocolDetected || localAgentImport ? "success" : "pending"}
+          state={protocolDetected ? "success" : "pending"}
           title={t(protocolTitle)}
         />
         <ProviderConnectionStatusRow
@@ -1815,7 +1598,7 @@ function ProviderConnectionStatusPanel({
           ) : null}
           description={t(requestDescription)}
           loading={connectivityLoading}
-          state={connectionVerified || localAgentImport ? "success" : hasConnectivityCheckInputs ? "warning" : "pending"}
+          state={connectionVerified ? "success" : hasConnectivityCheckInputs ? "warning" : "pending"}
           title={t(requestTitle)}
         />
       </div>
@@ -1974,7 +1757,6 @@ export function AddProviderForm({
   onSelectStep,
   probe,
   probeLoading,
-  providerPlugins = emptyProviderPlugins,
   providers
 }: {
   activeStep?: ProviderSetupStepId;
@@ -1992,7 +1774,6 @@ export function AddProviderForm({
   onSelectStep?: (step: ProviderSetupStepId) => void;
   probe?: GatewayProviderProbeResult;
   probeLoading: boolean;
-  providerPlugins?: unknown[];
   providers: GatewayProviderConfig[];
 }) {
   const t = useAppText();
@@ -2012,16 +1793,12 @@ export function AddProviderForm({
     : probe?.detectedProtocol ?? draft.protocol;
   const detectedBaseUrl = providerCapabilityBaseUrlForProtocol(draft.baseUrl, detectedProtocol, probe);
   const safetyIssue = providerDraftSafetyIssue(draft, detectedBaseUrl);
-  const localAgentImport = draft.providerPlugins.length > 0;
-  const localAgentProviderPlugins = useMemo(
-    () => [...providerPlugins, ...draft.providerPlugins],
-    [draft.providerPlugins, providerPlugins]
-  );
   const manualProtocolDetection = draft.protocolDetectionMode === "manual";
-  const providerPresetOptions = [
-    { iconUrl: draft.icon, label: t("Other / custom API endpoint"), value: customProviderPresetId },
-    ...getProviderPresets().map((preset) => ({ label: t(preset.name), preset, value: preset.id }))
-  ];
+  const providerPresetOptions = getProviderPresets().map((preset) => ({
+    label: t(preset.name),
+    preset,
+    value: preset.id
+  }));
   const selectableProtocols = manualProtocolDetection
     ? providerProtocolOptions.map((option) => option.value)
     : providerSelectableProtocolsFromProbe(probe);
@@ -2036,13 +1813,13 @@ export function AddProviderForm({
     configuredModels.length > 0
   );
   const providerIdentityReady = importMode || Boolean(selectedPreset || draft.baseUrl.trim());
-  const credentialReady = localAgentImport || Boolean(
+  const credentialReady = Boolean(
     draft.credentialMode === "pool"
       ? credentialPoolReady
       : draft.apiKey.trim()
   );
   const modelsReady = configuredModels.length > 0;
-  const connectionVerified = localAgentImport || providerProbeHasSupportedProtocol(connectivityProbe);
+  const connectionVerified = providerProbeHasSupportedProtocol(connectivityProbe);
   const showStep = (step: ProviderSetupStepId) => !activeStep || activeStep === step;
 
   function updateConfiguredModels(models: string[]) {
@@ -2264,22 +2041,14 @@ export function AddProviderForm({
             {importProvider ? (
               <ProviderImportHeader draft={draft} provider={importProvider} preset={selectedPreset} />
             ) : (
-              <>
-                <LocalAgentProviderImportPanel
-                  mode={mode}
-                  onChange={onChange}
-                  providerPlugins={localAgentProviderPlugins}
-                  providers={providers}
+              <div className="block min-w-0 space-y-1 sm:col-span-2">
+                <span className="block truncate text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t("Select preset provider")}</span>
+                <ProviderPresetCombobox
+                  value={draft.presetId}
+                  onChange={updatePreset}
+                  options={providerPresetOptions}
                 />
-                <div className="block min-w-0 space-y-1 sm:col-span-2">
-                  <span className="block truncate text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t("Select preset provider")}</span>
-                  <ProviderPresetCombobox
-                    value={draft.presetId}
-                    onChange={updatePreset}
-                    options={providerPresetOptions}
-                  />
-                </div>
-              </>
+              </div>
             )}
             <Field className="sm:col-span-2" label={t("Name")}>
               <Input value={draft.name} onChange={(event) => onChange({ name: event.target.value })} />
@@ -2386,7 +2155,6 @@ export function AddProviderForm({
               connectivityLoading={connectivityLoading}
               connectivityProbe={connectivityProbe}
               hasConnectivityCheckInputs={hasConnectivityCheckInputs}
-              localAgentImport={localAgentImport}
               onCheck={onCheck}
               probe={probe}
               probeLoading={probeLoading}
@@ -3478,7 +3246,6 @@ export function AddProviderDialog({
   onSubmit,
   probe,
   probeLoading,
-  providerPlugins = emptyProviderPlugins,
   providers,
   submitLabel,
   title
@@ -3497,7 +3264,6 @@ export function AddProviderDialog({
   onSubmit: () => Promise<boolean>;
   probe?: GatewayProviderProbeResult;
   probeLoading: boolean;
-  providerPlugins?: unknown[];
   providers: GatewayProviderConfig[];
   submitLabel?: string;
   title?: string;
@@ -3513,10 +3279,9 @@ export function AddProviderDialog({
   const submitDisabled = !canSubmit || submitLoading;
   const wizardMode = mode === "add";
   const selectedPreset = findProviderPreset(draft.presetId);
-  const localAgentImport = draft.providerPlugins.length > 0;
   const providerIdentityReady = Boolean(importProvider) || Boolean(selectedPreset || draft.baseUrl.trim());
   const credentialPoolReady = providerDraftHasReadyCredentialPool(draft);
-  const credentialReady = localAgentImport || Boolean(
+  const credentialReady = Boolean(
     draft.credentialMode === "pool"
       ? credentialPoolReady
       : draft.apiKey.trim()
@@ -3616,7 +3381,7 @@ export function AddProviderDialog({
               modelsReady={modelsReady}
               providerReady={providerIdentityReady}
               variant="divider"
-              verified={localAgentImport || providerProbeHasSupportedProtocol(connectivityProbe)}
+              verified={providerProbeHasSupportedProtocol(connectivityProbe)}
             />
           ) : null}
 
@@ -3637,7 +3402,6 @@ export function AddProviderDialog({
               onSelectStep={wizardMode ? selectSetupStep : undefined}
               probe={probe}
               probeLoading={probeLoading}
-              providerPlugins={providerPlugins}
               providers={providers}
             />
           </DialogBody>

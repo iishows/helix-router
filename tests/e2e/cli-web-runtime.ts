@@ -16,11 +16,12 @@ export type CliWebChild = ChildProcessByStdio<null, Readable, Readable>;
 export type CliWebRuntime = {
   baseUrl: string;
   child: CliWebChild;
+  loginPassword?: string;
   testHome: string;
   token: string;
 };
 
-export async function startCliWebServer(authToken: string): Promise<CliWebRuntime> {
+export async function startCliWebServer(authToken: string, loginPassword?: string): Promise<CliWebRuntime> {
   const port = await findAvailablePort();
   const testHome = mkdtempSync(path.join(os.tmpdir(), "ccr-playwright-home-"));
   const child = spawn(process.execPath, [
@@ -40,6 +41,7 @@ export async function startCliWebServer(authToken: string): Promise<CliWebRuntim
       CCR_INTERNAL_HOME_DIR: testHome,
       CCR_INTERNAL_USER_DATA_DIR: path.join(testHome, "user-data"),
       CCR_WEB_AUTH_TOKEN: authToken,
+      ...(loginPassword === undefined ? {} : { CCR_WEB_LOGIN_PASSWORD: loginPassword }),
       HOME: testHome
     },
     stdio: ["ignore", "pipe", "pipe"]
@@ -96,6 +98,7 @@ export async function startCliWebServer(authToken: string): Promise<CliWebRuntim
   return {
     ...service,
     child,
+    loginPassword,
     testHome
   };
 }

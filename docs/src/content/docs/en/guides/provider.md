@@ -2,17 +2,16 @@
 title: Add a provider
 pageTitle: Add a provider
 eyebrow: Quick start
-lead: "The interactive panel at the top of this page connects to your running CCR to add a provider directly. Prefer the desktop app? The steps below cover choosing a preset or custom endpoint, entering credentials, letting CCR auto-detect protocols and models, and verifying with a connectivity check."
+lead: "The interactive panel at the top of this page connects to your running CCR to add a provider directly. Prefer the desktop app? The steps below cover selecting the DoitX preset, entering credentials, letting CCR auto-detect protocols and models, and verifying with a connectivity check."
 ---
 
 ## Add the provider
 
 1. Open **Providers** and click **Add Provider**.
-2. Choose a built-in preset under **Select preset provider**. Presets fill common API endpoints, protocols, and icons automatically.
-3. If the service is not listed, choose **Other / custom API endpoint** and enter a **Name** and **API endpoint**.
-4. In the **Add credentials** step, enter the **API key**.
+2. Select the **DoitX** preset under **Select preset provider**. The preset fills the API endpoint, protocols, and icon automatically.
+3. In the **Add credentials** step, enter the **API key**.
 
-After you enter the API endpoint and key, CCR automatically detects the protocols and models the endpoint supports. Preset providers hide the API endpoint field by default; override it in **Advanced settings** if needed.
+After you enter the API key, CCR automatically detects the protocols and models the endpoint supports. The preset fills the API endpoint for you; override it in **Advanced settings** if needed.
 
 ## Protocols
 

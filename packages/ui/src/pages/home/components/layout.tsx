@@ -108,6 +108,7 @@ export function MainLayout({
   shouldReduceMotion,
   sidebarOpen,
   toggleGatewayService,
+  version,
   viewProps,
   visibleNavigation
 }: {
@@ -131,6 +132,7 @@ export function MainLayout({
   shouldReduceMotion: boolean | null;
   sidebarOpen: boolean;
   toggleGatewayService: () => void;
+  version: string;
   viewProps: MainViewProps;
   requestLogsEnabled: boolean;
   visibleNavigation: MainNavigationItem[];
@@ -235,6 +237,9 @@ export function MainLayout({
                 </span>
                 <span className="min-w-0 flex-1 truncate">{copy.settings.button}</span>
               </Button>
+              <div className="px-2 pb-1 text-center text-[11px] leading-none text-muted-foreground/60">
+                v{version}
+              </div>
             </div>
 
             <div className="h-3 shrink-0 max-[720px]:hidden" />

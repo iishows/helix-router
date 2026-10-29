@@ -100,20 +100,30 @@ docker run -d \
 
 | 凭据 | 用途 | 配置位置 |
 | --- | --- | --- |
-| `CCR_WEB_AUTH_TOKEN` | 管理 UI / RPC 鉴权 | 容器环境变量 |
+| `CCR_WEB_LOGIN_PASSWORD` | 浏览器登录管理台（换会话 Cookie） | 容器环境变量 |
+| `CCR_WEB_AUTH_TOKEN` | 管理 RPC 鉴权（脚本、反代注入） | 容器环境变量 |
 | CCR 客户端 API Key | 模型网关请求鉴权 | UI 的 **API 密钥** 页面 |
 | 上游供应商凭据 | CCR 调用模型供应商 | UI 的 **供应商** 页面 |
 
-不设置 `CCR_WEB_AUTH_TOKEN` 时，EntryPoint 每次启动容器都会生成新的随机 Token。打开根地址仍可工作，因为 Nginx 会跳转到包含当前 Token 的 URL；但持久部署和远程部署应固定一个足够长的强 Token。
+浏览器访问管理台时，未登录会被跳转到登录页。提交 `CCR_WEB_LOGIN_PASSWORD` 后由服务端签发 `HttpOnly` 会话 Cookie（有效期 12 小时），凭据不会出现在 URL、浏览器历史或截图里。
 
-不要把 Token 直接写进 Shell 历史。可以创建不进入版本控制的环境文件：
+不设置 `CCR_WEB_LOGIN_PASSWORD` 时，EntryPoint 首次启动会生成随机密码，持久化到数据卷 `.claude-code-router/web-login-password`，并打印在启动日志中：
+
+```sh
+docker logs ccr | grep 'login password'
+```
+
+`CCR_WEB_AUTH_TOKEN` 仍然有效，用于非浏览器调用：客户端可用 `x-ccr-web-auth` 请求头访问 RPC，或从带 `?ccr_web_token=...` 的 URL 打开管理台（CLI 的 `ccr ui` 走的正是这条路）。不设置时同样每次启动随机生成。
+
+不要把密码或 Token 直接写进 Shell 历史。可以创建不进入版本控制的环境文件：
 
 ```dotenv
+CCR_WEB_LOGIN_PASSWORD=replace-with-a-long-random-value
 CCR_WEB_AUTH_TOKEN=replace-with-a-long-random-value
 CCR_PUBLIC_BASE_URL=http://127.0.0.1:3458
 ```
 
-通过 `docker run --env-file` 使用，或把同名变量映射到 Compose 服务的 `environment`。包含 `ccr_web_token` 的完整管理 URL 也应按密码保护，因为它可能出现在浏览器历史、反向代理日志、截图和工单中。
+通过 `docker run --env-file` 使用，或把同名变量映射到 Compose 服务的 `environment`。
 
 ## 修改外部端口或地址
 
@@ -126,6 +136,7 @@ services:
       - "127.0.0.1:8088:8080"
     environment:
       CCR_PUBLIC_BASE_URL: http://127.0.0.1:8088
+      CCR_WEB_LOGIN_PASSWORD: ${CCR_WEB_LOGIN_PASSWORD:?set CCR_WEB_LOGIN_PASSWORD}
       CCR_WEB_AUTH_TOKEN: ${CCR_WEB_AUTH_TOKEN:?set CCR_WEB_AUTH_TOKEN}
 ```
 
@@ -204,11 +215,12 @@ docker compose logs --tail=200 ccr
 
 ## 环境变量完整参考
 
-一般部署只需要设置 `CCR_WEB_AUTH_TOKEN`、`CCR_PUBLIC_BASE_URL` 和 Docker Port Mapping。内部监听变量通常不需要修改。
+一般部署只需要设置 `CCR_WEB_LOGIN_PASSWORD`、`CCR_PUBLIC_BASE_URL` 和 Docker Port Mapping。内部监听变量通常不需要修改。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `CCR_WEB_AUTH_TOKEN` | 每次启动随机生成 | 管理 UI / RPC Token。持久或远程部署应设置固定强值。 |
+| `CCR_WEB_LOGIN_PASSWORD` | 首次启动随机生成并持久化 | 管理台浏览器登录密码。持久或远程部署应设置固定强值；查看自动生成的密码见上文。 |
+| `CCR_WEB_AUTH_TOKEN` | 每次启动随机生成 | 管理 RPC Token，供脚本或反代注入使用，不下发给浏览器。 |
 | `CCR_PUBLIC_BASE_URL` | `http://127.0.0.1:3458` | 写入 CCR 配置的完整公开地址；设置后优先于 Public Host / Port。 |
 | `CCR_PUBLIC_HOST` | `127.0.0.1` | 仅在没有完整公开 URL 时用于拼接公开地址，不会改变 Docker 端口绑定。 |
 | `CCR_PUBLIC_PORT` | `3458` | 仅在没有完整公开 URL 时用于拼接公开地址。 |
@@ -264,9 +276,9 @@ docker compose config
 
 它检查模型网关，不检查 Nginx 或 UI。新数据卷尚未配置供应商 / 模型时会返回 `502`。先打开 UI 完成配置并启动网关。
 
-### 修改 Token 后 UI 返回 `401`
+### 修改凭据后 UI 返回 `401`
 
-重新打开不带参数的根地址，让 Nginx 生成包含新 Token 的 URL；关闭仍使用旧 `ccr_web_token` 的标签页和书签。
+会话 Cookie 已过期（12 小时），或者改密码后容器没有重建。重新登录一次；若改的是 `CCR_WEB_LOGIN_PASSWORD`，还要执行 `docker compose up -d` 让容器生效。关闭仍使用旧 `ccr_web_token` 的标签页和书签。
 
 ### 客户端仍使用旧端口或域名
 

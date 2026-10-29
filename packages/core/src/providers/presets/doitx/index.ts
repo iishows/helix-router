@@ -1,15 +1,15 @@
 import { defaultProviderAccountConfig, type ProviderPreset } from "@ccr/core/providers/presets/types";
 
-export const teamoRouterProviderPreset: ProviderPreset = {
+export const doitxProviderPreset: ProviderPreset = {
   account: defaultProviderAccountConfig,
-  aliases: ["teamorouter", "teamo router", "teamo"],
+  aliases: ["doitx", "doit x", "helix gateway"],
   endpoints: [
     {
-      baseUrl: "https://api.teamorouter.com",
+      baseUrl: "https://router.doitx.ai",
       protocols: ["anthropic_messages", "openai_chat_completions", "openai_responses"]
     }
   ],
-  id: "teamorouter",
-  name: "TeamoRouter",
-  websiteUrl: "https://teamorouter.com/"
+  id: "doitx",
+  name: "DoitX",
+  websiteUrl: "https://router.doitx.ai/"
 };

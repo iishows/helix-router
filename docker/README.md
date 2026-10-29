@@ -82,14 +82,21 @@ npm run docker:run
 
 There are two independent authentication layers:
 
-1. `CCR_WEB_AUTH_TOKEN` protects management RPC. Nginx puts it into the management-page URL, and the browser sends it to RPC as `x-ccr-web-auth`.
+1. `CCR_WEB_LOGIN_PASSWORD` gates the management console. Visiting it while signed out redirects to a login page; a correct password yields an `HttpOnly` session cookie (12 hours), so no credential is ever placed in a URL. `CCR_WEB_AUTH_TOKEN` remains available for non-browser callers: send it as the `x-ccr-web-auth` header to RPC, or open the console from a `?ccr_web_token=...` URL (what `ccr ui` does).
 2. CCR client API keys created in the **API Keys** page protect model gateway requests. These are separate from upstream provider credentials.
 
-If `CCR_WEB_AUTH_TOKEN` is unset, the entrypoint generates a new random token on each container start. Opening `/` still works because Nginx redirects to a tokenized URL, but a stable token is recommended for persistent or remote deployments.
+If `CCR_WEB_LOGIN_PASSWORD` is unset, the entrypoint generates a random password on first start, persists it in `.claude-code-router/web-login-password` inside the data volume, and logs it. If `CCR_WEB_AUTH_TOKEN` is unset it is regenerated randomly on every container start, which is fine because browsers no longer depend on it.
 
-Avoid putting the token directly in shell history. Create a protected environment file instead:
+Read an auto-generated password with:
+
+```sh
+docker logs ccr | grep 'login password'
+```
+
+Avoid putting credentials directly in shell history. Create a protected environment file instead:
 
 ```dotenv
+CCR_WEB_LOGIN_PASSWORD=replace-with-a-long-random-value
 CCR_WEB_AUTH_TOKEN=replace-with-a-long-random-value
 CCR_PUBLIC_BASE_URL=http://127.0.0.1:3458
 ```
@@ -99,8 +106,8 @@ Then use it with `docker run --env-file` or map the same variables under the Com
 Security guidance:
 
 - Bind the published port to `127.0.0.1` unless LAN or remote access is intentional.
-- Never expose the management UI over untrusted networks without TLS, a firewall/private network, and a fixed strong management token.
-- Treat tokenized management URLs as secrets; URLs may be recorded in browser history, proxy logs, screenshots, and support tickets. The hardened reverse-proxy mode above removes the token from the URL entirely.
+- Never expose the management UI over untrusted networks without TLS, a firewall/private network, and a fixed strong login password.
+- Treat the management token and login password as secrets. Browsers no longer receive a token, but a `?ccr_web_token=...` URL (used by scripts) may still be recorded in browser history, proxy logs, screenshots, and support tickets.
 - Create scoped CCR client API keys before exposing gateway routes. Do not reuse upstream provider credentials as client keys.
 - Protect `/data` and its backups because they contain configuration, provider credentials, CCR client keys, request data, and generated certificates.
 
@@ -115,6 +122,7 @@ services:
       - "127.0.0.1:8088:8080"
     environment:
       CCR_PUBLIC_BASE_URL: http://127.0.0.1:8088
+      CCR_WEB_LOGIN_PASSWORD: ${CCR_WEB_LOGIN_PASSWORD:?set CCR_WEB_LOGIN_PASSWORD}
       CCR_WEB_AUTH_TOKEN: ${CCR_WEB_AUTH_TOKEN:?set CCR_WEB_AUTH_TOKEN}
 ```
 
@@ -129,6 +137,7 @@ services:
       - "127.0.0.1:3458:8080"
     environment:
       CCR_PUBLIC_BASE_URL: https://ccr.example.com
+      CCR_WEB_LOGIN_PASSWORD: ${CCR_WEB_LOGIN_PASSWORD:?set CCR_WEB_LOGIN_PASSWORD}
       CCR_WEB_AUTH_TOKEN: ${CCR_WEB_AUTH_TOKEN:?set CCR_WEB_AUTH_TOKEN}
 ```
 
@@ -199,9 +208,9 @@ Keep the container port loopback-only and open only `443` in the host firewall.
 
 ### Management Auth Modes
 
-**Default — token in URL.** Container Nginx 302-redirects `/` to `/pages/home/index.html?ccr_web_token=...`. The browser reads the token, removes it from the address bar before the app's main script runs, keeps it in `sessionStorage`, and sends it as the `x-ccr-web-auth` header on management RPC. The token appears once in the first redirect URL (and may therefore be recorded in browser history, screenshots, or support tickets).
+**Default — password login.** Container Nginx sends unauthenticated visitors from `/` to `/pages/login/index.html`. Submitting the password (`POST /api/ccr/login`) yields an `HttpOnly` session cookie (12 hours) that authorizes both the console and management RPC. No credential appears in any URL. Non-browser callers can still pass `?ccr_web_token=...` once to bootstrap, then use the `x-ccr-web-auth` header.
 
-**Hardened — token never in the URL.** The reverse proxy injects the token header and the browser never receives it. Enable it with `CCR_WEB_INJECT_HEADER=1`, which stops the container Nginx from appending `ccr_web_token` to any URL, and inject the header on the host proxy:
+**Hardened — token injected by the proxy.** The reverse proxy injects the token header and the browser never receives it. Enable it with `CCR_WEB_INJECT_HEADER=1`, which disables the in-container password login, and inject the header on the host proxy:
 
 ```nginx
 proxy_set_header x-ccr-web-auth "<CCR_WEB_AUTH_TOKEN>";
@@ -303,11 +312,12 @@ Configuration migrations run against the persistent data. To roll back, use the 
 
 ## Environment Variables
 
-Most deployments should set only `CCR_WEB_AUTH_TOKEN`, `CCR_PUBLIC_BASE_URL`, and the Docker port mapping. Internal listener values normally should remain unchanged.
+Most deployments should set only `CCR_WEB_LOGIN_PASSWORD`, `CCR_PUBLIC_BASE_URL`, and the Docker port mapping. Internal listener values normally should remain unchanged.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `CCR_WEB_AUTH_TOKEN` | Random per container start | Management UI/RPC token. Set a stable strong value for persistent or remote use. |
+| `CCR_WEB_LOGIN_PASSWORD` | Random on first start, then persisted in the data volume | Browser sign-in password for the console. Set a stable strong value for persistent or remote use. |
+| `CCR_WEB_AUTH_TOKEN` | Random per container start | Management RPC token for scripts or proxy header injection. Never handed to browsers. |
 | `CCR_PUBLIC_BASE_URL` | `http://127.0.0.1:3458` | Exact public gateway/UI base URL written into CCR configuration. Overrides `CCR_PUBLIC_HOST` and `CCR_PUBLIC_PORT`. |
 | `CCR_PUBLIC_HOST` | `127.0.0.1` | Used only to derive `CCR_PUBLIC_BASE_URL` when the full URL is unset; it does not change Docker port publishing. |
 | `CCR_PUBLIC_PORT` | `3458` | Used only to derive `CCR_PUBLIC_BASE_URL` when the full URL is unset. |
@@ -362,9 +372,9 @@ This is expected. Nginx redirects the root URL to the management page and URL-en
 
 `/health` checks the model gateway, not Nginx or the management UI. On a fresh volume it returns `502` until a provider/model exists and the gateway has started; after startup, the plugin-capable ai-gateway runtime returns `200` with status `ok`. Use `docker compose ps` for container health and open the UI to configure/start the gateway.
 
-### The UI returns `401` after a token change
+### The UI returns `401` after a credential change
 
-Open the bare root URL again so Nginx creates a URL with the current token. Close stale tabs and avoid bookmarks that contain an old `ccr_web_token`.
+Your session cookie expired (12 hours) or the password changed while the container was not recreated. Sign in again, and run `docker compose up -d` so the container picks up the new `CCR_WEB_LOGIN_PASSWORD`. Close stale tabs and avoid bookmarks that contain an old `ccr_web_token`.
 
 ### Model responses arrive in one burst after a long pause
 
@@ -418,11 +428,12 @@ ports:
 
 ### 鉴权与远程访问
 
-- `CCR_WEB_AUTH_TOKEN` 用于管理 UI / RPC；不设置时，每次容器启动都会生成新的随机 Token。
+- `CCR_WEB_LOGIN_PASSWORD` 用于管理台登录：未登录访问会被重定向到登录页，密码正确后签发 `HttpOnly` 会话 Cookie（12 小时），URL 里不出现任何凭据。不设置时首次启动生成随机密码并持久化到数据卷，可用 `docker logs ccr | grep 'login password'` 查看。
+- `CCR_WEB_AUTH_TOKEN` 用于非浏览器调用（脚本、`ccr ui` 的 `?ccr_web_token=` 引导）：可作 `x-ccr-web-auth` 请求头发给 RPC。不设置时每次容器启动都会生成新的随机 Token。
 - **API 密钥** 页面创建的 CCR 客户端 Key 用于模型网关请求。
 - 上游供应商凭据是第三类凭据，不应拿来代替 CCR 客户端 Key。
 
-根路径会重定向到包含 `ccr_web_token` 的管理 URL。请把该 URL 当作密码。远程部署至少应使用固定强 Token、TLS、主机防火墙或私网，并让反向代理把全部路径转发到 Nginx。流式响应和 SSE 不应被代理缓冲。
+请把登录密码和 Token 都当作机密。远程部署至少应使用固定强密码与 Token、TLS、主机防火墙或私网，并让反向代理把全部路径转发到 Nginx。流式响应和 SSE 不应被代理缓冲。
 
 ### 反向代理与 TLS
 
@@ -489,9 +500,9 @@ server {
 
 #### 管理端鉴权模式
 
-**默认 —— token 进 URL。** 容器 Nginx 把 `/` 302 到 `/pages/home/index.html?ccr_web_token=...`。浏览器取出 token、在应用主脚本运行前从地址栏抹掉、存入 `sessionStorage`，之后以 `x-ccr-web-auth` header 发管理 RPC。token 会在首次跳转 URL 里出现一次（因而可能被浏览器历史、截图或工单记录）。
+**默认 —— 密码登录。** 容器 Nginx 把未登录的 `/` 302 到 `/pages/login/index.html`。提交密码（`POST /api/ccr/login`）后由服务端签发 `HttpOnly` 会话 Cookie（12 小时），管理台页面与管理 RPC 都用它鉴权，URL 里不出现任何凭据。非浏览器调用仍可先带一次 `?ccr_web_token=...` 引导，随后改用 `x-ccr-web-auth` header。
 
-**加固 —— token 不进 URL。** 由反代注入 token header，浏览器根本拿不到 token。以 `CCR_WEB_INJECT_HEADER=1` 启用：容器 Nginx 不再向任何 URL 追加 `ccr_web_token`；再在宿主反代注入 header：
+**加固 —— 反代注入 token。** 由反代注入 token header，浏览器根本拿不到 token。以 `CCR_WEB_INJECT_HEADER=1` 启用：容器内不再提供密码登录，容器 Nginx 也不再向任何 URL 追加 `ccr_web_token`；再在宿主反代注入 header：
 
 ```nginx
 proxy_set_header x-ccr-web-auth "<CCR_WEB_AUTH_TOKEN>";
@@ -516,6 +527,7 @@ node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('b
 ```yaml
 environment:
   CCR_PUBLIC_BASE_URL: https://ccr.example.com
+  CCR_WEB_LOGIN_PASSWORD: ${CCR_WEB_LOGIN_PASSWORD:?set CCR_WEB_LOGIN_PASSWORD}
   CCR_WEB_AUTH_TOKEN: ${CCR_WEB_AUTH_TOKEN:?set CCR_WEB_AUTH_TOKEN}
 ```
 

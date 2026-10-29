@@ -627,7 +627,8 @@ function printStartHelp(exitCode: number): void {
     "Environment:",
     "  CCR_WEB_HOST        Default management server host.",
     "  CCR_WEB_PORT        Default management server port.",
-    "  CCR_WEB_AUTH_TOKEN  Use this token for management UI and RPC authentication."
+    "  CCR_WEB_AUTH_TOKEN  Use this token for management UI and RPC authentication.",
+    "  CCR_WEB_LOGIN_PASSWORD  Password for the browser login page. No login page when unset."
   ].join("\n");
   const stream = exitCode === 0 ? process.stdout : process.stderr;
   stream.write(`${output}\n`);
@@ -654,7 +655,8 @@ function printUiHelp(exitCode: number): void {
     "Environment:",
     "  CCR_WEB_HOST        Default management server host.",
     "  CCR_WEB_PORT        Default management server port.",
-    "  CCR_WEB_AUTH_TOKEN  Use this token for management UI and RPC authentication."
+    "  CCR_WEB_AUTH_TOKEN  Use this token for management UI and RPC authentication.",
+    "  CCR_WEB_LOGIN_PASSWORD  Password for the browser login page. No login page when unset."
   ].join("\n");
   const stream = exitCode === 0 ? process.stdout : process.stderr;
   stream.write(`${output}\n`);
@@ -694,7 +696,8 @@ function printWebHelp(exitCode: number): void {
     "Environment:",
     "  CCR_WEB_HOST        Default management server host.",
     "  CCR_WEB_PORT        Default management server port.",
-    "  CCR_WEB_AUTH_TOKEN  Use this token for management UI and RPC authentication."
+    "  CCR_WEB_AUTH_TOKEN  Use this token for management UI and RPC authentication.",
+    "  CCR_WEB_LOGIN_PASSWORD  Password for the browser login page. No login page when unset."
   ].join("\n");
   const stream = exitCode === 0 ? process.stdout : process.stderr;
   stream.write(`${output}\n`);

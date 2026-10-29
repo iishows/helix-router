@@ -12,11 +12,11 @@ CCR_PUBLIC_PORT="${CCR_PUBLIC_PORT:-3458}"
 CCR_PUBLIC_BASE_URL="${CCR_PUBLIC_BASE_URL:-http://${CCR_PUBLIC_HOST}:${CCR_PUBLIC_PORT}}"
 CCR_NO_GATEWAY="${CCR_NO_GATEWAY:-0}"
 CCR_WEB_INJECT_HEADER="${CCR_WEB_INJECT_HEADER:-0}"
+CCR_WEB_LOGIN_PASSWORD="${CCR_WEB_LOGIN_PASSWORD:-}"
 
 if [ -z "${CCR_WEB_AUTH_TOKEN:-}" ]; then
   CCR_WEB_AUTH_TOKEN="$(node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))")"
 fi
-CCR_WEB_AUTH_TOKEN_QUERY="$(node -e "process.stdout.write(encodeURIComponent(process.argv[1] || ''))" "${CCR_WEB_AUTH_TOKEN}")"
 
 # Hardened mode (CCR_WEB_INJECT_HEADER=1): the management token is never placed in
 # a URL. The outer reverse proxy must inject `x-ccr-web-auth` and authenticate the
@@ -29,15 +29,52 @@ case "$(printf '%s' "${CCR_WEB_INJECT_HEADER}" | tr '[:upper:]' '[:lower:]')" in
   *) CCR_WEB_INJECT_HEADER_ENABLED=0 ;;
 esac
 
+# Default mode: the console is gated by a password login handled by the core
+# server (session cookie). Hardened mode delegates authentication to the outer
+# reverse proxy, so no in-app password is configured there.
+CCR_WEB_LOGIN_PASSWORD_GENERATED=0
+if [ "${CCR_WEB_INJECT_HEADER_ENABLED}" = "1" ]; then
+  CCR_WEB_LOGIN_PASSWORD=""
+else
+  if [ -z "${CCR_WEB_LOGIN_PASSWORD}" ]; then
+    CCR_WEB_LOGIN_PASSWORD_FILE="${CCR_DATA_DIR}/.claude-code-router/web-login-password"
+    if [ -f "${CCR_WEB_LOGIN_PASSWORD_FILE}" ]; then
+      CCR_WEB_LOGIN_PASSWORD="$(cat "${CCR_WEB_LOGIN_PASSWORD_FILE}")"
+    fi
+    if [ -z "${CCR_WEB_LOGIN_PASSWORD}" ]; then
+      CCR_WEB_LOGIN_PASSWORD="$(node -e "process.stdout.write(require('node:crypto').randomBytes(18).toString('base64url'))")"
+      mkdir -p "$(dirname "${CCR_WEB_LOGIN_PASSWORD_FILE}")"
+      printf '%s' "${CCR_WEB_LOGIN_PASSWORD}" > "${CCR_WEB_LOGIN_PASSWORD_FILE}"
+      chmod 600 "${CCR_WEB_LOGIN_PASSWORD_FILE}"
+      CCR_WEB_LOGIN_PASSWORD_GENERATED=1
+    fi
+    if [ "${CCR_WEB_LOGIN_PASSWORD_GENERATED}" = "1" ]; then
+      printf 'CCR web console: generated login password (set CCR_WEB_LOGIN_PASSWORD to override): %s\n' "${CCR_WEB_LOGIN_PASSWORD}" >&2
+    else
+      printf 'CCR web console: reusing persisted login password from %s\n' "${CCR_WEB_LOGIN_PASSWORD_FILE}" >&2
+    fi
+  fi
+fi
+
+CCR_WEB_UPSTREAM="${CCR_WEB_HOST}:${CCR_WEB_PORT}"
+WEB_PROXY_HEADERS="    proxy_http_version 1.1;
+    proxy_set_header Host ${CCR_WEB_UPSTREAM};
+    proxy_set_header Origin http://${CCR_WEB_UPSTREAM};
+    proxy_set_header Referer http://${CCR_WEB_UPSTREAM}/;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Host \$host;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_pass http://${CCR_WEB_UPSTREAM};"
+
 if [ "${CCR_WEB_INJECT_HEADER_ENABLED}" = "1" ]; then
   NGINX_ROOT_LOCATION_BODY='    try_files /pages/home/index.html =404;'
   NGINX_HOME_LOCATION_BODY='    try_files /pages/home/index.html =404;'
 else
-  NGINX_ROOT_LOCATION_BODY="    return 302 /pages/home/index.html?ccr_web_token=${CCR_WEB_AUTH_TOKEN_QUERY};"
-  NGINX_HOME_LOCATION_BODY="    if (\$arg_ccr_web_token = \"\") {
-      return 302 /pages/home/index.html?ccr_web_token=${CCR_WEB_AUTH_TOKEN_QUERY};
-    }
-    try_files /pages/home/index.html =404;"
+  # The HTML shell is proxied to the core server so it can decide between the
+  # login page and the console (session cookie). No credential is ever put in a
+  # URL; the token query-param handoff is gone.
+  NGINX_ROOT_LOCATION_BODY="${WEB_PROXY_HEADERS}"
+  NGINX_HOME_LOCATION_BODY="${WEB_PROXY_HEADERS}"
 fi
 
 export HOME="${CCR_DATA_DIR}"
@@ -50,10 +87,10 @@ export CCR_PUBLIC_BASE_URL
 export CCR_PUBLIC_HOST
 export CCR_PUBLIC_PORT
 export CCR_WEB_AUTH_TOKEN
-export CCR_WEB_AUTH_TOKEN_QUERY
 export CCR_WEB_HOST
 export CCR_WEB_PORT
 export CCR_WEB_INJECT_HEADER
+export CCR_WEB_LOGIN_PASSWORD
 
 CONFIG_DIR="${HOME}/.claude-code-router"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
@@ -174,14 +211,23 @@ ${NGINX_HOME_LOCATION_BODY}
   }
 
   location = /api/ccr/rpc {
-    proxy_http_version 1.1;
-    proxy_set_header Host ${CCR_WEB_HOST}:${CCR_WEB_PORT};
-    proxy_set_header Origin http://${CCR_WEB_HOST}:${CCR_WEB_PORT};
-    proxy_set_header Referer http://${CCR_WEB_HOST}:${CCR_WEB_PORT}/;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Host \$host;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-    proxy_pass http://${CCR_WEB_HOST}:${CCR_WEB_PORT};
+${WEB_PROXY_HEADERS}
+  }
+
+  location = /api/ccr/login {
+${WEB_PROXY_HEADERS}
+  }
+
+  location = /api/ccr/logout {
+${WEB_PROXY_HEADERS}
+  }
+
+  location = /api/ccr/auth-status {
+${WEB_PROXY_HEADERS}
+  }
+
+  location = /pages/login/index.html {
+${WEB_PROXY_HEADERS}
   }
 
   location = /health {
@@ -208,6 +254,9 @@ ${NGINX_HOME_LOCATION_BODY}
   }
 
   location / {
+    # /assets/* and unmatched paths are served statically; the internal
+    # redirect to /pages/home/index.html re-enters the exact-match location
+    # above, which enforces the login cookie in default mode.
     try_files \$uri \$uri/ /pages/home/index.html;
   }
 }

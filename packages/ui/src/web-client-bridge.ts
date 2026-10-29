@@ -13,12 +13,20 @@ type RpcResponse =
 async function rpc(method: string, args: unknown[] = []): Promise<unknown> {
   const response = await fetch(rpcEndpoint, {
     body: JSON.stringify({ args: trimTrailingUndefined(args), method }),
+    // The management server authenticates browser sessions with a cookie, so
+    // same-origin requests must carry credentials. Cross-origin callers keep
+    // using the explicit token header below.
+    credentials: "same-origin",
     headers: {
       "content-type": "application/json",
       ...(webAuthToken ? { [webAuthHeader]: webAuthToken } : {})
     },
     method: "POST"
   });
+  if (response.status === 401 && isLoginRequiredRedirect()) {
+    redirectToLoginPage();
+    throw new Error("Sign-in required.");
+  }
   let payload: RpcResponse | undefined;
   try {
     payload = await response.json() as RpcResponse;
@@ -34,6 +42,16 @@ async function rpc(method: string, args: unknown[] = []): Promise<unknown> {
     throw new Error(message);
   }
   return payload.value;
+}
+
+function isLoginRequiredRedirect(): boolean {
+  // Only bounce to the login page when we are already on the management origin;
+  // otherwise leave error handling to the caller.
+  return window.location.pathname !== "/pages/login/index.html";
+}
+
+function redirectToLoginPage(): void {
+  window.location.replace("/pages/login/index.html");
 }
 
 function trimTrailingUndefined(args: unknown[]): unknown[] {
@@ -131,6 +149,7 @@ const webClientBridge: CcrApi = {
   getProviderCatalogModels: (request) => rpc("getProviderCatalogModels", [request]) as ReturnType<CcrApi["getProviderCatalogModels"]>,
   getOpenRouterProviderCatalog: (request) => rpc("getOpenRouterProviderCatalog", [request]) as ReturnType<CcrApi["getOpenRouterProviderCatalog"]>,
   getProviderPresets: () => rpc("getProviderPresets") as ReturnType<CcrApi["getProviderPresets"]>,
+  getProviderEndpointLock: () => rpc("getProviderEndpointLock") as ReturnType<CcrApi["getProviderEndpointLock"]>,
   getProxyCertificateStatus: () => rpc("getProxyCertificateStatus") as ReturnType<CcrApi["getProxyCertificateStatus"]>,
   getProxyNetworkCaptures: () => rpc("getProxyNetworkCaptures") as ReturnType<CcrApi["getProxyNetworkCaptures"]>,
   getProxyStatus: () => rpc("getProxyStatus") as ReturnType<CcrApi["getProxyStatus"]>,

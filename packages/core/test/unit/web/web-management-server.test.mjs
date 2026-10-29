@@ -37,6 +37,7 @@ test("normalizeExternalHttpTarget accepts absolute http, https, and CCR plugin U
 
 test("web RPC ignores Origin and Referer when the auth token is valid", async () => {
   const { startWebManagementServer } = await import("@ccr/core/web/management-server.ts");
+  const { APP_NAME } = await import("@ccr/core/runtime/app-paths.ts");
   const authToken = "test-web-auth-token";
   const runtime = await startWebManagementServer({
     authToken,
@@ -60,7 +61,7 @@ test("web RPC ignores Origin and Referer when the auth token is valid", async ()
 
     assert.equal(response.status, 200);
     assert.equal(payload.ok, true);
-    assert.equal(payload.value.name, "Claude Code Router");
+    assert.equal(payload.value.name, APP_NAME);
   } finally {
     await runtime.close();
   }
