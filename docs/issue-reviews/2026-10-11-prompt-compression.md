@@ -252,7 +252,7 @@ tool_result 占 65%，是 Helix V3.2 Q&A pair 压缩的主要目标。
 
 ```sh
 # 进入仓库根
-cd D:/projects/claude-code-router
+cd D:/projects/helix-router
 
 # 1. 顶层结构
 node -e \"
@@ -323,7 +323,7 @@ tools length : 117496
 复现命令：
 
 ```sh
-cd D:/projects/claude-code-router
+cd D:/projects/helix-router
 node build/test.mjs core ui --grep "compress/"
 node build/run-tests.mjs core --grep "compress/"
 node build/run-tests.mjs core --grep "helix/"
