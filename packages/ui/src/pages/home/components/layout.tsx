@@ -225,20 +225,19 @@ export function MainLayout({
             </nav>
 
             <div className="grid shrink-0 gap-1 border-t border-border/60 p-2 max-[720px]:border-t max-[720px]:pt-2">
-              <Button
-                className="flex h-9 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left text-[13px] font-medium text-muted-foreground transition-all duration-150 hover:bg-muted/80 hover:text-foreground"
-                onClick={onOpenSettings}
-                title={copy.settings.title}
-                type="button"
-                unstyled
-              >
-                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md">
+              <div className="flex items-center justify-between px-2 pb-1">
+                <button
+                  aria-label={copy.settings.title}
+                  className="flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground transition-all duration-150 hover:bg-muted/80 hover:text-foreground"
+                  onClick={onOpenSettings}
+                  title={copy.settings.title}
+                  type="button"
+                >
                   <Settings className="h-3.5 w-3.5" />
+                </button>
+                <span className="text-[11px] leading-none text-muted-foreground/60">
+                  v{version}
                 </span>
-                <span className="min-w-0 flex-1 truncate">{copy.settings.button}</span>
-              </Button>
-              <div className="px-2 pb-1 text-center text-[11px] leading-none text-muted-foreground/60">
-                v{version}
               </div>
             </div>
 
