@@ -2678,8 +2678,10 @@ function ProviderUsageSettings({
   const usageApiKey = providerConnectivityApiKeyFromDraft(draft);
   const isJsonUsageMode = draft.accountMode === "http-json" || draft.accountMode === "browser";
   const showNewApiUserBalanceTemplate = probe?.detectedProvider === "new-api" ||
+    probe?.detectedProvider === "one-hub" ||
     draft.accountConnectorsText.includes("new-api-key-usage") ||
-    draft.accountConnectorsText.includes("new-api-user-self");
+    draft.accountConnectorsText.includes("new-api-user-self") ||
+    draft.accountConnectorsText.includes("one-api-billing");
 
   useEffect(() => {
     setTestResult(undefined);

@@ -1,7 +1,7 @@
 import type { ProviderAccountConfig, ProviderAccountHttpJsonConnectorConfig } from "@ccr/core/contracts/app";
 import { compactProviderUrl, providerUrlWithDefaultScheme } from "@ccr/core/providers/url";
 
-export type DetectedProviderKind = "new-api";
+export type DetectedProviderKind = "new-api" | "one-hub";
 
 const newApiHeaderNames = ["x-new-api-version", "x-oneapi-request-id"];
 

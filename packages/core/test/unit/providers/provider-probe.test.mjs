@@ -6,9 +6,11 @@ import test from "node:test";
 import {
   newApiKeyUsageFallbackMessageForTest,
   newApiKeyUsageMetersForTest,
-  newApiUserSelfMetersForTest
+  newApiUserSelfMetersForTest,
+  oneApiBillingMetersForTest
 } from "@ccr/core/providers/account-service.ts";
 import { detectedProviderFromHeaders, newApiKeyUsageAccountConfig, newApiUserSelfConnectorConfig } from "@ccr/core/providers/new-api.ts";
+import { oneApiBillingAccountConfig, oneApiBillingDateWindow, oneApiBillingMeters, oneApiBillingSubscriptionEndpoint, oneApiBillingUsageEndpoint } from "@ccr/core/providers/one-api.ts";
 import {
   checkGatewayProviderConnectivity,
   isProviderProtocolEndpointSupportedForProbe,
@@ -275,15 +277,16 @@ test("candidate protocol probe carries the entered API key and Authorization fal
     protocols: ["openai_chat_completions", "anthropic_messages", "gemini_generate_content"]
   });
 
+  const protocolCalls = calls.filter((call) => call.pathname !== "/v1/dashboard/billing/subscription");
   assert.deepEqual(
-    calls.map((call) => call.protocol),
+    protocolCalls.map((call) => call.protocol),
     ["openai", "anthropic", "gemini"]
   );
-  assert.equal(calls[0]?.authorization, "Bearer sk-probe-key");
-  assert.equal(calls[1]?.authorization, "Bearer sk-probe-key");
-  assert.equal(calls[1]?.xApiKey, "sk-probe-key");
-  assert.equal(calls[2]?.authorization, "Bearer sk-probe-key");
-  assert.equal(calls[2]?.xGoogApiKey, "sk-probe-key");
+  assert.equal(protocolCalls[0]?.authorization, "Bearer sk-probe-key");
+  assert.equal(protocolCalls[1]?.authorization, "Bearer sk-probe-key");
+  assert.equal(protocolCalls[1]?.xApiKey, "sk-probe-key");
+  assert.equal(protocolCalls[2]?.authorization, "Bearer sk-probe-key");
+  assert.equal(protocolCalls[2]?.xGoogApiKey, "sk-probe-key");
 });
 
 test("model discovery carries Authorization fallback for protocol-specific API keys", async (t) => {
@@ -849,6 +852,66 @@ test("New API response headers enable key quota account connector", () => {
   assert.equal(userBalanceConnector.endpoint, "https://gateway.example/api/user/self");
   assert.equal(userBalanceConnector.parser, "new-api-user-self");
   assert.equal(userBalanceConnector.headers?.["New-Api-User"], "<user-id>");
+});
+
+test("One-API billing endpoints and account config", () => {
+  const subscriptionUrl = oneApiBillingSubscriptionEndpoint("https://hub.example/v1");
+  assert.equal(subscriptionUrl, "https://hub.example/v1/dashboard/billing/subscription");
+
+  const window = oneApiBillingDateWindow(new Date("2026-10-29T00:00:00Z"));
+  const usageUrl = oneApiBillingUsageEndpoint("https://hub.example/v1", window.start, window.end);
+  assert.match(usageUrl, /^https:\/\/hub\.example\/v1\/dashboard\/billing\/usage\?/);
+  assert.match(usageUrl, /start_date=2026-09-29/);
+  assert.match(usageUrl, /end_date=2026-10-30/);
+
+  const account = oneApiBillingAccountConfig("https://hub.example/v1");
+  const connector = account.connectors?.[0];
+  assert.equal(account.enabled, true);
+  assert.equal(connector?.type, "http-json");
+  assert.equal(connector?.endpoint, "https://hub.example/v1/dashboard/billing/subscription");
+  assert.equal(connector?.parser, "one-api-billing");
+  assert.equal(connector?.auth, "provider-api-key");
+});
+
+test("One-API billing parser converts quota units and computes remaining", () => {
+  const subscription = { hard_limit_usd: 50, system_hard_limit_usd: 100 };
+  const usage = { total_usage: 125000 };
+
+  assert.deepEqual(oneApiBillingMetersForTest(subscription, usage), [{
+    id: "one_api_billing_balance",
+    kind: "balance",
+    label: "Balance",
+    limit: 50,
+    remaining: 37.5,
+    source: "http-json",
+    unit: "USD",
+    used: 12.5,
+    window: "monthly"
+  }]);
+});
+
+test("One-API billing parser accepts nested data payloads and USD-native usage", () => {
+  const meters = oneApiBillingMetersForTest(
+    { data: { hard_limit_usd: 20 } },
+    { data: { total_usage: 50_000 } }
+  );
+  assert.equal(meters.length, 1);
+  assert.equal(meters[0]?.limit, 20);
+  assert.equal(meters[0]?.used, 5);
+  assert.equal(meters[0]?.remaining, 15);
+});
+
+test("One-API billing parser omits usage when usage payload is missing", () => {
+  const meters = oneApiBillingMetersForTest({ hard_limit_usd: 50 }, undefined);
+  assert.equal(meters.length, 1);
+  assert.equal(meters[0]?.limit, 50);
+  assert.equal(meters[0]?.used, undefined);
+  assert.equal(meters[0]?.remaining, undefined);
+});
+
+test("One-API billing parser returns no meters without a hard limit", () => {
+  assert.deepEqual(oneApiBillingMetersForTest({ object: "billing_subscription" }, { total_usage: 1 }), []);
+  assert.deepEqual(oneApiBillingMetersForTest(undefined, { total_usage: 1 }), []);
 });
 
 test("New API key usage parser ignores keys without a dedicated quota", () => {

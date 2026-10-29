@@ -31,6 +31,7 @@ import {
   newApiKeyUsageAccountConfig,
   type DetectedProviderKind
 } from "@ccr/core/providers/new-api";
+import { oneApiBillingAccountConfig, oneApiBillingSubscriptionEndpoint } from "@ccr/core/providers/one-api";
 import { recordGatewayRequestLog } from "@ccr/core/observability/request-log-store";
 import { requestLogSampled } from "@ccr/core/observability/raw-trace-sync";
 
@@ -368,13 +369,23 @@ async function resolveGatewayProviderProbe(request: GatewayProviderProbeRequest)
   const models = (mode === "connectivity" || mode === "models") && resolvedModelProbe.models.length > 0
     ? resolvedModelProbe.models
     : typedModels;
-  const protocolResults = await probeProtocols(parsed, request.apiKey, models, protocols, mode, request.providerPlugins ?? []);
+  const [protocolResults, billingProbe] = await Promise.all([
+    probeProtocols(parsed, request.apiKey, models, protocols, mode, request.providerPlugins ?? []),
+    mode === "protocols"
+      ? probeOneApiBilling(parsed, request.apiKey).catch(() => false)
+      : Promise.resolve(false)
+  ]);
   const detectedProtocol = detectProtocol(parsed, protocolResults, resolvedModelProbe.source, protocols);
   const normalizedBaseUrl = detectedProtocol
     ? resolveProbeBaseUrl(parsed, detectedProtocol, protocolResults, resolvedModelProbe)
     : parsed.normalizedInputBaseUrl;
-  const detectedProvider = detectProvider(protocolResults);
-  const account = detectedProvider === "new-api" ? newApiKeyUsageAccountConfig(normalizedBaseUrl) : undefined;
+  const headerDetectedProvider = detectProvider(protocolResults);
+  const detectedProvider = billingProbe ? "one-hub" : headerDetectedProvider;
+  const account = billingProbe
+    ? oneApiBillingAccountConfig(normalizedBaseUrl)
+    : headerDetectedProvider === "new-api"
+      ? newApiKeyUsageAccountConfig(normalizedBaseUrl)
+      : undefined;
   const catalog = getProviderCatalogModels({ baseUrl: normalizedBaseUrl });
 
   return {
@@ -1753,6 +1764,39 @@ function pruneCodexProbeOauthCache(): void {
   for (const [key] of oldestEntries) {
     codexProbeOauthCache.delete(key);
   }
+}
+
+const knownFirstPartyBillingHosts = [
+  "generativelanguage.googleapis.com",
+  "api.anthropic.com",
+  "api.openai.com",
+  "api.mistral.ai",
+  "openrouter.ai"
+];
+
+async function probeOneApiBilling(parsed: ParsedProviderUrl, apiKey: string | undefined): Promise<boolean> {
+  if (!apiKey) {
+    return false;
+  }
+  // Skip first-party model APIs — billing routes are a one-api relay convention.
+  if (knownFirstPartyBillingHosts.some((host) => parsed.normalizedInputBaseUrl.toLowerCase().includes(host))) {
+    return false;
+  }
+  const result = await requestJson(oneApiBillingSubscriptionEndpoint(parsed.normalizedInputBaseUrl), {
+    headers: {
+      accept: "application/json",
+      authorization: `Bearer ${apiKey}`
+    },
+    method: "GET"
+  });
+  if (result.status !== 200 || !isRecord(result.payload)) {
+    return false;
+  }
+  const data = isRecord(result.payload.data) ? result.payload.data : result.payload;
+  return (
+    typeof data.hard_limit_usd === "number" ||
+    typeof data.system_hard_limit_usd === "number"
+  );
 }
 
 async function requestJson(url: string, init: RequestInit): Promise<FetchJsonResult> {

@@ -23,6 +23,11 @@ import { findProviderPresetByBaseUrl, providerEndpointCanReceiveProviderApiKey }
 import { fetchWithSystemProxy } from "@ccr/core/proxy/system-proxy-fetch";
 import { normalizeProviderBaseUrl, providerUrlWithDefaultScheme } from "@ccr/core/providers/url";
 import { fetchProviderAccountWebContentJson } from "@ccr/core/providers/account-webcontent";
+import {
+  oneApiBillingDateWindow,
+  oneApiBillingMeters,
+  oneApiBillingUsageEndpoint
+} from "@ccr/core/providers/one-api";
 import { isGatewayProviderEnabled } from "@ccr/core/contracts/app";
 import type {
   AppConfig,
@@ -179,6 +184,16 @@ export async function testProviderAccountConnector(request: ProviderAccountTestR
     name: request.providerName?.trim() || "Provider"
   };
   const connector = normalizeProviderAccountTestConnector(request.connector);
+  if (connector.type === "http-json" && connector.parser === "one-api-billing") {
+    const resolved = await resolveOneApiBillingConnector(provider, connector);
+    return {
+      meters: resolved.meters,
+      message: resolved.message,
+      paths: [],
+      payload: undefined,
+      status: statusFromMeters(resolved.meters, [], 1)
+    };
+  }
   const payload = connector.type === "webcontent-json"
     ? await fetchWebContentJson(provider, connector)
     : await fetchJson(connector.endpoint, provider, connector.auth, connector.headers, connector.method, connector.body);
@@ -223,6 +238,16 @@ export async function testProviderAccountConnector(request: ProviderAccountTestR
       status: statusFromMeters(meters, [], 1)
     };
   }
+  if (connector.type === "http-json" && connector.parser === "one-api-billing") {
+    const resolved = await resolveOneApiBillingConnector(provider, connector, source);
+    return {
+      meters: resolved.meters,
+      message: resolved.message,
+      paths: flattenJsonPaths(resolved.meters),
+      payload,
+      status: statusFromMeters(resolved.meters, [], 1)
+    };
+  }
 
   const meters = mappedMetersFromPayload(connector, payload, source);
 
@@ -263,6 +288,10 @@ export function newApiKeyUsageFallbackMessageForTest(payload: unknown): string {
 
 export function newApiUserSelfMetersForTest(payload: unknown): ProviderAccountMeter[] {
   return newApiUserSelfMeters(payload);
+}
+
+export function oneApiBillingMetersForTest(subscription: unknown, usage: unknown): ProviderAccountMeter[] {
+  return oneApiBillingMeters(subscription, usage);
 }
 
 export async function localCodexAccountCredentialForTest(plugin: Record<string, unknown>): Promise<LocalAgentAccountCredential> {
@@ -739,6 +768,9 @@ async function resolveHttpJsonConnector(
       source: "http-json"
     };
   }
+  if (connector.parser === "one-api-billing") {
+    return await resolveOneApiBillingConnector(provider, connector);
+  }
 
   const meters = mappedMetersFromPayload(connector, payload);
   return {
@@ -747,6 +779,37 @@ async function resolveHttpJsonConnector(
     message: readMappedString(connector.mapping.message, payload),
     source: "http-json",
     status: normalizeStatus(readMappedString(connector.mapping.status, payload))
+  };
+}
+
+async function resolveOneApiBillingConnector(
+  provider: GatewayProviderConfig,
+  connector: ProviderAccountHttpJsonConnectorConfig,
+  source: ProviderAccountConnectorSource = "http-json"
+): Promise<ConnectorResult> {
+  const subscription = await fetchJson(connector.endpoint, provider, connector.auth, connector.headers, connector.method);
+  const window = oneApiBillingDateWindow();
+  let usage: unknown;
+  let usageError: string | undefined;
+  try {
+    usage = await fetchJson(oneApiBillingUsageEndpoint(providerBaseUrl(provider), window.start, window.end), provider, connector.auth, connector.headers, connector.method);
+  } catch (error) {
+    usageError = formatError(error);
+  }
+  const meters = oneApiBillingMeters(subscription, usage, source);
+  if (meters.length === 0) {
+    return {
+      errors: [],
+      message: "No one-api billing data available.",
+      meters: [],
+      source
+    };
+  }
+  return {
+    errors: [],
+    message: usageError ? `Usage endpoint unavailable: ${usageError}` : undefined,
+    meters,
+    source
   };
 }
 
