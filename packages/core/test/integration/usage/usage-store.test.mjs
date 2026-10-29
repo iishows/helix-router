@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { preloadUsagePriceCatalog } from "@ccr/core/models/pricing-service.ts";
 import { RequestLogStore } from "@ccr/core/observability/request-log-store.ts";
 import { providerRuntimeId } from "@ccr/core/routing/model-registry.ts";
 import { createBetterSqliteDatabase } from "@ccr/core/storage/sqlite-native.ts";
@@ -910,6 +911,170 @@ test("UsageStore reset clears overview stats and does not backfill old request l
     assert.equal(afterNewRequest.totals.totalTokens, 10);
     assert.equal(afterNewRequest.providerModels[0]?.provider, "beta");
   } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("UsageStore backfills missing usage costs without overwriting priced rows", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-usage-cost-backfill-test-"));
+  try {
+    const dbFile = path.join(dir, "usage.sqlite");
+    let priceKnown = false;
+    const store = new UsageStore(dbFile, {
+      estimateCost: async (input) => priceKnown
+        ? { amountUsd: 0.5, model: input.model, source: "litellm" }
+        : undefined
+    });
+    const createdAt = new Date().toISOString();
+
+    await store.record({
+      createdAt,
+      durationMs: 10,
+      method: "POST",
+      model: "doitx-model",
+      path: "/v1/messages",
+      provider: "provider-4",
+      requestId: "backfill-null-cost",
+      statusCode: 200,
+      usage: { cacheReadTokens: 400, inputTokens: 10, outputTokens: 20 }
+    });
+    await store.record({
+      costSource: "gateway_billing",
+      costUsd: 0.25,
+      createdAt,
+      durationMs: 10,
+      method: "POST",
+      model: "billed-model",
+      path: "/v1/messages",
+      provider: "provider-4",
+      requestId: "backfill-existing-cost",
+      statusCode: 200,
+      usage: { inputTokens: 10, outputTokens: 20 }
+    });
+
+    priceKnown = true;
+    const page = await store.backfillMissingUsageCostsPage();
+    assert.deepEqual(page, { scanned: 1, updated: 1 });
+
+    const stats = await store.getStats("today", { includeProxy: true });
+    assert.equal(Number(stats.totals.costUsd.toFixed(4)), 0.75);
+    assert.equal(stats.recentRequests.find((row) => row.requestId === "backfill-null-cost")?.costSource, "litellm");
+
+    const database = createBetterSqliteDatabase(dbFile);
+    try {
+      const rows = database
+        .prepare("SELECT request_id, cost_usd, cost_source FROM usage_events ORDER BY id")
+        .all();
+      assert.equal(rows.find((row) => row.request_id === "backfill-null-cost")?.cost_usd, 0.5);
+      assert.equal(rows.find((row) => row.request_id === "backfill-existing-cost")?.cost_usd, 0.25);
+      assert.equal(rows.find((row) => row.request_id === "backfill-existing-cost")?.cost_source, "gateway_billing");
+    } finally {
+      database.close();
+    }
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("UsageStore cost backfill pages through rows and leaves unpriceable events NULL", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-usage-cost-backfill-page-test-"));
+  try {
+    const dbFile = path.join(dir, "usage.sqlite");
+    let priceKnown = false;
+    const store = new UsageStore(dbFile, {
+      estimateCost: async (input) => {
+        if (!priceKnown || input.model === "unpriceable-model") return undefined;
+        return { amountUsd: 0.1, model: input.model, source: "models.dev" };
+      }
+    });
+    for (const model of ["model-a", "unpriceable-model", "model-b", "model-c"]) {
+      await store.record({
+        createdAt: new Date().toISOString(),
+        durationMs: 5,
+        method: "POST",
+        model,
+        path: "/v1/messages",
+        provider: "provider-4",
+        requestId: `page-${model}`,
+        statusCode: 200,
+        usage: { inputTokens: 1, outputTokens: 1 }
+      });
+    }
+
+    priceKnown = true;
+    const firstPage = await store.backfillMissingUsageCostsPage({ limit: 2 });
+    assert.equal(firstPage.scanned, 2);
+    assert.equal(firstPage.updated, 2);
+    assert.equal(typeof firstPage.nextBeforeId, "number");
+
+    const secondPage = await store.backfillMissingUsageCostsPage({ limit: 2, beforeId: firstPage.nextBeforeId });
+    assert.equal(secondPage.scanned, 2);
+    assert.equal(secondPage.nextBeforeId, undefined);
+
+    const database = createBetterSqliteDatabase(dbFile);
+    try {
+      const rows = database
+        .prepare("SELECT model, cost_usd FROM usage_events ORDER BY id")
+        .all();
+      assert.equal(rows.find((row) => row.model === "unpriceable-model")?.cost_usd, null);
+      assert.deepEqual(
+        rows.filter((row) => row.model !== "unpriceable-model").map((row) => row.cost_usd),
+        [0.1, 0.1, 0.1]
+      );
+    } finally {
+      database.close();
+    }
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("UsageStore backfills missing costs on a stats read once the price catalog is loaded", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-usage-cost-backfill-read-test-"));
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    "read-trigger-model": {
+      input_cost_per_token: 0.000001,
+      litellm_provider: "provider-4",
+      output_cost_per_token: 0.000002
+    }
+  }), {
+    headers: { "content-type": "application/json" },
+    status: 200
+  });
+  try {
+    await preloadUsagePriceCatalog({ forceRefresh: true });
+    let priceKnown = false;
+    let estimateCalls = 0;
+    const store = new UsageStore(path.join(dir, "usage.sqlite"), {
+      estimateCost: async (input) => {
+        estimateCalls += 1;
+        return priceKnown ? { amountUsd: 0.5, model: input.model, source: "litellm" } : undefined;
+      }
+    });
+
+    await store.record({
+      createdAt: new Date().toISOString(),
+      durationMs: 5,
+      method: "POST",
+      model: "read-trigger-model",
+      path: "/v1/messages",
+      provider: "provider-4",
+      requestId: "read-trigger-null-cost",
+      statusCode: 200,
+      usage: { inputTokens: 1, outputTokens: 1 }
+    });
+    priceKnown = true;
+
+    const stats = await store.getStats("today", { includeProxy: true });
+    assert.equal(stats.totals.costUsd, 0.5);
+    assert.equal(estimateCalls, 2);
+
+    // Retries are throttled so unpriceable leftovers do not scan on every read.
+    await store.getStats("today", { includeProxy: true });
+    assert.equal(estimateCalls, 2);
+  } finally {
+    globalThis.fetch = previousFetch;
     rmSync(dir, { force: true, recursive: true });
   }
 });

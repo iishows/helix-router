@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { decodeClaudeAppGatewayRouteId } from "@ccr/core/agents/claude-app/gateway-routes";
 import { REQUEST_LOGS_DB_FILE, USAGE_DB_FILE } from "@ccr/core/config/constants";
-import { estimateUsageCostUsd, providerModelPricingForUsage } from "@ccr/core/models/pricing-service";
+import {
+  estimateUsageCostUsd,
+  providerModelPricingForUsage,
+  usagePriceCatalogNeedsRefresh
+} from "@ccr/core/models/pricing-service";
 import { createBetterSqliteDatabase, type BetterSqliteDatabase } from "@ccr/core/storage/sqlite-native";
 import { normalizeUsageInputTokens } from "@ccr/core/usage/normalization";
 import { isKnownProviderSelector, resolveUsageModelAttribution } from "@ccr/core/usage/model-attribution";
@@ -85,6 +89,12 @@ type UsageWhereClause = {
   where: string;
 };
 
+export type UsageCostBackfillPage = {
+  nextBeforeId?: number;
+  scanned: number;
+  updated: number;
+};
+
 type StoredUsageEvent = {
   cacheReadTokens: number;
   cacheWriteTokens: number;
@@ -114,6 +124,8 @@ type UsageSnapshot = UsageNumbers & {
 const usageEvents = new EventEmitter();
 const usageStatsRanges = new Set<UsageStatsRange>(["today", "24h", "7d", "30d"]);
 const usageStatsResetAtKey = "usage_stats_reset_at";
+const usageCostBackfillAtKey = "usage_cost_backfill_at";
+const usageCostBackfillIntervalMs = 10 * 60 * 1000;
 const emptyTotals: UsageTotals = {
   avgDurationMs: 0,
   cacheRatio: 0,
@@ -128,6 +140,7 @@ const emptyTotals: UsageTotals = {
 };
 
 export class UsageStore {
+  private costBackfillPromise?: Promise<number>;
   private database?: SqlDatabase;
   private readonly estimateCost: typeof estimateUsageCostUsd;
   private initPromise?: Promise<SqlDatabase>;
@@ -294,6 +307,7 @@ export class UsageStore {
     const normalizedRange = normalizeUsageRange(range);
     const since = getRangeSince(normalizedRange, now);
     this.backfillFromRequestLogs(database, since);
+    await this.backfillMissingUsageCostsBeforeRead(database);
     const query = buildUsageWhereClause(since, filter);
 
     return {
@@ -311,6 +325,7 @@ export class UsageStore {
   async getTotalsSince(since: Date, filter: UsageStatsFilter | null | undefined = {}, options: UsageStatsQueryOptions | null | undefined = {}): Promise<UsageTotals> {
     const database = await this.getDatabase();
     this.backfillFromRequestLogs(database, since);
+    await this.backfillMissingUsageCostsBeforeRead(database);
     return readUsageTotals(database, buildUsageWhereClause(since, filter, options));
   }
 
@@ -331,6 +346,127 @@ export class UsageStore {
 
     usageEvents.emit("recorded");
     return { deletedEvents, resetAt };
+  }
+
+  /**
+   * Prices usage rows that were recorded while the price catalog was not
+   * loaded (cost_usd NULL). Mirrors the request-log backfill worker; events
+   * that still have no known price are left NULL and retried later.
+   */
+  async backfillMissingUsageCostsPage(options: {
+    beforeId?: number;
+    limit?: number;
+  } = {}): Promise<UsageCostBackfillPage> {
+    const database = await this.getDatabase();
+    const limit = Math.max(1, Math.floor(options.limit ?? 1_000));
+    const beforeId = options.beforeId === undefined
+      ? undefined
+      : Math.max(1, Math.floor(options.beforeId));
+    const rows = queryRows(
+      database,
+      `
+        SELECT
+          id,
+          cache_read_tokens,
+          cache_write_tokens,
+          input_tokens,
+          model,
+          output_tokens,
+          provider
+        FROM usage_events
+        WHERE cost_usd IS NULL
+          AND (cache_read_tokens + cache_write_tokens + input_tokens + output_tokens) > 0
+          ${beforeId === undefined ? "" : "AND id < ?"}
+        ORDER BY id DESC
+        LIMIT ?
+      `,
+      beforeId === undefined ? [limit] : [beforeId, limit]
+    );
+    const estimates: Array<{ amountUsd: number; id: number; source: string }> = [];
+    for (const row of rows) {
+      const cost = await this.estimateCost({
+        cacheReadTokens: normalizeCount(row.cache_read_tokens),
+        cacheWriteTokens: normalizeCount(row.cache_write_tokens),
+        inputTokens: normalizeCount(row.input_tokens),
+        model: String(row.model ?? ""),
+        outputTokens: normalizeCount(row.output_tokens),
+        provider: String(row.provider ?? "")
+      });
+      if (!cost || !(cost.amountUsd > 0)) {
+        continue;
+      }
+      estimates.push({
+        amountUsd: cost.amountUsd,
+        id: normalizeCount(row.id),
+        source: normalizeLabel(cost.source, "")
+      });
+    }
+
+    let updated = 0;
+    if (estimates.length > 0) {
+      const statement = database.prepare(
+        "UPDATE usage_events SET cost_usd = ?, cost_source = ? WHERE id = ? AND cost_usd IS NULL"
+      );
+      database.transaction(() => {
+        for (const estimate of estimates) {
+          updated += Number(statement.run(estimate.amountUsd, estimate.source, estimate.id).changes);
+        }
+      })();
+    }
+    if (updated > 0) {
+      usageEvents.emit("recorded");
+    }
+
+    const lastId = rows.length === limit ? normalizeCount(rows[rows.length - 1]?.id) : 0;
+    return {
+      ...(lastId > 0 ? { nextBeforeId: lastId } : {}),
+      scanned: rows.length,
+      updated
+    };
+  }
+
+  /** Runs every pending backfill page; concurrent callers share one run. */
+  async backfillMissingUsageCosts(options: {
+    limit?: number;
+    maxPages?: number;
+  } = {}): Promise<number> {
+    this.costBackfillPromise ??= this.runCostBackfill(options).finally(() => {
+      this.costBackfillPromise = undefined;
+    });
+    return this.costBackfillPromise;
+  }
+
+  private async runCostBackfill(options: { limit?: number; maxPages?: number }): Promise<number> {
+    const maxPages = Math.max(1, Math.floor(options.maxPages ?? Number.POSITIVE_INFINITY));
+    let beforeId: number | undefined;
+    let updated = 0;
+    for (let page = 0; page < maxPages; page += 1) {
+      const result = await this.backfillMissingUsageCostsPage({ beforeId, limit: options.limit });
+      updated += result.updated;
+      beforeId = result.nextBeforeId;
+      if (beforeId === undefined) {
+        break;
+      }
+    }
+    return updated;
+  }
+
+  private async backfillMissingUsageCostsBeforeRead(database: SqlDatabase): Promise<void> {
+    // Only price with an already loaded catalog: a stats read must never
+    // trigger the remote price fetch itself.
+    if (usagePriceCatalogNeedsRefresh()) {
+      return;
+    }
+    if (this.costBackfillPromise || !usageCostBackfillDue(database)) {
+      return;
+    }
+    try {
+      await this.backfillMissingUsageCosts({ limit: 500, maxPages: 4 });
+    } catch (error) {
+      console.warn(`[usage] Failed to backfill usage costs: ${formatError(error)}`);
+    } finally {
+      writeUsageCostBackfillAt(database);
+    }
   }
 
   private async getDatabase(): Promise<SqlDatabase> {
@@ -521,6 +657,7 @@ function ensureUsageSchema(database: SqlDatabase): void {
   database.exec("CREATE INDEX IF NOT EXISTS usage_events_provider_created_at_idx ON usage_events(provider, created_at)");
   database.exec("CREATE INDEX IF NOT EXISTS usage_events_model_created_at_idx ON usage_events(model, created_at)");
   database.exec("CREATE INDEX IF NOT EXISTS usage_events_credential_created_at_idx ON usage_events(credential_id, created_at)");
+  database.exec("CREATE INDEX IF NOT EXISTS usage_events_missing_cost_idx ON usage_events(id) WHERE cost_usd IS NULL");
 }
 
 export async function getUsageStats(range?: UsageStatsRange | null, filter?: UsageStatsFilter | null): Promise<UsageStatsSnapshot> {
@@ -674,6 +811,20 @@ function usageBackfillSinceAfterReset(database: SqlDatabase, since: Date): Date 
     return since;
   }
   return new Date(resetAt.getTime() + 1);
+}
+
+function usageCostBackfillDue(database: SqlDatabase): boolean {
+  const row = queryRows(database, "SELECT value FROM usage_metadata WHERE key = ? LIMIT 1", [usageCostBackfillAtKey])[0];
+  const lastAttemptAt = typeof row?.value === "string" ? Number(row.value) : Number.NaN;
+  return !Number.isFinite(lastAttemptAt) || Date.now() - lastAttemptAt >= usageCostBackfillIntervalMs;
+}
+
+function writeUsageCostBackfillAt(database: SqlDatabase): void {
+  database.prepare(`
+    INSERT INTO usage_metadata (key, value)
+    VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(usageCostBackfillAtKey, String(Date.now()));
 }
 
 function readUsageStatsResetAt(database: SqlDatabase): Date | undefined {
