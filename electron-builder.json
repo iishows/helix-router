@@ -11,8 +11,8 @@
   "publish": [
     {
       "provider": "github",
-      "owner": "musistudio",
-      "repo": "claude-code-router",
+      "owner": "iishows",
+      "repo": "helix-router",
       "releaseType": "release"
     }
   ],
