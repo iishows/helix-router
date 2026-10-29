@@ -32,6 +32,10 @@ import {
 import { HELIX_RECALL_DIR } from "@ccr/core/config/constants";
 import type { AppConfig, VirtualModelProfileConfig } from "@ccr/core/contracts/app";
 import { HELIX_RECALL_MODEL_PREFIX } from "@ccr/core/contracts/app";
+import { providerRuntimeId } from "@ccr/core/routing/model-registry";
+
+/** Claude Code 的 1M 上下文标记后缀(与 `gateway/internal/shared` 保持一致)。 */
+const CLAUDE_CODE_ONE_MILLION_CONTEXT_SUFFIX = "[1m]";
 
 /**
  * helix 本地召回(recall)是否启用。
@@ -70,15 +74,18 @@ function modelMatchesGlob(model: string, pattern: string): boolean {
  * 解析"召回改写"应写入前缀的**真实模型名**。
  *
  * 背景:召回触发时会把请求 model 改写成 `${HELIX_RECALL_MODEL_PREFIX}<model>`,
- * 网关据此命中召回 virtual model profile 并剥掉前缀,但**不会**再解析内层的
- * 虚拟模型 —— 若 `<model>` 是 `Fusion/Doitx` 这类虚拟别名,剥前缀后落到普通
- * provider 白名单校验,即报
- *   `Model "Fusion/Doitx" is not configured for target provider ...` → HTTP 400。
- * 真实模型(`autodl-3/DeepSeek-V4.1-Flash`)剥前缀后仍合法,故此前只在使用
- * **虚拟模型**、且请求大到触发压缩时才暴露。
+ * 网关据此命中召回 virtual model profile 并剥掉前缀,但**不会**再解析内层 ——
+ * 既不解析虚拟模型别名,也不解析 `provider/model` 限定前缀,而是直接拿内层
+ * 去做目标 provider 的白名单校验。因此内层必须是网关能解析的模型选择器:
+ *   - `Fusion/Doitx` 这类虚拟别名 → 解析成 fixedModel;
+ *   - `Doitx/DeepSeek-V4.1-Flash` 这类 provider 限定名 → 换成网关认识的
+ *     `<providerRuntimeId>/DeepSeek-V4.1-Flash`(不能保留 `Doitx/`,网关只认 runtime id)。
+ * 否则大请求压缩后即报
+ *   `Model "<内层>" is not configured for target provider ...` → HTTP 400。
+ * 小请求不压缩、不写前缀,所以只在大请求上暴露。
  *
  * 返回:
- *   - 非虚拟模型 → 原样返回;
+ *   - 非虚拟模型 → 原样返回(provider 前缀见下);
  *   - 虚拟模型且 `baseModel` 可静态解析(mode=fixed)→ 返回 `fixedModel`;
  *   - 虚拟模型但无法静态解析(缺 baseModel / mode=request 等)→ undefined,
  *     调用方据此**整体跳过压缩与改写**(宁可不召回,也不能 400)。
@@ -88,13 +95,63 @@ function resolveRecallRoutableModel(
   appConfig: AppConfig | undefined
 ): string | undefined {
   const profiles = appConfig?.virtualModelProfiles;
-  if (!Array.isArray(profiles) || profiles.length === 0) return model;
+  if (!Array.isArray(profiles) || profiles.length === 0) {
+    return stripProviderQualifier(model, appConfig);
+  }
 
   const profile = profiles.find((candidate) => virtualProfileMatchesModel(candidate, model));
-  if (!profile) return model;
+  if (!profile) return stripProviderQualifier(model, appConfig);
 
   const fixed = typeof profile.baseModel?.fixedModel === "string" ? profile.baseModel.fixedModel.trim() : "";
-  return fixed.length > 0 ? fixed : undefined;
+  return fixed.length > 0 ? stripProviderQualifier(fixed, appConfig) : undefined;
+}
+
+/**
+ * 把 `provider/model` 形式的模型名改写为网关可解析的 `<runtimeId>/model`。
+ *
+ * 召回改写写入 `ccr-helix-recall/<model>` 后,网关只剥掉召回前缀,**不会**再解析
+ * 内层的 provider 限定前缀,而是直接拿它做目标 provider 的白名单校验。所以若
+ * 内层仍是 `Doitx/DeepSeek-V4.1-Flash`(客户端常用这种写法),大请求一旦压缩产生
+ * 占位符就会 400:
+ *   Model "Doitx/DeepSeek-V4.1-Flash" is not configured for target provider ...
+ * (小请求不压缩 → 不写前缀 → 不受影响,表现为"只有大请求报错")
+ *
+ * 仅在可安全判定时改写:前缀命中某个已配置 provider 的 name/id,且该 provider
+ * 未限定 models 或裸模型就在其 models 白名单内。否则原样返回,保持旧行为。
+ *
+ * 改写结果用 **provider 的 runtime id**(`providerRuntimeId(pre)`,即配置里的 `id`,
+ * 缺省时按 name/baseUrl 生成)而非裸模型名:网关的 provider 选择别名正是 runtime id
+ * (见 `toCoreGatewayProviders` / 网关 `providerConfigSelectorAliases`)。若只写裸模型,
+ * 多个 provider 暴露同名模型时会落到默认 provider(网关 `resolveTargetProviders`
+ * 无 provider 引用时回退),导致"压缩后请求被路由到别的 provider";带 runtime id
+ * 则显式指定目标,与客户端的 `Doitx/...` 意图一致。
+ */
+function stripProviderQualifier(model: string, appConfig: AppConfig | undefined): string {
+  const slash = model.indexOf("/");
+  if (slash <= 0 || slash >= model.length - 1) return model;
+  const hint = model.slice(0, slash).trim().toLowerCase();
+  const bare = model.slice(slash + 1).trim();
+  if (!hint || !bare) return model;
+
+  const providers = appConfig?.Providers ?? [];
+  const provider = providers.find((candidate) =>
+    [candidate?.id, candidate?.name].some(
+      (alias) => typeof alias === "string" && alias.trim().length > 0 && alias.trim().toLowerCase() === hint
+    )
+  );
+  if (!provider) return model;
+
+  const models = Array.isArray(provider.models) ? provider.models : [];
+  const bareWithoutSuffix = bare.toLowerCase().endsWith(CLAUDE_CODE_ONE_MILLION_CONTEXT_SUFFIX)
+    ? bare.slice(0, -CLAUDE_CODE_ONE_MILLION_CONTEXT_SUFFIX.length).trim()
+    : bare;
+  const bareAllowed = models.length === 0
+    || models.some((entry) =>
+      typeof entry === "string" && (entry.trim() === bare || entry.trim() === bareWithoutSuffix)
+    );
+  if (!bareAllowed) return model;
+  const runtimeId = providerRuntimeId(provider).trim();
+  return runtimeId ? `${runtimeId}/${bare}` : bare;
 }
 
 /** 虚拟模型 profile 是否匹配该模型名(exactAliases / prefixes / suffixes)。 */

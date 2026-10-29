@@ -208,6 +208,53 @@ test("provider 前缀模型在白名单命末段 → 有占位符", async () => 
   assert.equal(bodyHasPlaceholder(result.body), true);
 });
 
+// 回归(2026-10-29):客户端发 `Doitx/DeepSeek-V4.1-Flash` 这类 provider 限定模型时,
+// 召回前缀内层若保留 `Doitx/` 前缀,网关只剥召回前缀、不再解析 provider 前缀 →
+// 大请求压缩后 400 `Model "Doitx/..." is not configured for target provider`。
+// 内层固定写网关认识的 runtime id(`provider-4/...`):裸模型名在多 provider 同名时
+// 会回退到默认 provider,带 runtime id 才能保持客户端显式选择。
+test("provider 限定模型 → 召回首层写 runtime id 限定名", async () => {
+  const appConfig = {
+    Providers: [
+      { id: "provider-4", name: "Doitx", models: ["DeepSeek-V4.1-Flash", "GLM-5.3-flash"] }
+    ]
+  };
+  const result = await runTransform(
+    "Doitx/DeepSeek-V4.1-Flash",
+    { recallModelPatterns: ["DeepSeek-*"], keepRecentPairs: 0 },
+    appConfig
+  );
+  assert.ok(result);
+  assert.equal(result.routedModel, `${HELIX_RECALL_MODEL_PREFIX}provider-4/DeepSeek-V4.1-Flash`);
+  assert.equal(bodyHasPlaceholder(result.body), true);
+});
+
+test("多 provider 同名模型 → 改写保留命中 provider 的 runtime id(不被默认 provider 抢走)", async () => {
+  const appConfig = {
+    Providers: [
+      { id: "provider-1", name: "First", models: ["DeepSeek-V4.1-Flash"] },
+      { id: "provider-2", name: "Second", models: ["DeepSeek-V4.1-Flash"] }
+    ]
+  };
+  const result = await runTransform(
+    "Second/DeepSeek-V4.1-Flash",
+    { recallModelPatterns: [], keepRecentPairs: 0 },
+    appConfig
+  );
+  assert.ok(result);
+  assert.equal(result.routedModel, `${HELIX_RECALL_MODEL_PREFIX}provider-2/DeepSeek-V4.1-Flash`);
+});
+
+test("provider 前缀未命中已配置 provider → 原样保留", async () => {
+  const appConfig = {
+    Providers: [{ id: "provider-4", name: "Doitx", models: ["DeepSeek-V4.1-Flash"] }]
+  };
+  const model = "VendorX/Some-Model";
+  const result = await runTransform(model, { recallModelPatterns: ["Some-*"], keepRecentPairs: 0 }, appConfig);
+  assert.ok(result);
+  assert.equal(result.routedModel, `${HELIX_RECALL_MODEL_PREFIX}${model}`);
+});
+
 // ============== 虚拟模型 (virtualModelProfiles) 别名解析 ==============
 // 回归:模型是虚拟别名(如 `Fusion/Doitx`)时,召回前缀必须写**真实 base model**,
 // 否则网关剥前缀后拿别名去校验 provider 白名单 → 400
