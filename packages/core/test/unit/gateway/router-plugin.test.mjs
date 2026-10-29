@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createDefaultAppConfig } from "@ccr/core/config/default-config.ts";
+import { configureCacheDir } from "@ccr/core/observability/helix-recall-local-store.ts";
 import {
   ccrAnthropicReasoningResponseHookKey,
   ccrCodexApplyPatchBridgeHeader,
+  ccrHelixSkipCompressionHeader,
   ccrCodexBridgeRequestTransformKey,
   ccrCodexBridgeResponseHookKey,
   ccrCodexBridgeStreamHookKey,
@@ -111,6 +116,38 @@ test("helix-compressor request transform is registered at beforeRouting stage (b
   );
   assert.ok(transform, "helix-compressor request transform must be registered");
   assert.equal(transform.stage, "beforeRouting");
+});
+
+// Pipeline recall-budget fallback 依赖这个 header：网关必须跳过压缩(从而不改写 model、
+// 不命中 recall profile)。控制组证明同一 body 默认会被压缩。
+test("helix skip-compression header bypasses compression and model rewrite", async () => {
+  configureCacheDir(mkdtempSync(join(tmpdir(), "helix-skip-")));
+  const config = createDefaultAppConfig();
+  config.Providers = [{ models: ["alpha"], name: "Primary", type: "openai_chat_completions" }];
+  config.plugins = [{ config: { keepRecentPairs: 0 }, enabled: true, id: "helix-compressor" }];
+  const plugin = await createGatewayPlugin({ plugin: { config: { appConfig: config } } });
+  const transform = plugin.requestTransforms.find(
+    (item) => item.key === helixCompressorRequestTransformKey
+  );
+  const longHistory = [
+    { role: "user", content: "A".repeat(600) },
+    { role: "assistant", content: "B".repeat(600) },
+    { role: "user", content: "final question" }
+  ];
+  const input = (headers) => ({
+    request: { headers, method: "POST", url: "/v1/messages" },
+    requestBody: { messages: longHistory, model: "Primary/alpha" },
+    route: { method: "POST", url: "/v1/messages" }
+  });
+
+  const control = await transform.transform(input({}));
+  assert.ok(control, "control run must compress");
+
+  const skipped = await transform.transform(input({ [ccrHelixSkipCompressionHeader]: "1" }));
+  assert.equal(skipped, undefined, "skip header must bypass compression entirely");
+
+  const skippedCased = await transform.transform(input({ [ccrHelixSkipCompressionHeader.toUpperCase()]: "1" }));
+  assert.equal(skippedCased, undefined, "header lookup must be case-insensitive");
 });
 
 test("CCR router core plugin publishes live token rate snapshots from the single runtime", async () => {

@@ -324,3 +324,49 @@ export function shouldBufferAggregateErrorBody(responseHeaders: Headers): boolea
   const contentLength = Number(responseHeaders.get("content-length"));
   return Number.isFinite(contentLength) && contentLength > 0 && contentLength <= maxAggregateErrorDetailBodyBytes;
 }
+
+export type HelixToolLoopLimitKind = "maxToolCalls" | "maxTurns";
+
+/**
+ * Whether a buffered upstream error is the core gateway's synthetic 400 for the
+ * internal helix recall tool loop exhausting its budget. Detecting it lets the
+ * request pipeline retry once with compression disabled instead of surfacing
+ * `All target providers failed.` to the client.
+ */
+export function detectHelixToolLoopLimit(text: string): HelixToolLoopLimitKind | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return undefined;
+  }
+  const error = (parsed as { error?: unknown }).error;
+  if (typeof error !== "object" || error === null || Array.isArray(error)) {
+    return undefined;
+  }
+  const attempts = (error as { attempts?: unknown }).attempts;
+  if (!Array.isArray(attempts)) {
+    return undefined;
+  }
+  for (const attempt of attempts) {
+    if (typeof attempt !== "object" || attempt === null || Array.isArray(attempt)) {
+      continue;
+    }
+    if ((attempt as AggregateErrorAttempt).stage !== "tool_loop_limit") {
+      continue;
+    }
+    const haystack = JSON.stringify(attempt).toLowerCase();
+    if (haystack.includes("maxturns")) {
+      return "maxTurns";
+    }
+    if (haystack.includes("maxtoolcalls")) {
+      return "maxToolCalls";
+    }
+    // The stage is decisive; the turns budget is what actually binds in practice.
+    return "maxTurns";
+  }
+  return undefined;
+}

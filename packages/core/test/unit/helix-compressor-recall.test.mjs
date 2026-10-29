@@ -119,7 +119,7 @@ test("injectRecallInstruction: inserts new system message if none", () => {
 
 test("injectRecallInstruction: no duplicate if already injected", () => {
   const messages = [
-    { role: "system", content: "<<HC_RECALL_INSTRUCTION_v1>>\n## 工具调用: hc_recall" },
+    { role: "system", content: "<<HC_RECALL_INSTRUCTION_v2>>\n## 工具调用: hc_recall" },
     { role: "user", content: "Hi" }
   ];
   const result = injectRecallInstruction(messages);

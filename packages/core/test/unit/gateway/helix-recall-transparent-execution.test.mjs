@@ -25,6 +25,10 @@ import {
   HELIX_RECALL_PROFILE_KEY,
   HELIX_RECALL_TOOL_NAMES
 } from "@ccr/core/contracts/app.ts";
+import {
+  helixRecallProfileMaxToolCalls,
+  helixRecallProfileMaxTurns
+} from "@ccr/core/gateway/core-runtime/router-plugin-contract.ts";
 
 function configWithHelixPlugin(pluginConfig) {
   const config = createDefaultAppConfig();
@@ -76,8 +80,13 @@ test("启用 helix 插件 → 追加 helix virtualModelProfile,model 前缀命�
   assert.equal(profile.execution.mode, "tool_loop");
   assert.equal(profile.execution.clientToolsPolicy, "allow", "客户端工具必须放行,否则 Claude Code 自带工具被拒");
   assert.equal(profile.execution.streamMode, "buffered", "流式需 buffered 才能跑 internal tool loop");
-  assert.ok(profile.execution.maxTurns > 0 && profile.execution.maxTurns < Number.MAX_SAFE_INTEGER);
-  assert.ok(profile.execution.maxToolCalls > 0 && profile.execution.maxToolCalls < Number.MAX_SAFE_INTEGER);
+  assert.equal(profile.execution.maxTurns, helixRecallProfileMaxTurns);
+  assert.equal(profile.execution.maxToolCalls, helixRecallProfileMaxToolCalls);
+  // 回归守卫：旧预算 4 轮会让 2–4 块/轮的批量召回在第 5 轮前撞顶 400。
+  assert.ok(profile.execution.maxTurns > 4, "maxTurns 必须高于旧值 4");
+  assert.ok(profile.execution.maxToolCalls > 8, "maxToolCalls 必须高于旧值 8");
+  assert.ok(profile.execution.maxTurns < Number.MAX_SAFE_INTEGER);
+  assert.ok(profile.execution.maxToolCalls < Number.MAX_SAFE_INTEGER);
 });
 
 test("启用 helix 插件 → helix profile 不进 gateway 模型列表(materialization 关闭)", async () => {

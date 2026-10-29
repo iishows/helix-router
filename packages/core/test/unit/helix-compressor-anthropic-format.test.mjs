@@ -137,7 +137,7 @@ test("含占位符 → 注入教学 prompt(system message 含 marker)", async ()
 
   assert.ok(result);
   const systemText = JSON.stringify(result.body.messages);
-  assert.ok(systemText.includes("HISTORY_RECALL_INSTRUCTION_v1"), "应含 history recall 教学 marker");
+  assert.ok(systemText.includes("HISTORY_RECALL_INSTRUCTION_v2"), "应含 history recall 教学 marker");
 });
 
 // ===== countChars 回归(2026-10-19):tool_result/tool_use/多 text 块不得漏计 =====

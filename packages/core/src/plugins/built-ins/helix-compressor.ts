@@ -21,7 +21,7 @@ import type {
   GatewayPluginResponseHookHandler,
   GatewayPluginResponseHookResult
 } from "@ccr/core/plugins/service";
-import { helixCompressorRecallToolName, helixCompressorMaxRecallPerRequest, helixCompressorLoopTimeoutMs } from "@ccr/core/gateway/core-runtime/router-plugin-contract";
+import { helixCompressorRecallToolName, helixCompressorMaxRecallPerRequest, helixCompressorLoopTimeoutMs, helixRecallProfileMaxToolCalls, helixRecallProfileMaxTurns } from "@ccr/core/gateway/core-runtime/router-plugin-contract";
 import { compressV3x, type LocalCompressMessage } from "@ccr/core/plugins/built-ins/helix-compressor/hc-local";
 import {
   putBatch as putRecallCacheBatch,
@@ -758,7 +758,7 @@ export const HC_RECALL_TOOL_SCHEMA_ANTHROPIC = {
   }
 } as const;
 
-const HC_RECALL_INSTRUCTION_MARKER = "<<HC_RECALL_INSTRUCTION_v1>>";
+const HC_RECALL_INSTRUCTION_MARKER = "<<HC_RECALL_INSTRUCTION_v2>>";
 
 const HC_RECALL_INSTRUCTION = `${HC_RECALL_INSTRUCTION_MARKER}
 ## ⚠️ Compressed content: recall only when the answer is NOT visible
@@ -788,16 +788,18 @@ visible** — otherwise answer directly and do NOT recall.
 ### How to call
 - The placeholder looks like \`⟦HC:abcdef0123456789⟧\`.
 - \`hash_id\` = the 16 hex chars only (drop the \`⟦HC:\` prefix and the \`⟧\` suffix): \`abcdef0123456789\`.
-- One call retrieves one placeholder; issue additional calls only if the task needs more than one.
+- Put **every hash the current task needs into ONE call**: \`${helixCompressorRecallToolName}(calls=[{hash_id, reason}, ...])\`.
+  Batching matters: the recall loop is budgeted per turn, and one call can carry all needed hashes.
 
 ### Hard limits
 - ❌ Never treat \`⟦HC:hash⟧\` as the content. It is a pointer, never an answer.
 - ❌ Never recall every placeholder — recall only what the current task actually needs.
-- ❌ Never call the same \`hash_id\` twice (per-request limit: ${helixCompressorMaxRecallPerRequest}).
+- ❌ Never call the same \`hash_id\` twice.
+- ⏱ The request allows at most ${helixRecallProfileMaxTurns} recall turns / ${helixRecallProfileMaxToolCalls} tool calls — batch all hashes instead of spreading recalls across turns.
 
 ### Example
 Only if the exact file content is needed: \`⟦HC:abcdef0123456789⟧\`
-→ Call: \`${helixCompressorRecallToolName}(hash_id="abcdef0123456789", reason="need the original file content")\`
+→ Call: \`${helixCompressorRecallToolName}(calls=[{hash_id: "abcdef0123456789", reason: "need the original file content"}])\`
 `;
 
 // hash_id 格式校验：8-128 位 hex
@@ -1009,7 +1011,7 @@ export const HISTORY_RECALL_TOOL_SCHEMA_ANTHROPIC = {
   }
 } as const;
 
-const HISTORY_RECALL_INSTRUCTION_MARKER = "<<HISTORY_RECALL_INSTRUCTION_v1>>";
+const HISTORY_RECALL_INSTRUCTION_MARKER = "<<HISTORY_RECALL_INSTRUCTION_v2>>";
 /** 清单最多列多少条占位符主题(超出部分仍可召回,只是不进清单)。 */
 const HISTORY_RECALL_TOPIC_LIMIT = 40;
 
@@ -1050,6 +1052,8 @@ placeholder and cannot be answered from what is already visible.**
 
 ### How to call
 - Placeholder: \`⟦QA:abc123def4567890⟧\`; \`hash_id\` = the 16 hex chars only: \`abc123def4567890\`.
+- Put **every hash the current task needs into ONE call**: \`${HISTORY_RECALL_TOOL_NAME}(calls=[{hash_id, reason}, ...])\`.
+  Batching matters: the recall loop is budgeted per turn, and one call can carry all needed hashes.
 - Default \`with_media=false\` returns the Q+A text only — the answer already contains the assistant's
   textual description of any image/video/document, which is enough in most cases.
 - Set \`with_media=true\` **only** when the earlier question contained an **image** and you need
@@ -1057,13 +1061,14 @@ placeholder and cannot be answered from what is already visible.**
 
 ### Hard limits
 - ❌ Never treat \`⟦QA:hash⟧\` as complete information — it is a pointer label, not the content.
-- ❌ Never recall **every** placeholder — there is a per-request budget; recall only what you need.
+- ❌ Never recall **every** placeholder — recall only what the current task actually needs.
 - ❌ Never call the same \`hash_id\` twice.
+- ⏱ The request allows at most ${helixRecallProfileMaxTurns} recall turns / ${helixRecallProfileMaxToolCalls} tool calls — batch all hashes instead of spreading recalls across turns.
 
 ### Examples
 \`\`\`
-${HISTORY_RECALL_TOOL_NAME}(hash_id="abc123def4567890", reason="need the detail from that earlier image")
-${HISTORY_RECALL_TOOL_NAME}(hash_id="abc123def4567890", with_media=true, reason="compare the old and new PDF")
+${HISTORY_RECALL_TOOL_NAME}(calls=[{hash_id: "abc123def4567890", reason: "need the detail from that earlier image"}])
+${HISTORY_RECALL_TOOL_NAME}(calls=[{hash_id: "abc123def4567890", with_media: true, reason: "compare the old and new PDF"}])
 \`\`\`
 `;
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   appendAggregateErrorAttemptSummary,
+  detectHelixToolLoopLimit,
   maxAggregateErrorDetailBodyBytes,
   shouldBufferAggregateErrorBody
 } from "@ccr/core/gateway/http/error-detail.ts";
@@ -357,5 +358,42 @@ test("shouldBufferAggregateErrorBody requires bounded JSON bodies", () => {
   assert.equal(
     shouldBufferAggregateErrorBody(headers([["content-type", "application/json"], ["content-length", String(maxAggregateErrorDetailBodyBytes + 1)]])),
     false
+  );
+});
+
+test("detectHelixToolLoopLimit identifies the recall budget 400", () => {
+  const payload = (message) => JSON.stringify({
+    error: {
+      attempts: [{ message, stage: "tool_loop_limit", status: 400 }],
+      message: "All target providers failed."
+    }
+  });
+  assert.equal(
+    detectHelixToolLoopLimit(payload("Virtual model tool loop exceeded maxTurns (4)")),
+    "maxTurns"
+  );
+  assert.equal(
+    detectHelixToolLoopLimit(payload("Virtual model tool loop exceeded maxToolCalls (8)")),
+    "maxToolCalls"
+  );
+  // Stage alone is decisive; missing detail defaults to the turns budget.
+  assert.equal(detectHelixToolLoopLimit(payload("tool loop limit")), "maxTurns");
+});
+
+test("detectHelixToolLoopLimit ignores unrelated payloads", () => {
+  assert.equal(detectHelixToolLoopLimit("not json"), undefined);
+  assert.equal(detectHelixToolLoopLimit(JSON.stringify({ error: { message: "All target providers failed." } })), undefined);
+  assert.equal(
+    detectHelixToolLoopLimit(JSON.stringify({
+      error: { attempts: [{ message: "upstream 500", stage: "upstream", status: 500 }], message: "All target providers failed." }
+    })),
+    undefined
+  );
+  // Other attempt stages must not trigger the fallback even next to a loop limit.
+  assert.equal(
+    detectHelixToolLoopLimit(JSON.stringify({
+      error: { attempts: [{ message: "rate limited", stage: "upstream", status: 429 }], message: "All target providers failed." }
+    })),
+    undefined
   );
 });

@@ -37,7 +37,7 @@ import { codexMultiAgentBridgeResponseStream, prepareCodexMultiAgentBridgeReques
 import { rewriteAnthropicMessageStartModelStream, shouldRewriteAnthropicMessageStartModel } from "@ccr/core/gateway/features/anthropic-response-model";
 import { prepareCursorOpenAICompatChatBody } from "@ccr/core/gateway/features/cursor-compat";
 import { filteredResponseHeaders, formatError, formatUpstreamErrorForLog, forwardHeaders, inferGatewayClient, readRequestBody, sendJson, shouldCaptureGatewayUsage, shouldSendBody, stripLocalGatewayAuthHeaders } from "@ccr/core/gateway/http/io";
-import { appendAggregateErrorAttemptSummary, shouldBufferAggregateErrorBody } from "@ccr/core/gateway/http/error-detail";
+import { appendAggregateErrorAttemptSummary, detectHelixToolLoopLimit, shouldBufferAggregateErrorBody } from "@ccr/core/gateway/http/error-detail";
 import { parseJsonObjectSafe, serializeJsonBody, takeJsonObject } from "@ccr/core/gateway/http/body";
 import { createGatewayModelsResponse, prepareClaudeAppDiscoveredModelRequest, prepareClaudeCodeDiscoveredModelRequest, shouldServeGatewayModelsResponse } from "@ccr/core/gateway/features/model-discovery";
 import { providerProtocolForClientProtocol, resolveProviderLogName, resolveResponseProviderProtocol, sanitizeHeaderValue } from "@ccr/core/providers/runtime-topology";
@@ -54,7 +54,14 @@ import { modelRegistryForConfig } from "@ccr/core/routing/model-registry";
 import { createClaudeCodeWebSearchContinuationContext, createHostedWebSearchProtocolContext, hostedWebSearchProtocolResponseStream, hostedWebSearchUnavailableMessage, prepareClaudeCodeWebSearchContinuationRequestBody, prepareHostedWebSearchProtocolRequestBody, selectClaudeCodeWebSearchContinuationRecords, selectHostedWebSearchProtocolRecords } from "@ccr/core/gateway/features/hosted-web-search/index";
 import { isModelAllowedForProfile, profileForApiKey } from "@ccr/core/profiles/model-allowlist";
 import { pluginService } from "@ccr/core/plugins/service";
-import { helixCompressorMaxLoopPerRequest } from "@ccr/core/gateway/core-runtime/router-plugin-contract";
+import {
+  ccrHelixFallbackHeader,
+  ccrHelixSkipCompressionHeader,
+  helixCompressorMaxLoopPerRequest,
+  helixFallbackRetryMaxBodyBytes,
+  helixFallbackRetryMaxElapsedMs
+} from "@ccr/core/gateway/core-runtime/router-plugin-contract";
+import { helixLocalRecallEnabled } from "@ccr/core/plugins/built-ins/helix-compressor";
 import { finalizeOpenRouterDiscountProviderRouterSelection } from "@ccr/core/plugins/built-ins/openrouter-discount-provider-router";
 import {
   ccrRouteHeaderNames,
@@ -931,6 +938,7 @@ export class GatewayRequestPipeline {
       upstreamRequestUrl.search = new URL(requestUrl).search;
       const upstreamUrl = upstreamRequestUrl.toString();
       let upstreamResult: UpstreamFetchResult;
+      let helixFallbackUsed = false;
 
       try {
         upstreamResult = await fetchUpstreamWithFallback({
@@ -969,6 +977,96 @@ export class GatewayRequestPipeline {
           upstreamResult = loopResult.upstreamResult;
           bodyToForward = loopResult.body;
           recallTokens = loopResult.recallTokens;
+        }
+
+        // ============= helix recall budget fallback =============
+        // The built-in "Helix Recall" virtual model profile runs an internal
+        // tool loop with a hard budget. When the model needs more turns than
+        // the budget allows, the gateway answers with a synthetic
+        // `All target providers failed.` 400 (attempt stage `tool_loop_limit`).
+        // Retry once with compression disabled: the pipeline body is still the
+        // original, uncompressed request, so the client gets a correct answer
+        // at the cost of the compression savings for this single request.
+        if (
+          bodyToForward &&
+          !upstreamResult.response.ok &&
+          !upstreamAbortController.signal.aborted &&
+          !helixFallbackUsed &&
+          helixLocalRecallEnabled(this.config) &&
+          !contextArchiveRecord &&
+          !codexCompactCompatResponseMode &&
+          !codexApplyPatchBridgeActive &&
+          !codexMultiAgentBridgeActive &&
+          !hostedWebSearchProtocolContext &&
+          bodyToForward.length <= helixFallbackRetryMaxBodyBytes &&
+          Date.now() - startedAt <= helixFallbackRetryMaxElapsedMs &&
+          shouldBufferAggregateErrorBody(new Headers(upstreamResponseHeaders(upstreamResult)))
+        ) {
+          const bufferedError = await upstreamResult.response.clone().text();
+          const loopLimit = detectHelixToolLoopLimit(bufferedError);
+          if (loopLimit) {
+            await cancelResponseBody(upstreamResult.response);
+            const fallbackStartedAt = Date.now();
+            try {
+              const retryResult = await fetchUpstreamWithFallback({
+                body: bodyToForward,
+                config: this.config,
+                fallback: { mode: "off", models: [], retryCount: 1 },
+                headers: { ...headers, [ccrHelixSkipCompressionHeader]: "1" },
+                method,
+                path: upstreamPath,
+                preparationChanges: upstreamPreparationChanges,
+                routedModel,
+                coreAuthToken: this.coreAuthToken,
+                signal: upstreamAbortController.signal,
+                trace: routeTrace,
+                upstreamUrl
+              });
+              retryResult.failedAttempts.unshift({
+                error: `tool_loop_limit:${loopLimit}`,
+                model: routedModel,
+                statusCode: upstreamResult.response.status
+              });
+              upstreamResult = retryResult;
+              helixFallbackUsed = true;
+              pluginResponseHeaders.set(ccrHelixFallbackHeader, `tool_loop_limit:${loopLimit}`);
+              routeTrace?.capture({
+                changes: [{
+                  after: `tool_loop_limit:${loopLimit}`,
+                  operation: "add",
+                  path: `/headers/${ccrHelixFallbackHeader}`,
+                  scope: "headers"
+                }],
+                durationMs: Date.now() - fallbackStartedAt,
+                kind: "mutation",
+                name: "compatibility.helix-recall-fallback",
+                phase: "compatibility",
+                startedAtMs: fallbackStartedAt
+              });
+              console.warn(
+                `[helix-compressor] recall ${loopLimit} budget exhausted for ${requestId}; retried without compression`
+              );
+            } catch (retryError) {
+              // Restore the original aggregate error so the existing error
+              // handling below reports the same 400 instead of a 502. The
+              // buffered text is already decoded, so drop body framing headers.
+              const restoredHeaders = new Headers(upstreamResult.response.headers);
+              restoredHeaders.delete("content-encoding");
+              restoredHeaders.delete("content-length");
+              restoredHeaders.delete("transfer-encoding");
+              upstreamResult = {
+                ...upstreamResult,
+                response: new Response(bufferedError, {
+                  headers: restoredHeaders,
+                  status: upstreamResult.response.status,
+                  statusText: upstreamResult.response.statusText
+                })
+              };
+              console.warn(
+                `[helix-compressor] recall fallback retry failed for ${requestId}: ${(retryError as Error).message}`
+              );
+            }
+          }
         }
       } catch (error) {
         finalizeOpenRouterDiscountSelection(false);
@@ -1030,7 +1128,7 @@ export class GatewayRequestPipeline {
         bodyToForward = upstreamResult.attempt.body ?? bodyToForward;
         routedModel = upstreamResult.attempt.model ?? routedModel;
       }
-      openRouterDiscountUsedCcrFallback = upstreamResult.failedAttempts.length > 0;
+      openRouterDiscountUsedCcrFallback = upstreamResult.failedAttempts.length > 0 || helixFallbackUsed;
       const responseHeaders = rewriteCapabilityResponseHeaders(
         // Copy into a mutable Headers instance: upstream fetch Response.headers
         // can be immutable (TypeError: immutable on .delete/.set), and

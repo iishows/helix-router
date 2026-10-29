@@ -23,6 +23,19 @@ export const helixCompressorRecallToolName = "hc_recall";
 export const helixCompressorMaxLoopPerRequest = 3;
 export const helixCompressorMaxRecallPerRequest = 3;
 export const helixCompressorLoopTimeoutMs = 60000;
+// Budget of the built-in "Helix Recall" virtual model profile. These bypass the
+// config normalizer on purpose (config profiles would be raised to
+// MAX_SAFE_INTEGER); they bound the internal tool loop for compressed requests.
+export const helixRecallProfileMaxTurns = 12;
+export const helixRecallProfileMaxToolCalls = 32;
+// Internal-only header: tells the core gateway plugin to skip helix compression
+// (and therefore the recall model rewrite) for this request.
+export const ccrHelixSkipCompressionHeader = "x-ccr-helix-skip-compression";
+// Response header set when the pipeline retried a request without compression
+// after the recall tool loop exhausted its budget.
+export const ccrHelixFallbackHeader = "x-ccr-helix-fallback";
+export const helixFallbackRetryMaxBodyBytes = 32 * 1024 * 1024;
+export const helixFallbackRetryMaxElapsedMs = 300_000;
 
 export type CcrLiveTokenRateConfigMessage = {
   enabled: boolean;

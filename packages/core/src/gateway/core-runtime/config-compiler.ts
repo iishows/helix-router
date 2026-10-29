@@ -20,7 +20,7 @@ import type { BrowserWebSearchMcpIntegration, CoreGatewayProvider } from "@ccr/c
 import { uniqueStrings } from "@ccr/core/gateway/internal/collections";
 import { isLocalClaudeCodeOauthProviderPlugin, mergeAnthropicBetaValues } from "@ccr/core/providers/oauth-plugin";
 import { isLocalAgentOauthProviderPlugin } from "@ccr/core/gateway/core-runtime/local-agent-auth-provider-hook";
-import { ccrRouterPluginKey } from "@ccr/core/gateway/core-runtime/router-plugin-contract";
+import { ccrRouterPluginKey, helixRecallProfileMaxToolCalls, helixRecallProfileMaxTurns } from "@ccr/core/gateway/core-runtime/router-plugin-contract";
 import { isOpenCodePublicFreeTierPlugin } from "@ccr/core/agents/local-providers/opencode-freetier";
 import { resolveConfiguredProviderModelSelector, resolveUniqueConfiguredProviderModelSelector } from "@ccr/core/routing/model-resolution";
 
@@ -217,8 +217,8 @@ function helixRecallVirtualModelProfile(config: AppConfig): VirtualModelProfileC
     enabled: true,
     execution: {
       clientToolsPolicy: "allow",
-      maxToolCalls: 8,
-      maxTurns: 4,
+      maxToolCalls: helixRecallProfileMaxToolCalls,
+      maxTurns: helixRecallProfileMaxTurns,
       mode: "tool_loop",
       streamMode: "buffered"
     },

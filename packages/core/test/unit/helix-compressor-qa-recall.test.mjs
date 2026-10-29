@@ -138,7 +138,7 @@ test("injectHistoryRecallInstruction: inserts new system if none exists", () => 
 
 test("injectHistoryRecallInstruction: NO duplicate if marker already present (回归测试)", () => {
   const messages = [
-    { role: "system", content: "<<HISTORY_RECALL_INSTRUCTION_v1>>\n## 历史 Q&A 召回机制" },
+    { role: "system", content: "<<HISTORY_RECALL_INSTRUCTION_v2>>\n## 历史 Q&A 召回机制" },
     { role: "user", content: "Hi" }
   ];
   const result = injectHistoryRecallInstruction(messages);
@@ -146,7 +146,7 @@ test("injectHistoryRecallInstruction: NO duplicate if marker already present (�
   assert.equal(result.length, 2);
   assert.ok(result[0].content.includes("## 历史 Q&A 召回机制"));
   // 系统 prompt 应该只包含一次 marker 段,而非累积两次
-  const markerCount = (result[0].content.match(/HISTORY_RECALL_INSTRUCTION_v1/g) || []).length;
+  const markerCount = (result[0].content.match(/HISTORY_RECALL_INSTRUCTION_v2/g) || []).length;
   assert.equal(markerCount, 1, "marker 不应重复");
 });
 
@@ -209,7 +209,7 @@ test("injectHistoryRecallInstruction: 有 index → 追加清单,且 marker 仍�
   );
   assert.match(injected.content, /hash → topic/);
   assert.match(injected.content, /`eeeeeeeeeeeeeeee` — Q: topic here/);
-  const markerCount = (injected.content.match(/HISTORY_RECALL_INSTRUCTION_v1/g) || []).length;
+  const markerCount = (injected.content.match(/HISTORY_RECALL_INSTRUCTION_v2/g) || []).length;
   assert.equal(markerCount, 1);
 });
 

@@ -23,6 +23,7 @@ import {
 import {
   ccrAnthropicReasoningResponseHookKey,
   ccrCodexApplyPatchBridgeHeader,
+  ccrHelixSkipCompressionHeader,
   ccrCodexBridgeRequestTransformKey,
   ccrCodexBridgeResponseHookKey,
   ccrCodexBridgeStreamHookKey,
@@ -997,6 +998,13 @@ async function applyHelixCompressorTransform(
   const headers = requestInput.request?.headers ?? {};
   const requestId = requestInput.request?.id ?? "";
   const routedModel = requestInput.model;
+  const stringifiedHeaders = stringHeaders(headers);
+
+  // Pipeline 兜底重试：召回工具循环耗尽预算后，用同一份未压缩请求体重发，
+  // 并带上该 header 要求跳过压缩（从而不改写 model、不命中 recall profile）。
+  if (isTruthyHelixSkipCompression(stringifiedHeaders)) {
+    return undefined;
+  }
 
   // 查找 helix-compressor plugin config（v1.1 评估边界由插件配置）
   // 判据与 `helixLocalRecallEnabled` 保持一致：只看 `enabled !== false`。
@@ -1019,7 +1027,7 @@ async function applyHelixCompressorTransform(
     url: string;
   } = {
     body: requestInput.requestBody as Record<string, unknown>,
-    headers: stringHeaders(headers),
+    headers: stringifiedHeaders,
     method,
     path,
     requestId,
@@ -1673,6 +1681,12 @@ function constantTimeEqual(left: string, right: string): boolean {
   const leftBuffer = Buffer.from(left);
   const rightBuffer = Buffer.from(right);
   return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function isTruthyHelixSkipCompression(headers: Record<string, string>): boolean {
+  return Object.entries(headers).some(
+    ([name, value]) => name.toLowerCase() === ccrHelixSkipCompressionHeader && value.trim() === "1"
+  );
 }
 
 function stringHeaders(headers: Record<string, HeaderValue> | undefined): Record<string, string> {
