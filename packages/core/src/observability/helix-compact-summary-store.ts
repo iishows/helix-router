@@ -186,11 +186,25 @@ function extractHeader(lineBuf: Buffer): { h: string; s?: string; mhLen: number 
 
 // ============= public API =============
 
+/**
+ * 摘要正文是否其实是 HTML/XML 页面。
+ *
+ * 2026-10/11 事故:provider `api_base_url` 缺少 `/v1`,摘要请求落到 `https://host/chat/completions`,
+ * 上游 SPA 兜底页以 `200 text/html` 返回整页 HTML,被当作摘要写入并注入 system,
+ * 折叠掉的历史上下文全部变成网页源码。生成端已修正,这里再做一道读/写防线:
+ * 历史里已存在的坏摘要也不会再被命中。
+ */
+export function looksLikeHtmlText(text: string): boolean {
+  const head = (text ?? "").trimStart().toLowerCase();
+  return head.startsWith("<!doctype") || head.startsWith("<html") || head.startsWith("<?xml");
+}
+
 /** 写入(内容寻址,幂等)。返回是否写入成功。 */
 export function putCompactSummary(entry: CompactSummaryEntry, ttlMs: number = DEFAULT_TTL_MS): boolean {
   if (!entry || typeof entry.key !== "string" || !entry.key) return false;
   if (typeof entry.sessionId !== "string" || !entry.sessionId) return false;
   if (typeof entry.summary !== "string" || !entry.summary.trim()) return false;
+  if (looksLikeHtmlText(entry.summary)) return false;
   if (!Array.isArray(entry.messageHashes) || entry.messageHashes.length === 0) return false;
 
   const idx = ensureIndex();
@@ -372,6 +386,7 @@ function parseEntryLoose(line: string | undefined, now: number): CompactSummaryE
     return null;
   }
   if (typeof obj.h !== "string" || typeof obj.sum !== "string") return null;
+  if (looksLikeHtmlText(obj.sum)) return null;
   if (typeof obj.e === "number" && obj.e <= now) return null;
   if (typeof obj.s !== "string" || !obj.s) return null;
   const messageHashes = Array.isArray(obj.mh) ? obj.mh.filter((h): h is string => typeof h === "string") : [];

@@ -7,10 +7,12 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test, { before, after } from "node:test";
+import { appendFileSync, mkdirSync } from "node:fs";
 import {
   cleanup,
   findPrefixSummary,
   getCompactSummary,
+  looksLikeHtmlText,
   putCompactSummary,
   resolveCompactSummaryDir,
   _clearCacheForTest,
@@ -228,4 +230,45 @@ test("findPrefixSummary: put 之后不再全量重建索引也能命中(增量�
   const found = findPrefixSummary("s1", ["a", "b", "c", "d"]);
   assert.ok(found, "put 后未重建索引即查不到 → 增量续扫失效");
   assert.equal(found.entry.summary, "three");
+});
+
+// ============= HTML 摘要防护(2026-11 事故) =============
+
+test("looksLikeHtmlText: 识别 HTML/XML 页面,不误伤普通摘要", () => {
+  assert.equal(looksLikeHtmlText("<!doctype html>\n<html></html>"), true);
+  assert.equal(looksLikeHtmlText("  <html><body></body></html>"), true);
+  assert.equal(looksLikeHtmlText("<?xml version=\"1.0\"?>"), true);
+  assert.equal(looksLikeHtmlText("# Handoff\n\n## 1. Current objective"), false);
+  assert.equal(looksLikeHtmlText("对话里提到 <!doctype html> 但这是摘要正文"), false);
+});
+
+test("putCompactSummary: HTML 摘要一律拒收", () => {
+  fresh();
+  assert.equal(putCompactSummary({
+    coveredCount: 1,
+    key: "html1",
+    messageHashes: ["a"],
+    sessionId: "s1",
+    summary: "<!doctype html>\n<html><head><title>Helix Gateway</title></head></html>"
+  }), false);
+  assert.equal(getCompactSummary("html1"), null);
+});
+
+test("读路径: 历史里已写入的 HTML 摘要不会被命中", () => {
+  fresh();
+  const dir = resolveCompactSummaryDir();
+  mkdirSync(dir, { recursive: true });
+  // 模拟旧版本(修复前)写入的坏数据
+  appendFileSync(path.join(dir, "summaries.jsonl"), JSON.stringify({
+    e: Date.now() + 60000,
+    h: "legacy-html",
+    mh: ["a", "b"],
+    n: 2,
+    s: "s1",
+    sum: "<!doctype html>\n<html><head><title>Helix Gateway</title></head></html>",
+    t: Date.now()
+  }) + "\n", "utf-8");
+  _resetIndexForTest();
+  assert.equal(getCompactSummary("legacy-html"), null);
+  assert.equal(findPrefixSummary("s1", ["a", "b", "c"]), null);
 });

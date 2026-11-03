@@ -13,6 +13,7 @@ import test, { before, after } from "node:test";
 import {
   applyHelixProactiveCompact,
   foldBoundary,
+  isUsableSummaryResponse,
   mergeSystemSummary,
   readProactiveCompactSettingsFromConfig,
   resolveCompactBudgetTokens,
@@ -835,4 +836,89 @@ test("anthropic 协议: 摘要请求打到 /v1/messages 且带 anthropic-version
     assert.equal(calls[0].headers["anthropic-version"], "2023-06-01");
     assert.equal(calls[0].headers["x-api-key"], "anthropic-key");
   });
+});
+
+// ============= 摘要端点选择 / HTML 响应防护(2026-11 事故) =============
+
+function unversionedOpenAiConfig(overrides = {}) {
+  return {
+    Providers: [
+      {
+        api_base_url: "http://127.0.0.1:9997",
+        api_key: "k",
+        models: ["MiniMax-M3"],
+        name: "Unversioned",
+        type: "openai_chat_completions",
+        ...overrides
+      }
+    ],
+    Router: { fallback: { mode: "off", models: [], retryCount: 0 } },
+    gateway: {}
+  };
+}
+
+test("端点: baseUrl 不带 /v1 时优先使用带版本号的 /v1/chat/completions", async () => {
+  resetCacheIndex();
+  await withMockFetch(() => openAiSummaryResponse("V1 HANDOFF"), async (calls) => {
+    const result = await applyHelixProactiveCompact({
+      body: { messages: multiTurnMessages() },
+      config: unversionedOpenAiConfig(),
+      headers: { "x-session-id": "sess-unversioned" },
+      model: "MiniMax-M3",
+      postCompressionTokens: 999999,
+      settings: settings()
+    });
+    assert.ok(result);
+    assert.equal(calls[0].url, "http://127.0.0.1:9997/v1/chat/completions");
+    assert.match(result.requestBody.system, /V1 HANDOFF/);
+  });
+});
+
+test("端点: provider capability 声明的 endpoint 优先于 baseUrl 推导", async () => {
+  resetCacheIndex();
+  const config = unversionedOpenAiConfig({
+    capabilities: [{ type: "openai_chat_completions", endpoint: "http://127.0.0.1:9997/custom/chat" }]
+  });
+  await withMockFetch(() => openAiSummaryResponse("CAPABILITY HANDOFF"), async (calls) => {
+    const result = await applyHelixProactiveCompact({
+      body: { messages: multiTurnMessages() },
+      config,
+      headers: { "x-session-id": "sess-capability" },
+      model: "MiniMax-M3",
+      postCompressionTokens: 999999,
+      settings: settings()
+    });
+    assert.ok(result);
+    assert.equal(calls[0].url, "http://127.0.0.1:9997/custom/chat");
+  });
+});
+
+test("降级: 上游 200 text/html(SPA 兜底页)绝不当摘要使用", async () => {
+  resetCacheIndex();
+  const html = "<!doctype html>\n<html><head><title>Helix Gateway</title></head><body></body></html>";
+  await withMockFetch(() => new Response(html, {
+    headers: { "content-type": "text/html; charset=utf-8" },
+    status: 200
+  }), async () => {
+    const result = await applyHelixProactiveCompact({
+      body: { messages: multiTurnMessages(), system: "you are cc" },
+      config: unversionedOpenAiConfig(),
+      headers: { "x-session-id": "sess-html" },
+      model: "MiniMax-M3",
+      postCompressionTokens: 999999,
+      settings: settings()
+    });
+    assert.equal(result, undefined, "HTML 响应必须视为失败,退回原 body");
+  });
+});
+
+test("isUsableSummaryResponse: 只接受 JSON / SSE,拒绝 HTML 与非 JSON", () => {
+  assert.equal(isUsableSummaryResponse('{"choices":[]}', "application/json"), true);
+  assert.equal(isUsableSummaryResponse("data: {}\n", "text/event-stream"), true);
+  assert.equal(isUsableSummaryResponse("data: {}\n", undefined), true);
+  assert.equal(isUsableSummaryResponse("<!doctype html><html></html>", "text/html"), false);
+  assert.equal(isUsableSummaryResponse("<html></html>", "application/json"), false);
+  assert.equal(isUsableSummaryResponse("<error>bad</error>", undefined), false);
+  assert.equal(isUsableSummaryResponse("not json", "text/plain"), false);
+  assert.equal(isUsableSummaryResponse("", "application/json"), false);
 });

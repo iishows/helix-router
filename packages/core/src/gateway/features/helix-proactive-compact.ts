@@ -306,6 +306,7 @@ async function summarizeFolded(input: {
   }
   const prompt = buildSummaryPrompt(input.prefix?.entry.summary, delta);
   const text = await callSummary({
+    endpoints: input.target.endpoints,
     model: input.target.model,
     prompt,
     protocol: input.target.protocol,
@@ -371,6 +372,8 @@ type SummaryTarget = {
   model: string;
   provider: GatewayProviderConfig;
   protocol: GatewayProviderProtocol;
+  /** 按优先级排列的候选端点。第一个失败(5xx/HTML/非 JSON)时自动尝试下一个。 */
+  endpoints: string[];
 };
 
 function resolveSummaryTarget(config: AppConfig, model: string): SummaryTarget | undefined {
@@ -382,10 +385,74 @@ function resolveSummaryTarget(config: AppConfig, model: string): SummaryTarget |
     return undefined;
   }
   const protocol = normalizeProviderProtocol(provider.type) ?? normalizeProviderProtocol(provider.provider);
-  if (!protocol || !summaryEndpoint(providerBaseUrl(provider), protocol)) {
+  if (!protocol) {
     return undefined;
   }
-  return { model: upstreamModel, protocol, provider };
+  const endpoints = resolveSummaryEndpoints(provider, protocol);
+  if (endpoints.length === 0) {
+    return undefined;
+  }
+  return { endpoints, model: upstreamModel, protocol, provider };
+}
+
+/**
+ * 摘要端点候选。优先级:
+ *   1. provider 已探测/声明的 capability endpoint(最准确,通常带 `/v1`);
+ *   2. 从 baseUrl 推导的候选,带版本号的排前。
+ *
+ * 2026-11 事故:provider `api_base_url` 常写成 `https://host`(不带 `/v1`),
+ * 旧实现直接取「不带版本」的候选 → 请求落到 `https://host/chat/completions`,
+ * 上游 SPA 兜底页以 200 + text/html 返回,被当成摘要注入,历史上下文被网页替换。
+ */
+function resolveSummaryEndpoints(provider: GatewayProviderConfig, protocol: GatewayProviderProtocol): string[] {
+  const endpoints: string[] = [];
+  for (const capability of provider.capabilities ?? []) {
+    if (
+      isRecord(capability) &&
+      capability.type === protocol &&
+      typeof capability.endpoint === "string" &&
+      capability.endpoint.trim()
+    ) {
+      endpoints.push(capability.endpoint.trim());
+    }
+  }
+
+  const raw = providerBaseUrl(provider);
+  if (raw) {
+    const bases: string[] = [];
+    try {
+      const parsed = parseProviderBaseUrl(raw);
+      const candidates = protocol === "anthropic_messages"
+        ? parsed.anthropicBaseUrlCandidates
+        : protocol === "openai_chat_completions" || protocol === "openai_responses"
+          ? parsed.openaiBaseUrlCandidates
+          : [];
+      // 带版本号的候选排前:unversioned 命中 SPA 兜底页的概率更高。
+      const versioned = candidates.filter((base) => /\/v\d+(?:$|\/)/i.test(base));
+      const rest = candidates.filter((base) => !versioned.includes(base));
+      bases.push(...versioned, ...rest);
+    } catch {
+      bases.push(raw);
+    }
+    if (bases.length === 0) {
+      bases.push(raw);
+    }
+    for (const base of bases) {
+      const endpoint = summaryEndpoint(base, protocol);
+      if (endpoint) {
+        endpoints.push(endpoint);
+      }
+    }
+  }
+
+  const seen = new Set<string>();
+  return endpoints.filter((endpoint) => {
+    if (seen.has(endpoint)) {
+      return false;
+    }
+    seen.add(endpoint);
+    return true;
+  });
 }
 
 /** 剥掉 helix recall 虚拟 model 前缀,避免摘要请求命中 recall virtual-profile。 */
@@ -400,36 +467,44 @@ async function callSummary(input: {
   prompt: string;
   protocol: GatewayProviderProtocol;
   provider: GatewayProviderConfig;
+  endpoints: string[];
   timeoutMs: number;
   signal?: AbortSignal;
 }): Promise<string | undefined> {
-  const endpoint = summaryEndpoint(providerBaseUrl(input.provider), input.protocol);
-  if (!endpoint || !input.model.trim()) {
+  if (!input.model.trim() || input.endpoints.length === 0) {
     return undefined;
   }
   const apiKey = providerApiKey(input.provider);
-  // 先试「关思考」。只有当 provider **拒绝**该字段(4xx)时才退回「原样请求」——
-  //   若返回 200 但正文为空(reasoning 吃光预算),重试同样形状无意义,直接放弃(与原行为一致)。
-  const withDisable = await attemptSummary(
-    { endpoint, protocol: input.protocol, timeoutMs: input.timeoutMs, signal: input.signal },
-    buildSummaryRequest(input.protocol, input.model, input.prompt, apiKey, true)
-  );
-  if (withDisable.text !== undefined) {
-    return withDisable.text;
+  for (const endpoint of input.endpoints) {
+    // 先试「关思考」。只有当 provider **拒绝**该字段(4xx)时才退回「原样请求」——
+    //   若返回 200 但正文为空(reasoning 吃光预算),重试同样形状无意义,直接放弃该端点(与原行为一致)。
+    const withDisable = await attemptSummary(
+      { endpoint, protocol: input.protocol, timeoutMs: input.timeoutMs, signal: input.signal },
+      buildSummaryRequest(input.protocol, input.model, input.prompt, apiKey, true)
+    );
+    if (withDisable.text !== undefined) {
+      return withDisable.text;
+    }
+    if (withDisable.rejected) {
+      const fallback = await attemptSummary(
+        { endpoint, protocol: input.protocol, timeoutMs: input.timeoutMs, signal: input.signal },
+        buildSummaryRequest(input.protocol, input.model, input.prompt, apiKey, false)
+      );
+      if (fallback.text !== undefined) {
+        return fallback.text;
+      }
+    }
+    // retryable(含 5xx / HTML / 非 JSON)→ 尝试下一个候选端点;否则本端点已给出确定结论。
+    if (!withDisable.retryable) {
+      return undefined;
+    }
   }
-  if (!withDisable.rejected) {
-    return undefined;
-  }
-  const fallback = await attemptSummary(
-    { endpoint, protocol: input.protocol, timeoutMs: input.timeoutMs, signal: input.signal },
-    buildSummaryRequest(input.protocol, input.model, input.prompt, apiKey, false)
-  );
-  return fallback.text;
+  return undefined;
 }
 
-type SummaryAttempt = { text?: string; rejected: boolean };
+type SummaryAttempt = { text?: string; rejected: boolean; retryable: boolean };
 
-/** 发一次摘要请求并提取助手文本。`rejected=true` 表示 provider 4xx 拒了请求体(可换形状重试)。 */
+/** 发一次摘要请求并提取助手文本。 */
 async function attemptSummary(
   input: { endpoint: string; protocol: GatewayProviderProtocol; timeoutMs: number; signal?: AbortSignal },
   request: { headers: Record<string, string>; body: JsonObject }
@@ -446,16 +521,49 @@ async function attemptSummary(
       signal: controller.signal
     });
     if (!response.ok) {
-      return { rejected: true };
+      // 4xx = 请求体形状被拒,可换形状重试;5xx = 端点临时故障,换候选端点。
+      return { rejected: response.status >= 400 && response.status < 500, retryable: response.status >= 500 };
     }
+    const contentType = response.headers.get("content-type") ?? "";
     const rawText = await response.text();
-    const text = extractArchiveAssistantText(rawText, input.protocol, response.headers.get("content-type") ?? undefined);
-    return { rejected: false, text: text.trim() ? text : undefined };
+    // 绝不把 HTML / 非 JSON 正文当摘要(上游 SPA 兜底页会说 200 + text/html)。
+    if (!isUsableSummaryResponse(rawText, contentType)) {
+      return { rejected: false, retryable: true };
+    }
+    const text = extractArchiveAssistantText(rawText, input.protocol, contentType);
+    return { rejected: false, retryable: false, text: text.trim() ? text : undefined };
   } catch {
-    return { rejected: false };
+    return { rejected: false, retryable: true };
   } finally {
     clearTimeout(timer);
     input.signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+/**
+ * 摘要响应是否可用:必须是 JSON 或 SSE 的模型响应,不能是 HTML/XML 页面。
+ * 导出以便单测。
+ */
+export function isUsableSummaryResponse(rawText: string, contentType?: string): boolean {
+  const trimmed = (rawText ?? "").trim();
+  if (!trimmed) {
+    return false;
+  }
+  const type = (contentType ?? "").toLowerCase();
+  if (type.includes("text/html") || type.includes("application/xhtml")) {
+    return false;
+  }
+  if (trimmed.startsWith("<")) {
+    return false;
+  }
+  if (type.includes("text/event-stream") || /^event:|^data:/m.test(trimmed)) {
+    return true;
+  }
+  try {
+    JSON.parse(trimmed);
+    return true;
+  } catch {
+    return false;
   }
 }
 
