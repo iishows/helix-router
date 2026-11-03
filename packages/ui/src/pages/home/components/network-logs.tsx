@@ -7,7 +7,7 @@ import {
   ChevronRight, clampNumber, clientInitial, cn, Copy, copyTextToClipboard,
   createLogBodyPreviewText, Database, Dialog, DialogBody, DialogContent, DialogHeader, DialogTitle, formatBytes, formatCompactNumber, formatDuration,
   compactSourceLabel,
-  formatLogDateTime, formatLogCompressSummary, formatLogTokenSummary, formatNetworkRequestRaw, formatNetworkResponseRaw, formatRouteTracePath, formatUsdCost,
+  formatLogDateTime, formatLogCompressSummary, formatLogTokenSummary, formatNetworkRequestRaw, formatNetworkResponseRaw, formatPercentFixed, formatRouteTracePath, formatUsdCost,
   FormattedLogBody,
   isJsonContainer, isLargeLogBody, jsonChildPath, logRequestModel,
   LogBodyFormatMode, logBodyLargeTextThreshold, logBodyPreviewTextLimit, LogBodyWorkerResponse,
@@ -1009,6 +1009,7 @@ export function LogExpandedDetails({
         <LogMetric label={t("Thinking")} value={formatCompactNumber(entry.reasoningTokens, numberLocale)} />
         <LogMetric label={t("缓存读取")} value={formatCompactNumber(entry.cacheReadTokens, numberLocale)} />
         <LogMetric label={t("缓存写入")} value={formatCompactNumber(entry.cacheWriteTokens, numberLocale)} />
+        <LogCacheHitMetric entry={entry} />
         <LogMetric label={t("总计")} value={formatCompactNumber(entry.totalTokens, numberLocale)} />
         <LogMetric label={t("Cost")} value={formatUsdCost(entry.costUsd ?? 0)} />
       </div>
@@ -1395,6 +1396,38 @@ function LogRetryAttempts({ attempts }: { attempts: RequestLogEntry["retryAttemp
         ))}
       </div>
     </div>
+  );
+}
+
+/**
+ * 单条请求的 prompt 缓存命中率。
+ *
+ * 口径与仪表盘 totals.cacheRatio 一致:
+ *   prompt = max(input + cache_read + cache_write, total - output)
+ *   hit    = cache_read / prompt
+ * 命中率越高,重复前缀的输入按 cache 价计费,单位成本越低。
+ */
+function logCacheHitRatio(entry: RequestLogEntry): { promptTokens: number; ratio: number } | undefined {
+  const read = typeof entry.cacheReadTokens === "number" ? entry.cacheReadTokens : 0;
+  const write = typeof entry.cacheWriteTokens === "number" ? entry.cacheWriteTokens : 0;
+  if (read <= 0 && write <= 0) return undefined;
+  const input = typeof entry.inputTokens === "number" ? entry.inputTokens : 0;
+  const output = typeof entry.outputTokens === "number" ? entry.outputTokens : 0;
+  const total = typeof entry.totalTokens === "number" ? entry.totalTokens : 0;
+  const promptTokens = Math.max(input + read + write, total - output);
+  return promptTokens > 0 ? { promptTokens, ratio: read / promptTokens } : undefined;
+}
+
+function LogCacheHitMetric({ entry }: { entry: RequestLogEntry }) {
+  const t = useAppText();
+  const hit = logCacheHitRatio(entry);
+  if (!hit) return null;
+  return (
+    <LogMetric
+      label={t("缓存命中率")}
+      value={formatPercentFixed(hit.ratio, 1)}
+      hint={t("命中率 = cache_read ÷ prompt(input + cache_read + cache_write);越高说明重复前缀越多、单位输入成本越低")}
+    />
   );
 }
 

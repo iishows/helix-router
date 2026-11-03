@@ -301,3 +301,21 @@ test("compactSourceLabel: 已知来源中文化", () => {
   assert.equal(compactSourceLabel("model"), "模型摘要");
   assert.equal(compactSourceLabel("other"), "other");
 });
+
+test("缓存命中率: title 显示 cache_read / prompt 百分比(与仪表盘 cacheRatio 同口径)", () => {
+  // prompt = max(input + cache_read + cache_write, total - output) = max(100+900+0, 1100-100) = 1000
+  const { title } = formatLogCompressSummary(
+    entry({ cacheReadTokens: 900, cacheWriteTokens: 0, inputTokens: 100, outputTokens: 100, totalTokens: 1100 }),
+    t
+  );
+  assert.match(title, /缓存命中率 90\.0%/);
+  assert.match(title, /cache_read 900 \/ prompt 1,000/);
+});
+
+test("缓存命中率: 只有 cache_write 时命中率为 0%", () => {
+  const { title } = formatLogCompressSummary(
+    entry({ cacheReadTokens: 0, cacheWriteTokens: 500, inputTokens: 500, outputTokens: 100, totalTokens: 1100 }),
+    t
+  );
+  assert.match(title, /缓存命中率 0\.0%/);
+});

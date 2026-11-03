@@ -84,7 +84,18 @@ export function formatLogCompressSummary(
 
   const inputTokens = typeof entry.inputTokens === "number" ? entry.inputTokens : 0;
   const cacheReadTokens = typeof entry.cacheReadTokens === "number" ? entry.cacheReadTokens : 0;
+  const cacheWriteTokens = typeof entry.cacheWriteTokens === "number" ? entry.cacheWriteTokens : 0;
   const freshTokens = Math.max(0, inputTokens - cacheReadTokens);
+  // 缓存命中率(与仪表盘 totals.cacheRatio 同口径):
+  //   prompt = max(input + cache_read + cache_write, total - output)
+  //   hit    = cache_read / prompt
+  const outputTokensForPrompt = typeof entry.outputTokens === "number" ? entry.outputTokens : 0;
+  const totalTokensForPrompt = typeof entry.totalTokens === "number" ? entry.totalTokens : 0;
+  const cachePromptTokens = Math.max(
+    inputTokens + cacheReadTokens + cacheWriteTokens,
+    totalTokensForPrompt - outputTokensForPrompt
+  );
+  const cacheHitPct = cachePromptTokens > 0 ? (cacheReadTokens / cachePromptTokens) * 100 : 0;
   // helix V1.4 / 2026-10-15: "净额" = 上游实际收到的 prompt token 总量
   //   = input_tokens + cache_read_tokens(MiniMax 命中 prompt cache 时 input_tokens
   //   只计未缓存部分,cache_read 才是命中部分,两者之和才等于上游看到的 prompt)。
@@ -166,6 +177,11 @@ export function formatLogCompressSummary(
     if (freshTokens > 0 && freshTokens !== inputTokens) {
       titleParts.push(`本请求新 token ${freshTokens.toLocaleString()}`);
     }
+  }
+  if (cacheReadTokens > 0 || cacheWriteTokens > 0) {
+    titleParts.push(
+      `缓存命中率 ${cacheHitPct.toFixed(1)}% (cache_read ${cacheReadTokens.toLocaleString()} / prompt ${cachePromptTokens.toLocaleString()})`
+    );
   }
   // helix V1.4 / 2026-10-15: 净额栏(上游实收 prompt = input + cache_read)。
   //   与"压缩后 msgs"是不同计量点:净额是真正发往 provider 的 prompt。
