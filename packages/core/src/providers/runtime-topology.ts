@@ -26,8 +26,14 @@ export function providerCapabilityForClientProtocol(
       // 2026-11-03: Doitx 的 Anthropic 端点(/v1/messages)不返回任何缓存用量字段
       //   (同一 prompt 连发两次,input_tokens 相同、无 cache_read/cache_creation),
       //   实测 0% 命中;而同一 provider 的 /v1/chat/completions 命中 99%+。
-      //   成本差额约 8×,因此 Anthropic 客户端也改走 OpenAI chat 端点,由网关做协议转换。
-      return { ...doitxChat, type: "openai_chat_completions" };
+      //   成本差额约 8×,默认让 Anthropic 客户端走 OpenAI chat 端点。
+      //   可通过 provider.anthropicEndpointPreference 切换(chat / messages / auto)。
+      const anthropicCapability = capabilities.find(
+        (item): item is GatewayProviderCapability & { type: "anthropic_messages" } =>
+          item.type === "anthropic_messages"
+      );
+      const useMessages = shouldUseAnthropicMessagesEndpoint(provider, anthropicCapability);
+      return { ...doitxChat, type: useMessages ? "anthropic_messages" : "openai_chat_completions" };
     }
   }
   for (const protocol of providerProtocolPreferenceForClient(clientProtocol)) {
@@ -39,6 +45,208 @@ export function providerCapabilityForClientProtocol(
     }
   }
   return undefined;
+}
+
+// ============= Anthropic 端点偏好(chat / messages / auto) =============
+
+type AnthropicEndpointProbeResult = { expiresAt: number; useMessages: boolean };
+
+const anthropicEndpointProbeTtlMs = 24 * 60 * 60 * 1000;
+const anthropicEndpointProbeResults = new Map<string, AnthropicEndpointProbeResult>();
+const anthropicEndpointProbesInFlight = new Set<string>();
+
+function shouldUseAnthropicMessagesEndpoint(
+  provider: GatewayProviderConfig,
+  anthropicCapability: GatewayProviderCapability | undefined
+): boolean {
+  const preference = provider.anthropicEndpointPreference;
+  if (preference === "messages") {
+    return true;
+  }
+  if (preference !== "auto") {
+    return false;
+  }
+  const key = anthropicEndpointProbeKey(provider);
+  const cached = anthropicEndpointProbeResults.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.useMessages;
+  }
+  // 首次(auto 且无缓存):先按 "chat" 处理,后台探测;结果写入缓存供后续请求使用。
+  void scheduleAnthropicEndpointProbe(provider, anthropicCapability, key);
+  return false;
+}
+
+function anthropicEndpointProbeKey(provider: GatewayProviderConfig): string {
+  return `${readBaseUrl(provider) ?? ""}|${provider.id || provider.name || ""}`;
+}
+
+function scheduleAnthropicEndpointProbe(
+  provider: GatewayProviderConfig,
+  anthropicCapability: GatewayProviderCapability | undefined,
+  key: string
+): Promise<void> {
+  if (anthropicEndpointProbesInFlight.has(key)) {
+    return Promise.resolve();
+  }
+  if (!anthropicCapability && !readBaseUrl(provider)) {
+    return Promise.resolve();
+  }
+  anthropicEndpointProbesInFlight.add(key);
+  return probeAnthropicEndpoint(provider, anthropicCapability)
+    .then((useMessages) => {
+      anthropicEndpointProbeResults.set(key, {
+        expiresAt: Date.now() + anthropicEndpointProbeTtlMs,
+        useMessages
+      });
+    })
+    .catch(() => {
+      anthropicEndpointProbeResults.set(key, {
+        expiresAt: Date.now() + anthropicEndpointProbeTtlMs,
+        useMessages: false
+      });
+    })
+    .finally(() => {
+      anthropicEndpointProbesInFlight.delete(key);
+    });
+}
+
+/**
+ * 探测 provider 的 Anthropic 端点是否值得使用:
+ *   1. prompt cache:同一段 ~15k token 的 prompt 连发两次,第二次需返回
+ *      `cache_read_input_tokens > 0`(或 `cache_creation_input_tokens > 0`);
+ *   2. 长上下文:发送 ~260k token,上游 `input_tokens + cache_read >= 200k`,
+ *      以排除会静默截断的端点(实测 Doitx `/v1/messages` 只处理 ~139k)。
+ * 两项都通过才返回 true。任何错误都返回 false(安全回退 chat)。
+ */
+export async function probeAnthropicEndpoint(
+  provider: GatewayProviderConfig,
+  anthropicCapability?: GatewayProviderCapability,
+  fetchImpl: typeof fetch = fetch
+): Promise<boolean> {
+  const endpoint = anthropicProbeEndpoint(provider, anthropicCapability);
+  const apiKey = providerApiKey(provider);
+  const model = provider.models?.find((item) => typeof item === "string" && item.trim());
+  if (!endpoint || !apiKey || !model) {
+    return false;
+  }
+
+  const headers = {
+    "anthropic-version": "2023-06-01",
+    "content-type": "application/json",
+    "x-api-key": apiKey
+  };
+  const post = async (text: string, maxTokens: number): Promise<Record<string, unknown> | undefined> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 90_000);
+    try {
+      const response = await fetchImpl(endpoint, {
+        body: JSON.stringify({
+          max_tokens: maxTokens,
+          messages: [{ content: [{ cache_control: { type: "ephemeral" }, text, type: "text" }], role: "user" }],
+          model,
+          stream: false,
+          system: [{ cache_control: { type: "ephemeral" }, text: "You are a probe.", type: "text" }]
+        }),
+        headers,
+        method: "POST",
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        return undefined;
+      }
+      return (await response.json()) as Record<string, unknown>;
+    } catch {
+      return undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const cacheProbeText = probeText(1_200);
+  const first = await post(cacheProbeText, 4);
+  if (!first) {
+    return false;
+  }
+  const second = await post(cacheProbeText, 4);
+  if (!second) {
+    return false;
+  }
+  const secondUsage = usageNumbers(second);
+  if (!(secondUsage.cacheRead > 0 || secondUsage.cacheWrite > 0)) {
+    return false;
+  }
+
+  const longProbe = await post(probeText(20_000), 1);
+  if (!longProbe) {
+    return false;
+  }
+  const longUsage = usageNumbers(longProbe);
+  return longUsage.input + longUsage.cacheRead >= 200_000;
+}
+
+function probeText(lines: number): string {
+  const out: string[] = [];
+  for (let index = 0; index < lines; index += 1) {
+    out.push(`record ${index}: alpha-${(index * 7919) % 100003} beta-${(index * 104729) % 99991} gamma-${(index * 1299709) % 1000003}`);
+  }
+  return out.join("\n");
+}
+
+function usageNumbers(payload: Record<string, unknown>): { cacheRead: number; cacheWrite: number; input: number } {
+  const usage = isPlainRecord(payload.usage) ? payload.usage : {};
+  return {
+    cacheRead: readFiniteNumber(usage.cache_read_input_tokens) ?? 0,
+    cacheWrite: readFiniteNumber(usage.cache_creation_input_tokens) ?? 0,
+    input: readFiniteNumber(usage.input_tokens) ?? 0
+  };
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function readFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function providerApiKey(provider: GatewayProviderConfig): string {
+  return provider.api_key || provider.apiKey || provider.apikey || "";
+}
+
+function anthropicProbeEndpoint(
+  provider: GatewayProviderConfig,
+  anthropicCapability: GatewayProviderCapability | undefined
+): string | undefined {
+  const capabilityEndpoint = anthropicCapability?.endpoint?.trim();
+  if (capabilityEndpoint) {
+    return /\/messages$/i.test(capabilityEndpoint) && !/\/v1\/messages$/i.test(capabilityEndpoint)
+      ? capabilityEndpoint.replace(/\/+$/, "").replace(/\/messages$/i, "/v1/messages")
+      : capabilityEndpoint;
+  }
+  const base = readBaseUrl(provider);
+  if (!base) {
+    return undefined;
+  }
+  const normalized = normalizeProviderBaseUrlInput(base, "anthropic_messages") || base.replace(/\/+$/, "");
+  return `${normalized.replace(/\/+$/, "")}/v1/messages`;
+}
+
+/** 仅供测试:清空探测结果与在途标记。 */
+export function _resetAnthropicEndpointProbeForTest(): void {
+  anthropicEndpointProbeResults.clear();
+  anthropicEndpointProbesInFlight.clear();
+}
+
+/** 仅供测试:直接写入探测结果。 */
+export function _setAnthropicEndpointProbeResultForTest(
+  provider: GatewayProviderConfig,
+  useMessages: boolean,
+  ttlMs = anthropicEndpointProbeTtlMs
+): void {
+  anthropicEndpointProbeResults.set(anthropicEndpointProbeKey(provider), {
+    expiresAt: Date.now() + ttlMs,
+    useMessages
+  });
 }
 
 export function providerProtocolForClientProtocol(

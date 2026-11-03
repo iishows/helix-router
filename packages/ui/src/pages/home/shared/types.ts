@@ -93,6 +93,8 @@ export type AddProviderDraft = {
   accountMode: ProviderAccountDraftMode;
   accountRefreshIntervalMs: string;
   apiKey: string;
+  /** Anthropic 客户端出站端点偏好;默认 "chat"(可命中 prompt cache)。 */
+  anthropicEndpointPreference: "auto" | "chat" | "messages";
   autoFetchModels: boolean;
   autoFetchKnownModels: string[];
   baseUrl: string;

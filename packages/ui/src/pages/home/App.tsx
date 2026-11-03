@@ -1737,6 +1737,9 @@ function App() {
     const provider: GatewayProviderConfig = {
       ...providerManualFieldsForSave(existingProvider),
       api_base_url: normalizeProviderBaseUrl(baseUrl),
+      anthropicEndpointPreference: providerDraft.anthropicEndpointPreference === "chat"
+        ? undefined
+        : providerDraft.anthropicEndpointPreference,
       api_key: primaryApiKey,
       autoFetchModels: providerDraft.autoFetchModels || undefined,
       autoFetchKnownModels,

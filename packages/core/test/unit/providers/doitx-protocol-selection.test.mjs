@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
-import test from "node:test";
-import { providerCapabilityForClientProtocol } from "@ccr/core/providers/runtime-topology.ts";
+import test, { beforeEach } from "node:test";
+import {
+  _resetAnthropicEndpointProbeForTest,
+  _setAnthropicEndpointProbeResultForTest,
+  probeAnthropicEndpoint,
+  providerCapabilityForClientProtocol
+} from "@ccr/core/providers/runtime-topology.ts";
+
+beforeEach(() => {
+  _resetAnthropicEndpointProbeForTest();
+});
 
 function doitxProvider() {
   return {
@@ -52,4 +61,66 @@ test("非 Doitx provider: Anthropic 客户端仍按原协议走 anthropic_messag
     ]
   };
   assert.equal(providerCapabilityForClientProtocol(provider, "anthropic_messages")?.type, "anthropic_messages");
+});
+
+// ============= anthropicEndpointPreference =============
+
+test("anthropicEndpointPreference=messages: 强制走 Anthropic 端点", () => {
+  const provider = { ...doitxProvider(), anthropicEndpointPreference: "messages" };
+  assert.equal(providerCapabilityForClientProtocol(provider, "anthropic_messages")?.type, "anthropic_messages");
+});
+
+test("anthropicEndpointPreference=chat: 强制走 OpenAI chat 端点", () => {
+  const provider = { ...doitxProvider(), anthropicEndpointPreference: "chat" };
+  assert.equal(providerCapabilityForClientProtocol(provider, "anthropic_messages")?.type, "openai_chat_completions");
+});
+
+test("anthropicEndpointPreference=auto: 使用缓存的探测结果", () => {
+  const provider = { ...doitxProvider(), anthropicEndpointPreference: "auto" };
+  _setAnthropicEndpointProbeResultForTest(provider, true);
+  assert.equal(providerCapabilityForClientProtocol(provider, "anthropic_messages")?.type, "anthropic_messages");
+  _setAnthropicEndpointProbeResultForTest(provider, false);
+  assert.equal(providerCapabilityForClientProtocol(provider, "anthropic_messages")?.type, "openai_chat_completions");
+});
+
+test("probeAnthropicEndpoint: 缓存命中 + 长上下文不截断 → true", async () => {
+  let call = 0;
+  const calls = [];
+  const fakeFetch = async (url, init) => {
+    call += 1;
+    calls.push({ url: String(url), body: JSON.parse(String(init.body)) });
+    const usage = call <= 2
+      ? { cache_read_input_tokens: call === 2 ? 15000 : 0, input_tokens: 15000 }
+      : { input_tokens: 260000 };
+    return new Response(JSON.stringify({ content: [], usage }), {
+      headers: { "content-type": "application/json" },
+      status: 200
+    });
+  };
+  assert.equal(await probeAnthropicEndpoint(doitxProvider(), undefined, fakeFetch), true);
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0].url, "https://router.doitx.ai/v1/messages");
+});
+
+test("probeAnthropicEndpoint: 无缓存字段 → false", async () => {
+  const fakeFetch = async () => new Response(JSON.stringify({ content: [], usage: { input_tokens: 15000 } }), {
+    headers: { "content-type": "application/json" },
+    status: 200
+  });
+  assert.equal(await probeAnthropicEndpoint(doitxProvider(), undefined, fakeFetch), false);
+});
+
+test("probeAnthropicEndpoint: 长上下文被截断 → false", async () => {
+  let call = 0;
+  const fakeFetch = async () => {
+    call += 1;
+    const usage = call <= 2
+      ? { cache_read_input_tokens: call === 2 ? 15000 : 0, input_tokens: 15000 }
+      : { input_tokens: 139000 };
+    return new Response(JSON.stringify({ content: [], usage }), {
+      headers: { "content-type": "application/json" },
+      status: 200
+    });
+  };
+  assert.equal(await probeAnthropicEndpoint(doitxProvider(), undefined, fakeFetch), false);
 });

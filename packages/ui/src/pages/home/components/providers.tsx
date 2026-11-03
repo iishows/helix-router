@@ -2229,6 +2229,20 @@ export function AddProviderForm({
                       onChange={onChange}
                       probe={probe}
                     />
+                    <Field className="sm:col-span-2" label={t("Anthropic endpoint")}>
+                      <SelectControl
+                        onChange={(value) => onChange({ anthropicEndpointPreference: value as "auto" | "chat" | "messages" })}
+                        options={[
+                          { label: t("OpenAI chat endpoint (recommended, cache-friendly)"), value: "chat" },
+                          { label: t("Auto detect"), value: "auto" },
+                          { label: t("Anthropic messages endpoint (native)"), value: "messages" }
+                        ]}
+                        value={draft.anthropicEndpointPreference}
+                      />
+                      <div className="mt-1 text-[12px] leading-5 text-muted-foreground">
+                        {t("Only affects Anthropic clients (Claude Code / Claude app). Auto probes prompt caching and long-context handling before choosing the native endpoint.")}
+                      </div>
+                    </Field>
                     <Field className="sm:col-span-2" label={t("Extra request body")} requirement="optional" requirementLabel={t("Optional")}>
                       <Textarea
                         className="min-h-[92px] font-mono text-[11px]"

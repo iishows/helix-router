@@ -170,6 +170,15 @@ export type GatewayProviderCapabilityProtocol = GatewayProviderProtocol | Gatewa
 
 export type GatewayProviderConfig = {
   account?: ProviderAccountConfig;
+  /**
+   * Anthropic 客户端(Claude Code / Claude app)的出站端点偏好。
+   *   - "chat"(默认): 始终走 provider 的 OpenAI chat 端点,由网关做协议转换 ——
+   *     prompt cache 通常可用,单位成本更低;
+   *   - "messages": 始终走 provider 的 Anthropic 端点(保留 Claude 原生语义);
+   *   - "auto": 首次使用时探测 Anthropic 端点是否支持 prompt cache 且不截断长上下文,
+   *     两项都通过才选 "messages",否则回退 "chat"。结果缓存 24 小时。
+   */
+  anthropicEndpointPreference?: "auto" | "chat" | "messages";
   api_base_url?: string;
   api_key?: string;
   apiKey?: string;

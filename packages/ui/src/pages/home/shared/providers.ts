@@ -637,6 +637,7 @@ export function createProviderDraftFromDeepLinkPayload(
 
   return {
     ...accountDraft,
+    anthropicEndpointPreference: "chat",
     apiKey: payload.apiKey?.trim() || "",
     autoFetchModels: false,
     autoFetchKnownModels: [],
@@ -737,6 +738,7 @@ export function createProviderDraft(providers: GatewayProviderConfig[]): AddProv
   const accountDraft = createDefaultProviderAccountDraft();
   return {
     ...accountDraft,
+    anthropicEndpointPreference: "chat",
     apiKey: "",
     autoFetchModels: false,
     autoFetchKnownModels: [],
@@ -771,6 +773,7 @@ export function createProviderDraftFromProvider(provider: GatewayProviderConfig)
   const credentials = (provider.credentials ?? []).map(providerCredentialDraftFromConfig);
   return {
     ...accountDraft,
+    anthropicEndpointPreference: provider.anthropicEndpointPreference ?? "chat",
     apiKey: providerApiKey(provider),
     autoFetchModels: Boolean(provider.autoFetchModels),
     autoFetchKnownModels: mergeProviderModelLists(provider.autoFetchKnownModels ?? []),
