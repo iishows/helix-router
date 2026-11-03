@@ -204,13 +204,28 @@ export function hasExplicitCompactSignal(
   return metadata?.ccr_context_compact === true || metadata?.ccrContextCompact === true;
 }
 
+// 最后一条 user 消息的下标(即"本轮"用户输入)。找不到返回 -1。
+function trailingUserMessageIndex(messages: unknown[]): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (isRecord(message) && String(message.role ?? "") === "user") {
+      return index;
+    }
+  }
+  return -1;
+}
+
+// 仅判定「本轮」申请:CC 自动 compact 的提示词位于请求的最后一条 user 消息。
+// 历史里残留的 compact 提示词(上一轮 auto-compact 留在 transcript 里)不代表本轮在申请 compact,
+// 若按整段历史判定,一次 auto-compact 之后主动 compact 将永久不再触发。
 function hasClaudeCodeAutoCompactPrompt(body: JsonObject): boolean {
   const messages = Array.isArray(body.messages) ? body.messages : [];
-  return messages.some((message) =>
-    isRecord(message) &&
-    String(message.role ?? "") === "user" &&
-    collectText(message.content).some(isClaudeCodeAutoCompactPromptText)
-  );
+  const index = trailingUserMessageIndex(messages);
+  if (index < 0) {
+    return false;
+  }
+  const message = messages[index];
+  return isRecord(message) && collectText(message.content).some(isClaudeCodeAutoCompactPromptText);
 }
 
 function replaceClaudeCodeAutoCompactPrompt(
@@ -225,29 +240,27 @@ function replaceClaudeCodeAutoCompactPrompt(
   if (!messages) {
     return false;
   }
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (
-      !isRecord(message) ||
-      String(message.role ?? "") !== "user" ||
-      !collectText(message.content).some(isClaudeCodeAutoCompactPromptText)
-    ) {
-      continue;
-    }
-    const nextMessage = cloneJsonObject(message);
-    nextMessage.content = protocol === "anthropic_messages"
-      ? [
-          ...(Array.isArray(message.content) ? message.content : []).filter(
-            (block) => isRecord(block) && block.type === "tool_result"
-          ),
-          { text: claudeCodeCompactHandoffTask(task), type: "text" }
-        ]
-      : claudeCodeCompactHandoffTask(task);
-    messages[index] = nextMessage;
-    body.messages = messages;
-    return true;
+  // 只改写本轮(最后一条 user 消息)的 compact 提示词;历史里残留的提示词不动。
+  const index = trailingUserMessageIndex(messages);
+  if (index < 0) {
+    return false;
   }
-  return false;
+  const message = messages[index];
+  if (!isRecord(message) || !collectText(message.content).some(isClaudeCodeAutoCompactPromptText)) {
+    return false;
+  }
+  const nextMessage = cloneJsonObject(message);
+  nextMessage.content = protocol === "anthropic_messages"
+    ? [
+        ...(Array.isArray(message.content) ? message.content : []).filter(
+          (block) => isRecord(block) && block.type === "tool_result"
+        ),
+        { text: claudeCodeCompactHandoffTask(task), type: "text" }
+      ]
+    : claudeCodeCompactHandoffTask(task);
+  messages[index] = nextMessage;
+  body.messages = messages;
+  return true;
 }
 
 function claudeCodeCompactHandoffTask(task: string): string {

@@ -535,6 +535,69 @@ test("成功: 折叠前缀 + system 注入摘要,diagnostic source=model", async
   });
 });
 
+/** CC 自动 compact 的提示词(三个特征串齐全才会被判为 compact 申请)。 */
+function claudeCompactPromptText() {
+  return [
+    "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.",
+    "Your task is to create a detailed summary of the conversation so far.",
+    "Your entire response must be plain text: an <analysis> block followed by a <summary> block."
+  ].join("\n\n");
+}
+
+/** 历史中段残留一条 compact 提示词,最后一轮是普通用户输入。 */
+function messagesWithStaleCompactPrompt() {
+  return [
+    { content: "q1", role: "user" },
+    { content: "a1", role: "assistant" },
+    { content: claudeCompactPromptText(), role: "user" },
+    { content: "a2", role: "assistant" },
+    { content: "q2", role: "user" },
+    { content: "a2b", role: "assistant" },
+    { content: "q3", role: "user" },
+    { content: "a3", role: "assistant" },
+    { content: "q4", role: "user" }
+  ];
+}
+
+// 回归 (2026-11-03):历史上残留的 compact 提示词曾被当作「本轮在申请 compact」,
+// 于是 CC 自动 compact 一次之后,主动 compact 在本会话内永久不再触发(实测 900+ 条消息未折叠)。
+test("门控: 历史中段残留的 CC compact 提示词不阻断折叠(仅看本轮)", async () => {
+  resetCacheIndex();
+  const messages = messagesWithStaleCompactPrompt();
+  await withMockFetch(() => openAiSummaryResponse("HANDOFF STALE PROMPT"), async (calls) => {
+    const result = await applyHelixProactiveCompact({
+      body: { messages, system: "you are cc" },
+      config: testConfig(),
+      headers: { "x-session-id": "sess-stale-prompt" },
+      model: "MiniMax-M3",
+      postCompressionTokens: 999999,
+      settings: settings()
+    });
+    assert.ok(result, "历史里的旧 compact 提示词不应阻断本轮折叠");
+    assert.deepEqual(result.requestBody.messages.map((m) => m.content), ["q3", "a3", "q4"]);
+    assert.match(result.requestBody.system, /HANDOFF STALE PROMPT/);
+    assert.equal(calls.length, 1);
+  });
+});
+
+test("门控: 本轮(最后一条 user)是 CC compact 提示词 → undefined(避免双折叠)", async () => {
+  resetCacheIndex();
+  const messages = messagesWithStaleCompactPrompt();
+  messages.push({ content: claudeCompactPromptText(), role: "user" });
+  await withMockFetch(() => openAiSummaryResponse("SHOULD NOT BE USED"), async (calls) => {
+    const result = await applyHelixProactiveCompact({
+      body: { messages, system: "you are cc" },
+      config: testConfig(),
+      headers: { "x-session-id": "sess-live-prompt" },
+      model: "MiniMax-M3",
+      postCompressionTokens: 999999,
+      settings: settings()
+    });
+    assert.equal(result, undefined, "本轮 compact 申请时不应再做主动折叠");
+    assert.equal(calls.length, 0, "不应发起摘要请求");
+  });
+});
+
 test("缓存: 同一折叠前缀第二次请求命中缓存,零额外 fetch", async () => {
   resetCacheIndex();
   const body = { messages: multiTurnMessages(), system: "you are cc" };
