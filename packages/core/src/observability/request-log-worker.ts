@@ -45,6 +45,10 @@ let shuttingDown = false;
 
 void store.initialize().then(() => {
   parentPort?.postMessage({ type: "ready" });
+  // 启动即预热定价目录。此前只在 `pricingRefreshNeeded` 的批次上触发,
+  // 而 streaming / raw-trace 更新路径常常判定不出「可计费 usage」→ 重启后
+  // 目录永远为空 → 所有请求 cost_usd 变成 null(2026-11-03 重启后复现)。
+  schedulePricingRefresh();
   parentPort?.on("message", (message: WorkerMessage) => {
     chain = chain.then(() => handleMessage(message)).catch((error) => {
       const detail = formatError(error);
@@ -116,6 +120,10 @@ function schedulePricingRefresh(): void {
     })
     .catch((error) => {
       console.warn(`[request-log] Failed to refresh pricing catalog: ${formatError(error)}`);
+      // 失败后 60s 重试:网络/代理抖动不应让本次进程生命周期内 cost 永久缺失。
+      if (!shuttingDown) {
+        setTimeout(schedulePricingRefresh, 60_000).unref?.();
+      }
     })
     .finally(() => {
       pricingRefreshPromise = undefined;
