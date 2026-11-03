@@ -23,7 +23,11 @@ export function providerCapabilityForClientProtocol(
     const doitxChat = capabilities.find((item) => item.type === "openai_chat_completions" &&
       findProviderPresetByBaseUrl(item.baseUrl || readBaseUrl(provider) || "")?.id === "doitx");
     if (doitxChat) {
-      return { ...doitxChat, type: "anthropic_messages" };
+      // 2026-11-03: Doitx 的 Anthropic 端点(/v1/messages)不返回任何缓存用量字段
+      //   (同一 prompt 连发两次,input_tokens 相同、无 cache_read/cache_creation),
+      //   实测 0% 命中;而同一 provider 的 /v1/chat/completions 命中 99%+。
+      //   成本差额约 8×,因此 Anthropic 客户端也改走 OpenAI chat 端点,由网关做协议转换。
+      return { ...doitxChat, type: "openai_chat_completions" };
     }
   }
   for (const protocol of providerProtocolPreferenceForClient(clientProtocol)) {
