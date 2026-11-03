@@ -114,29 +114,49 @@ function ensureIndex(): CacheIndex {
   return index;
 }
 
-/** 从 index.scanned 扫描到 limit,登记每行的 hash→offset。忽略未以 \n 结尾的末行。 */
+/**
+ * 从 index.scanned 扫描到 limit,登记每行的 hash→offset。忽略未以 \n 结尾的末行。
+ *
+ * 分块读取:缓存文件可达 COMPACT_SIZE_BYTES(64MB),一次性 `Buffer.allocUnsafe(len)`
+ * 会在内存紧张时抛 "Failed to allocate memory" 并拖垮网关(2026-11-03 线上事故)。
+ * 这里每块最多 SCAN_CHUNK_BYTES,跨块未闭合的行留在 pending 里(最多一行,受
+ * MAX_ENTRY_BYTES 限制),内存占用与文件大小无关。
+ */
+const SCAN_CHUNK_BYTES = 1024 * 1024;
+
 function scanInto(idx: CacheIndex, limit: number): void {
   const start = idx.scanned;
   if (limit <= start) return;
   const fd = openSync(idx.file, "r");
   try {
-    const len = limit - start;
-    const buf = Buffer.allocUnsafe(len);
-    let read = 0;
-    while (read < len) {
-      const n = readSync(fd, buf, read, len - read, start + read);
-      if (n <= 0) break;
-      read += n;
-    }
-    // 只在完整行(以 \n 结尾)范围内登记;半写尾部留待下次
-    let lineStart = start;
-    for (let i = 0; i < read; i++) {
-      if (buf[i] === 0x0a) {
-        registerLine(idx, buf.subarray(lineStart - start, i), lineStart);
-        lineStart = start + i + 1;
+    let pos = start;
+    let pending = Buffer.alloc(0);
+    let pendingStart = start;
+    while (pos < limit) {
+      const want = Math.min(SCAN_CHUNK_BYTES, limit - pos);
+      const buf = Buffer.allocUnsafe(want);
+      let read = 0;
+      while (read < want) {
+        const n = readSync(fd, buf, read, want - read, pos + read);
+        if (n <= 0) break;
+        read += n;
       }
+      if (read <= 0) break;
+      pos += read;
+      const chunk = read === want ? buf : buf.subarray(0, read);
+      const data = pending.length > 0 ? Buffer.concat([pending, chunk]) : chunk;
+      // 只在完整行(以 \n 结尾)范围内登记;半写尾部留待下次
+      let lineStart = 0;
+      for (let i = 0; i < data.length; i++) {
+        if (data[i] === 0x0a) {
+          registerLine(idx, data.subarray(lineStart, i), pendingStart + lineStart);
+          lineStart = i + 1;
+        }
+      }
+      pending = lineStart < data.length ? Buffer.from(data.subarray(lineStart)) : Buffer.alloc(0);
+      pendingStart += lineStart;
     }
-    idx.scanned = lineStart;
+    idx.scanned = pendingStart;
   } finally {
     closeSync(fd);
   }
@@ -211,9 +231,15 @@ export function putBatch(entries: Array<[string, RecallCacheEntry]>, ttlMs: numb
     written++;
   }
   if (!lines) return 0;
+  const beforeSize = existsSync(idx.file) ? statSync(idx.file).size : 0;
   appendFileSync(idx.file, lines, "utf-8");
-  // 追加后使索引失效(下次读重建/续扫)
-  index = undefined;
+  // 增量续扫刚追加的部分,而不是丢弃索引让下一次调用整体重扫 60MB+ 文件:
+  // 每个请求都全量重建索引会在低内存下触发 "Failed to allocate memory"。
+  if (index && index.dir === idx.dir && index.file === idx.file) {
+    scanInto(index, beforeSize + Buffer.byteLength(lines, "utf-8"));
+  } else {
+    index = undefined;
+  }
   maybeCompact(idx.dir);
   return written;
 }
@@ -247,20 +273,27 @@ export function cleanup(now: number = Date.now()): number {
   const file = pathJoin(dir, CACHE_FILE_NAME);
   if (!existsSync(file)) return 0;
   const idx = ensureIndex();
-  const kept = new Map<string, string>(); // hash -> raw line
-  for (const [hash, offset] of idx.offsets) {
-    const raw = readLineAt(file, offset);
-    if (!raw) continue;
-    const entry = safeParse(raw);
-    if (!entry) continue;
-    if (typeof entry.e === "number" && entry.e <= now) continue;
-    kept.set(hash, raw.endsWith("\n") ? raw : raw + "\n");
-  }
   const tmp = `${file}.tmp-${process.pid}`;
-  writeFileSync(tmp, [...kept.values()].join(""), "utf-8");
+  const out = openSync(tmp, "w");
+  let kept = 0;
+  try {
+    // 逐行读取并写入临时文件,不再把所有原文行收集到 Map / join 成一个 60MB+
+    // 字符串 —— 那会在 compaction 时把内存峰值抬到数百 MB。
+    for (const [, offset] of idx.offsets) {
+      const raw = readLineAt(file, offset);
+      if (!raw) continue;
+      const entry = safeParse(raw);
+      if (!entry) continue;
+      if (typeof entry.e === "number" && entry.e <= now) continue;
+      writeFileSync(out, raw.endsWith("\n") ? raw : raw + "\n", "utf-8");
+      kept += 1;
+    }
+  } finally {
+    closeSync(out);
+  }
   renameSync(tmp, file);
   index = undefined;
-  return kept.size;
+  return kept;
 }
 
 // ============= helpers =============
