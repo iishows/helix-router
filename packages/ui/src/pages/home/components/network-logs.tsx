@@ -1503,6 +1503,17 @@ function LogCompressDetails({ entry }: { entry: RequestLogEntry }) {
   const contextOverhead = netPromptTokens > 0
     ? Math.max(0, netPromptTokens - compressedTokens - recallTokens)
     : 0;
+  // 2026-11-08: 统一口径 —— 用户看到「baseline 31751」紧挨「上游实收 48695」会误以为
+  //   压缩把 prompt 变大了。真因是 baseline 只算 messages,system/tools 从未参与压缩。
+  //   这里补一个同口径对比:不压缩时 prompt ≈ baseline + 本次实际上下文开销,
+  //   与实际上游 prompt 相减得到「端到端节省」,与成本关联的唯一口径。
+  const promptBaselineTokens = baselineTokens > 0 && contextOverhead > 0
+    ? baselineTokens + contextOverhead
+    : 0;
+  const promptSavedTokens = promptBaselineTokens > 0 && netPromptTokens > 0
+    ? Math.max(0, promptBaselineTokens - netPromptTokens)
+    : 0;
+  const promptSavedPct = promptBaselineTokens > 0 ? (promptSavedTokens / promptBaselineTokens * 100) : 0;
 
   return (
     <>
@@ -1510,17 +1521,19 @@ function LogCompressDetails({ entry }: { entry: RequestLogEntry }) {
           baseline(原始 msgs) → post(压缩后 msgs,transform 出口)
                                → 净额(上游实收 prompt = input+cache_read,含召回回填)
           关键: post 只代表"压缩那一刻";模型调用 history_recall 后原文被回填,
-          净额才是真正发往 provider、也是真正计费参考的量。 */}
+          净额才是真正发往 provider、也是真正计费参考的量。
+          2026-11-08: 增加「不压缩时 prompt」与「端到端节省」两行,让 baseline 与
+          上游实收有同口径对照,避免"压缩后反而更多"的误读。 */}
       {baselineTokens > 0 ? (
         <LogMetric
-          label={t("原始请求 (baseline)")}
+          label={t("原始 messages (baseline)")}
           value={`${baselineTokens.toLocaleString()} tok`}
-          hint={t("只统计会被压缩的 messages(user/assistant);system prompt 与 tools 不计入")}
+          hint={t("只统计会被压缩的 messages(user/assistant);system prompt 与 tools 不计入,所以不能直接和「上游实收 prompt」比较")}
         />
       ) : null}
       {compressedTokens > 0 ? (
         <LogMetric
-          label={t("压缩后 (post)")}
+          label={t("压缩后 messages (post)")}
           value={`${compressedTokens.toLocaleString()} tok`}
           hint={compressed
             ? t("压缩后 messages 的 token 数(transform 出口)")
@@ -1529,22 +1542,36 @@ function LogCompressDetails({ entry }: { entry: RequestLogEntry }) {
       ) : null}
       {saved > 0 ? (
         <LogMetric
-          label={t("压缩节省 (post)")}
+          label={t("压缩节省 (messages 口径)")}
           value={`${saved.toLocaleString()} tok (-${savedPct.toFixed(1)}%)`}
         />
       ) : null}
       {netSaved > 0 ? (
         <LogMetric
-          label={t("净节省 (含召回)")}
+          label={t("净节省 (messages 口径, 含召回)")}
           value={`${netSaved.toLocaleString()} tok (-${netSavedPct.toFixed(1)}%)`}
-          hint={t("messages 口径:baseline − (压缩后 + 召回回填)。与下方「上游实收」不同域")}
+          hint={t("messages 口径:baseline − (压缩后 + 召回回填)。分母不含 system/tools")}
+        />
+      ) : null}
+      {promptBaselineTokens > 0 ? (
+        <LogMetric
+          label={t("不压缩时 prompt (同口径估算)")}
+          value={`${promptBaselineTokens.toLocaleString()} tok`}
+          hint={t("= baseline + 本次实际上下文开销(system/tools)。与下一行「上游实收 prompt」同口径,可直接相减")}
         />
       ) : null}
       {netPromptTokens > 0 ? (
         <LogMetric
-          label={t("上游实收 prompt")}
+          label={t("上游实收 prompt (含 system/tools)")}
           value={`${netPromptTokens.toLocaleString()} tok`}
-          hint={t("= LLM input + cache_read,含 system/tools(不被压缩)—— 与 messages 口径的节省率不同域,仅供参考")}
+          hint={t("= LLM input + cache_read。含从不被压缩的 system/tools,与上一行同口径;不要直接和 baseline 相减")}
+        />
+      ) : null}
+      {promptSavedTokens > 0 ? (
+        <LogMetric
+          label={t("端到端节省 (prompt 口径)")}
+          value={`${promptSavedTokens.toLocaleString()} tok (-${promptSavedPct.toFixed(1)}%)`}
+          hint={t("不压缩时 prompt − 上游实收 prompt。这是与成本一致的总节省口径")}
         />
       ) : null}
       {recallTokens > 0 ? (

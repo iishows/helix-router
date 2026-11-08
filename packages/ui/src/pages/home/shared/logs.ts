@@ -193,6 +193,16 @@ export function formatLogCompressSummary(
     const recallPart = recallTokens > 0 ? `, 召回回填 +${recallTokens.toLocaleString()}` : "";
     const overheadPart = overhead > 0 ? `, 上下文开销(system/tools) +${overhead.toLocaleString()}` : "";
     titleParts.push(`净额(上游实收 prompt) ${netPromptTokens.toLocaleString()} tok = input ${inputTokens.toLocaleString()} + cache_read ${cacheReadTokens.toLocaleString()}${recallPart}${overheadPart}`);
+    // 2026-11-08: 再给一个**同口径**对比 —— 避免 baseline(messages) 与上游实收(含
+    //   system/tools)并排时被误读成"压缩后更多"。不压缩时 prompt ≈ baseline + overhead。
+    if (overhead > 0) {
+      const promptBaseline = baselineTokens + overhead;
+      const promptSaved = Math.max(0, promptBaseline - netPromptTokens);
+      const promptSavedPct = promptBaseline > 0 ? (promptSaved / promptBaseline * 100).toFixed(1) : "0.0";
+      titleParts.push(
+        `同口径端到端:不压缩 prompt ${promptBaseline.toLocaleString()} → 实际 ${netPromptTokens.toLocaleString()} tok (-${promptSavedPct}%, 省 ${promptSaved.toLocaleString()})`
+      );
+    }
   }
   // 2026-10-17: 压缩过但召回回填为 0 时**显式**画出来,免得每次都猜"是没召回还是没渲染"。
   //   0 分两种:响应体里仍残留 recall 调用 = 模型调了但没被执行;否则 = 模型压根没调。

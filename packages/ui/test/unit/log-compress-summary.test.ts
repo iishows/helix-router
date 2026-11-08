@@ -103,6 +103,27 @@ test("system/tools 开销不再稀释节省率(跨域比较修复)", () => {
   assert.equal(text, "-87.5%");
 });
 
+test("title 给出与成本一致的 prompt 同口径对比(baseline + 上下文开销 vs 上游实收)", () => {
+  // 真实请求 16002259:baseline 31,751 / post 17,592 / input 1,335 + cache 47,360 = 48,695。
+  //   system/tools 开销 = 48,695 − 17,592 = 31,103。
+  //   不压缩时 prompt = 31,751 + 31,103 = 62,854 → 实际 48,695,省 14,159(-22.5%)。
+  //   这段存在的意义:避免用户把 baseline(messages) 和上游实收(含 system/tools)
+  //   并排时误读成"压缩后变多了"。
+  const { title } = formatLogCompressSummary(
+    entry({
+      inputTokens: 1335,
+      cacheReadTokens: 47360,
+      responseHeaders: {
+        "x-helix-compressor-enabled": "1",
+        "x-helix-compressor-baseline-tokens": "31751",
+        "x-helix-compressor-compressed-tokens": "17592"
+      }
+    }),
+    t
+  );
+  assert.match(title, /同口径端到端:不压缩 prompt 62,854 → 实际 48,695 tok \(-22\.5%, 省 14,159\)/);
+});
+
 test("压缩了但召回把原文全捞回(messages 口径无净节省)显示「无净节省」", () => {
   const { text } = formatLogCompressSummary(
     entry({

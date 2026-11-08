@@ -217,6 +217,17 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       primaryNavigation: "Primary navigation"
     },
     text: {
+      "原始 messages (baseline)": "Original messages (baseline)",
+      "压缩后 messages (post)": "Compressed messages (post)",
+      "压缩节省 (messages 口径)": "Compression saving (messages basis)",
+      "净节省 (messages 口径, 含召回)": "Net saving (messages basis, incl. recall)",
+      "不压缩时 prompt (同口径估算)": "Prompt without compression (same basis)",
+      "上游实收 prompt (含 system/tools)": "Upstream prompt (incl. system/tools)",
+      "端到端节省 (prompt 口径)": "End-to-end saving (prompt basis)",
+      "只统计会被压缩的 messages(user/assistant);system prompt 与 tools 不计入,所以不能直接和「上游实收 prompt」比较": "Counts only compressible messages (user/assistant); system prompt and tools are excluded, so this is not directly comparable to the upstream prompt.",
+      "= baseline + 本次实际上下文开销(system/tools)。与下一行「上游实收 prompt」同口径,可直接相减": "= baseline + the actual system/tools overhead of this request. Same basis as the upstream prompt below, so they can be subtracted directly.",
+      "= LLM input + cache_read。含从不被压缩的 system/tools,与上一行同口径;不要直接和 baseline 相减": "= LLM input + cache_read, including system/tools that are never compressed. Same basis as the row above; do not subtract it from baseline directly.",
+      "不压缩时 prompt − 上游实收 prompt。这是与成本一致的总节省口径": "Prompt without compression minus the actual upstream prompt. This is the total saving that matches the billed cost.",
       "上一页": "Previous page",
       "下一页": "Next page",
       "全部状态": "All statuses",
