@@ -1254,3 +1254,34 @@ test("默认 minNewMessages = 200(降低重摘频率,减少摘要改写导致的
   const explicit = readProactiveCompactSettingsFromConfig({ proactiveCompactMinNewMessages: 100 });
   assert.equal(explicit.minNewMessages, 100);
 });
+
+test("minNewMessages=200 边界: 追加 150 条仍复用, 满 200 条才重生成", async () => {
+  // 审计用:验证阈值语义本身,而不只是默认值常量。
+  //   150 < 200 → 必须发生 source=cache 复用且零摘要调用;
+  //   210 ≥ 200 → 允许重生成,必须新增一次摘要调用。
+  resetCacheIndex();
+  const base = cacheStableBody(0);
+  const append = (n) => {
+    const out = JSON.parse(JSON.stringify(base));
+    for (let i = 0; i < n; i += 1) {
+      out.push({ content: `extra-${i}`, role: i % 2 === 0 ? "assistant" : "user" });
+    }
+    return out;
+  };
+  await withMockFetch(() => openAiSummaryResponse("THRESHOLD HANDOFF"), async (calls) => {
+    const a = await compactWith(JSON.parse(JSON.stringify(base)), "sess-threshold-200", { minNewMessages: 200 });
+    assert.ok(a, "首轮应折叠并生成摘要");
+    assert.equal(a.source, "model");
+    assert.equal(calls.length, 1);
+
+    const b = await compactWith(append(150), "sess-threshold-200", { minNewMessages: 200 });
+    assert.ok(b, "追加 150 条后仍应压缩");
+    assert.equal(b.source, "cache", "追加 150 < 200 必须复用摘要");
+    assert.equal(calls.length, 1, "未达阈值不得发起新的摘要调用");
+
+    const c = await compactWith(append(210), "sess-threshold-200", { minNewMessages: 200 });
+    assert.ok(c, "追加 210 条后仍应压缩");
+    assert.ok(c.source === "model" || c.source === "incremental", "达到阈值应允许重生成摘要");
+    assert.equal(calls.length, 2, "达到阈值应新增一次摘要调用");
+  });
+});
