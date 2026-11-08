@@ -12,6 +12,7 @@ import path from "node:path";
 import test, { before, after } from "node:test";
 import {
   applyHelixProactiveCompact,
+  buildSummaryPrompt,
   foldBoundary,
   isUsableSummaryResponse,
   leadingSystemMessageCount,
@@ -979,8 +980,8 @@ test("leadingSystemMessageCount: 只统计头部连续 system", () => {
   assert.equal(leadingSystemMessageCount([{ content: "q", role: "user" }]), 0);
 });
 
-test("planCompactFold: 激进模式按预算继续整轮折叠", () => {
-  // 4 个人类轮,每轮 ~1 个大 assistant 消息;keepRecentTurns=2 的基线只保留后 2 轮。
+test("planCompactFold: 激进模式按预算尽可能多保留整轮", () => {
+  // 4 个人类轮,每轮 ~2k token;预算 3000 → 只能保留最后 2 轮。
   const messages = [];
   for (let t = 0; t < 4; t += 1) {
     messages.push({ content: `q${t}`, role: "user" });
@@ -989,12 +990,54 @@ test("planCompactFold: 激进模式按预算继续整轮折叠", () => {
   }
   const base = planCompactFold(messages, 2, 100000, false);
   assert.ok(base);
-  assert.equal(base.folded.length, 8, "4 条/轮 × 前 2 轮");
+  assert.equal(base.folded.length, 8, "非激进:固定保留最后 2 轮");
   const aggressive = planCompactFold(messages, 2, 3000, true);
   assert.ok(aggressive);
-  assert.ok(aggressive.folded.length > base.folded.length, "预算不足时应折叠更多整轮");
-  assert.equal(aggressive.usedIntraTurn, false, "整轮折叠足够时不应进入保留区");
-  assert.equal(aggressive.folded.length, 12, "压到只剩最后 1 轮");
+  // 预算只够「最后一轮的起点 + 倒数第二轮尾部的一个完整 tool 交换对」→ 轮内部分保留。
+  assert.equal(aggressive.folded.length, 9, "预算只够保留尾部约 3k token");
+  assert.equal(aggressive.usedIntraTurn, true);
+  assert.equal(aggressive.kept[0].content, "q2", "保留区从人类轮起点开始");
+  assert.match(JSON.stringify(aggressive.kept), /t3/, "最近一轮保留");
+});
+
+test("planCompactFold: 预算充足时保留比 keepRecentTurns 更多的轮次", () => {
+  // 头部一条可折的旧 assistant + 4 个小轮(每轮 ~700 token);预算 3000 足够容纳全部 4 轮。
+  const messages = [{ content: "y".repeat(5000), role: "assistant" }];
+  for (let t = 0; t < 4; t += 1) {
+    messages.push({ content: `q${t}`, role: "user" });
+    messages.push({ content: `a${t} ` + "x".repeat(2000), role: "assistant" });
+  }
+  const base = planCompactFold(messages, 2, 100000, false);
+  assert.ok(base);
+  assert.equal(base.kept.length, 4, "非激进:只保留最后 2 轮");
+  const filled = planCompactFold(messages, 2, 3000, true);
+  assert.ok(filled);
+  assert.equal(filled.kept.length, 8, "激进:预算内应保留全部 4 轮");
+  assert.equal(filled.kept[0].content, "q0");
+  assert.equal(filled.folded.length, 1, "只折掉头部那条旧消息");
+});
+
+test("planCompactFold: 单轮超预算时保留轮起点 + 尾部能装下的交换对", () => {
+  const pair = (id, size) => [
+    { content: [{ id, input: {}, name: "Read", type: "tool_use" }], role: "assistant" },
+    { content: [{ content: `${id} ` + "x".repeat(size), tool_use_id: id, type: "tool_result" }], role: "user" }
+  ];
+  const messages = [
+    { content: "task0", role: "user" },
+    { content: "T2 task", role: "user" },
+    ...Array.from({ length: 10 }, (_, i) => pair(`p${i}`, 4000)).flat(),
+    { content: "T3 task", role: "user" },
+    { content: "a3", role: "assistant" }
+  ];
+  const plan = planCompactFold(messages, 2, 4000, true);
+  assert.ok(plan);
+  // 保留区必须以人类轮起点开始
+  assert.equal(plan.kept[0].content, "T2 task");
+  const keptText = JSON.stringify(plan.kept);
+  assert.ok(!keptText.includes('"p0"'), "最早的大输出应被折叠");
+  assert.match(keptText, /"p9"/, "最近的输出应保留");
+  assert.ok(plan.usedIntraTurn, "轮内部分保留 → folded 不是纯前缀");
+  assert.ok(plan.folded.length > 0);
 });
 
 test("planCompactFold: 保留区内只丢完整 tool 交换对,绝不拆对", () => {
@@ -1070,27 +1113,31 @@ test("门槛: minFoldedTokens 达标时正常折叠", async () => {
   });
 });
 
-test("planCompactFold: tool_call 与结果不配对时绝不丢弃该交换对(防孤儿 tool_use)", () => {
+test("planCompactFold: kept 侧绝不出现孤儿 tool_result / 半截交换对", () => {
   const openAiCall = (id) => ({ function: { arguments: "{}", name: "Bash" }, id, type: "function" });
   const messages = [
     { content: "task", role: "user" },
     { content: "", role: "assistant", tool_calls: [openAiCall("a")] },
     { content: "y".repeat(6000), role: "tool", tool_call_id: "a" },
     { content: "next", role: "user" },
-    // assistant 声明 b、c 两个调用,却只有一个结果 → 整对不可丢
+    // 数据形状异常:assistant 声明 b、c,只有一个结果
     { content: "", role: "assistant", tool_calls: [openAiCall("b"), openAiCall("c")] },
     { content: "y".repeat(6000), role: "tool", tool_call_id: "b" },
     { content: "", role: "assistant", tool_calls: [openAiCall("d")] },
     { content: "y".repeat(6000), role: "tool", tool_call_id: "d" }
   ];
   const plan = planCompactFold(messages, 2, 100, true);
-  assert.ok(plan, "合法的第一个交换对应被丢弃");
-  const keptText = JSON.stringify(plan.kept);
-  assert.match(keptText, /"id":"c"/, "不配对单元的 tool_call 必须保留");
-  assert.match(keptText, /"id":"b"/, "不配对单元的 tool_call 必须保留");
-  assert.match(keptText, /"tool_call_id":"b"/, "不配对单元的结果必须保留");
-  const foldedText = JSON.stringify(plan.folded);
-  assert.doesNotMatch(foldedText, /"id":"c"/, "不配对单元不得进入 folded");
+  assert.ok(plan);
+
+  // 真正的安全不变量:kept 侧每个 tool_call 都有结果、每个结果都有对应调用。
+  const uses = new Set();
+  const results = new Set();
+  for (const message of plan.kept) {
+    for (const call of message.tool_calls ?? []) uses.add(call.id);
+    if (message.role === "tool" && message.tool_call_id) results.add(message.tool_call_id);
+  }
+  assert.deepEqual([...uses].sort(), [...results].sort(), "kept 侧必须成对");
+  assert.equal(plan.kept[0].role, "user", "保留区第一条必须是 user 轮起点");
 });
 
 // ============= 2026-11-08 缓存稳定:摘要复用必须让 body 保持纯前缀扩展 =============
@@ -1185,4 +1232,16 @@ test("缓存稳定: 复用会让 body 超过 2× 预算时宁可重生成", asyn
     assert.ok(b, "仍应输出折叠后的 body");
     assert.equal(calls.length, 2, "复用会超过 2× 预算 → 必须重生成摘要");
   });
+});
+
+test("buildSummaryPrompt: transcript 超限时保留尾部(最近折叠内容)", () => {
+  const delta = [];
+  for (let i = 0; i < 12; i += 1) {
+    delta.push({ content: `MSG_${i}_` + "x".repeat(30000), role: i % 2 === 0 ? "user" : "assistant" });
+  }
+  const prompt = buildSummaryPrompt(undefined, delta);
+  assert.match(prompt, /older messages omitted/, "应有截断标记");
+  assert.ok(prompt.includes("MSG_11_"), "最新消息必须保留");
+  assert.ok(!prompt.includes("MSG_0_"), "最旧消息应被省略");
+  assert.ok(prompt.length < 204000, `prompt 总长必须受控,实际 ${prompt.length}`);
 });

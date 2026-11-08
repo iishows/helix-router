@@ -333,15 +333,21 @@ type CompactFoldPlan = {
 };
 
 /**
- * 计算折叠计划(2026-11-08 重写):
- *   1. 基线 = 保留最近 keepRecentTurns 个「新用户轮」;
- *   2. aggressive 时,若仍超预算,继续整轮向前折叠(保留轮数逐轮减到 1);
- *   3. 仍超预算 → 在保留区内从旧到新丢弃「完整 tool 交换对」
- *      (assistant tool_use + 其后纯 tool_result 消息),绝不拆半个 tool 对,
- *      且绝不丢弃最后一条交换对/最后一条消息。
+ * 计算折叠计划(2026-11-08 二次重写:尾部填满预算)。
  *
- * 之所以需要 3:agent 长循环里单个用户轮就能占满整个上下文(实测一轮 202k/224k token),
- * 只按「人类轮」切点永远压不进预算。
+ * 旧策略按「人类轮」整轮丢弃:上一轮装不进预算就整轮扔掉,实测把 259k 折成 2.8k,
+ * 只剩最后 3 条消息 —— 上下文损失巨大,而多保留的 token 几乎都命中缓存(2% 价)。
+ *
+ * 新策略:
+ *   1. 非 aggressive = 旧行为(保留最近 keepRecentTurns 轮,只折更早历史);
+ *   2. aggressive = 从尾部按 token 填预算:选**最早**一个「新用户轮起点」,
+ *      使 [起点, 末尾] 的 token ≤ budget(尽可能多保留上下文);
+ *   3. 若连最后一轮都装不下,则保留该轮起点 + 尾部尽可能多的完整后缀
+ *      (切点只落在 assistant 消息上 → 不会产生孤儿 tool_result / 半截 tool 对),
+ *      中间段一并折叠。
+ *
+ * 协议约束:保留区第一条必须是「无 tool_result 的 user 消息」(轮起点),因此切点
+ * 只能是轮起点或 assistant 消息;绝不从 tool_result 消息开始保留。
  */
 export function planCompactFold(
   conversation: unknown[],
@@ -359,68 +365,144 @@ export function planCompactFold(
   if (starts.length === 0 || (!aggressive && starts.length < turns)) {
     return undefined;
   }
-  // 非激进模式:必须保留 keepRecentTurns 个完整轮,且只有更早历史可折(旧行为)。
-  // 激进模式:人类轮可能不足(agent 单轮循环),允许 boundary=0 / 轮数不足,
-  //   之后交给预算驱动的整轮折叠与保留区内交换对折叠。
-  const keepCount = aggressive ? Math.min(turns, starts.length) : turns;
-  let boundary = starts[starts.length - keepCount];
-  if (!aggressive && !(boundary > 0)) {
-    return undefined;
+
+  if (!aggressive) {
+    const boundary = starts[starts.length - turns];
+    if (!(boundary > 0)) {
+      return undefined;
+    }
+    return buildPrefixPlan(conversation, boundary);
   }
 
-  if (aggressive && budget > 0) {
-    // 整轮追加折叠:保留轮数逐轮减少,直到压进预算或只剩最后一轮。
-    let keptTokens = tokenize(conversation.slice(boundary));
-    for (let keep = keepCount - 1; keep >= 1 && keptTokens > budget; keep -= 1) {
-      const index = starts[starts.length - keep];
-      if (!(index > boundary)) {
+  const messageTokens = conversation.map((message) => tokenize([message]));
+  const suffixTokens = new Array<number>(conversation.length + 1).fill(0);
+  for (let i = conversation.length - 1; i >= 0; i -= 1) {
+    suffixTokens[i] = suffixTokens[i + 1] + (messageTokens[i] ?? 0);
+  }
+
+  if (budget <= 0) {
+    // 受保护 system 已超预算:退回旧的「保留最近 N 轮」,不做预算填充。
+    return buildPrefixPlan(conversation, starts[starts.length - Math.min(turns, starts.length)]);
+  }
+
+  // 在「每个人类轮起点」上尝试:整轮保留(suffix ≤ budget),或保留该轮起点消息 +
+  // 轮内某个 assistant 之后的后缀(不跨过下一个轮起点,保证上下文连续)。
+  // 取 kept token 最大的方案(≤budget 优先),从而把预算填满、保留最多最近上下文。
+  let bestFit: PartialTurnPlan | undefined;
+  let bestFallback: PartialTurnPlan | undefined;
+  for (let index = 0; index < starts.length; index += 1) {
+    const start = starts[index];
+    const startTokens = messageTokens[start] ?? 0;
+    const nextStart = index + 1 < starts.length ? starts[index + 1] : conversation.length;
+    const candidate = (cut: number): PartialTurnPlan => ({
+      cut,
+      keptTokens: cut === start ? suffixTokens[start] : startTokens + suffixTokens[cut],
+      start
+    });
+    const consider = (plan: PartialTurnPlan) => {
+      if (plan.start === 0 && plan.cut === plan.start) {
+        return; // 无任何可折内容(整段都保留)
+      }
+      if (plan.keptTokens <= budget) {
+        if (!bestFit || plan.keptTokens > bestFit.keptTokens) {
+          bestFit = plan;
+        }
+      } else if (!bestFallback || plan.keptTokens < bestFallback.keptTokens) {
+        // 预算太小、没有合法方案时,选择「保留最少」的方案(丢得最多,协议仍合法)。
+        bestFallback = plan;
+      }
+    };
+
+    if (suffixTokens[start] <= budget) {
+      consider(candidate(start));
+      continue;
+    }
+    // 该轮本身装不下:轮起点必须保留;在轮内找最早的 assistant 切点使总量 ≤ budget。
+    let found: PartialTurnPlan | undefined;
+    for (let cut = start + 1; cut < nextStart; cut += 1) {
+      if (!isSafeKeptStart(conversation[cut])) {
         continue;
       }
-      boundary = index;
-      keptTokens = tokenize(conversation.slice(boundary));
-    }
-  }
-
-  const dropped = new Set<number>();
-  for (let i = 0; i < boundary; i += 1) {
-    dropped.add(i);
-  }
-
-  let usedIntraTurn = false;
-  if (aggressive && budget > 0 && tokenize(conversation.slice(boundary)) > budget) {
-    // 保留区内折叠:逐条扣减 token,避免每丢一个单元都重新 tokenize 整个会话。
-    const perMessageTokens = conversation.map((message) => tokenize([message]));
-    let keptTokens = 0;
-    for (let i = boundary; i < conversation.length; i += 1) {
-      keptTokens += perMessageTokens[i] ?? 0;
-    }
-    let cursor = boundary;
-    while (keptTokens > budget) {
-      const unit = findDroppableExchangeUnit(conversation, cursor);
-      if (!unit || unit.end >= conversation.length - 1) {
+      const plan = candidate(cut);
+      if (plan.keptTokens <= budget) {
+        found = plan;
         break;
       }
-      for (let i = unit.start; i <= unit.end; i += 1) {
-        dropped.add(i);
-        keptTokens -= perMessageTokens[i] ?? 0;
+    }
+    if (!found) {
+      // 最小可行:保留轮起点 + 轮内最新的 assistant 后缀(可能略超预算)。
+      for (let cut = nextStart - 1; cut > start; cut -= 1) {
+        if (isSafeKeptStart(conversation[cut])) {
+          found = candidate(cut);
+          break;
+        }
       }
-      usedIntraTurn = true;
-      cursor = unit.end + 1;
+    }
+    if (found) {
+      consider(found);
     }
   }
 
-  if (dropped.size === 0) {
+  const best = bestFit ?? bestFallback;
+  if (!best) {
     return undefined;
   }
-  const folded: unknown[] = [];
-  const kept: unknown[] = [];
-  for (let i = 0; i < conversation.length; i += 1) {
-    (dropped.has(i) ? folded : kept).push(conversation[i]);
+  if (best.cut === best.start) {
+    return buildPrefixPlan(conversation, best.start);
   }
+  return buildPartialTurnPlan(conversation, best.start, best.cut);
+}
+
+type PartialTurnPlan = { start: number; cut: number; keptTokens: number };
+
+function buildPrefixPlan(conversation: unknown[], boundary: number): CompactFoldPlan | undefined {
+  if (!(boundary > 0) || boundary >= conversation.length) {
+    return undefined;
+  }
+  const folded = conversation.slice(0, boundary);
+  const kept = conversation.slice(boundary);
   if (folded.length === 0 || kept.length === 0) {
     return undefined;
   }
-  return { folded, kept, usedIntraTurn };
+  return { folded, kept, usedIntraTurn: false };
+}
+
+/**
+ * 最后一轮自身超预算:保留轮起点消息 + 从某个 assistant 消息开始的后缀。
+ * kept = [turnStart, ...conversation[cut..]],folded = 前缀 + (turnStart, cut) 中间段。
+ */
+function buildPartialTurnPlan(
+  conversation: unknown[],
+  turnStart: number,
+  cut: number
+): CompactFoldPlan | undefined {
+  if (!(cut > turnStart) || cut >= conversation.length) {
+    return undefined;
+  }
+  if (cut === turnStart + 1) {
+    // 没有中间段可丢 → 等价于前缀折叠。
+    return buildPrefixPlan(conversation, turnStart);
+  }
+  const folded: unknown[] = [];
+  for (let i = 0; i < turnStart; i += 1) {
+    folded.push(conversation[i]);
+  }
+  for (let i = turnStart + 1; i < cut; i += 1) {
+    folded.push(conversation[i]);
+  }
+  const kept = [conversation[turnStart], ...conversation.slice(cut)];
+  if (folded.length === 0 || kept.length === 0) {
+    return undefined;
+  }
+  return { folded, kept, usedIntraTurn: true };
+}
+
+/**
+ * 保留区切点:只能是 assistant 消息(其 tool_result 必然紧随其后、一起保留)
+ * 或轮起点(单独处理)。绝不能从 user/tool_result 消息开始,否则会产生孤儿 tool_result。
+ */
+function isSafeKeptStart(message: unknown): boolean {
+  return isRecord(message) && message.role === "assistant";
 }
 
 /**
@@ -473,90 +555,6 @@ function reconstructDroppedSet(
   return { folded, kept, usedIntraTurn: dropped.size !== prefix };
 }
 
-type ExchangeUnit = { start: number; end: number };
-
-/** 在 [from, len) 里找最早的「完整 tool 交换对」:assistant(tool_use) + 其后纯 tool_result 消息。 */
-function findDroppableExchangeUnit(messages: unknown[], from: number): ExchangeUnit | undefined {
-  for (let i = Math.max(1, from); i < messages.length - 1; i += 1) {
-    if (!isAssistantToolUseMessage(messages[i])) {
-      continue;
-    }
-    const end = pureToolResultEnd(messages, i + 1);
-    if (end < 0 || !exchangeUnitIdsConsistent(messages, i, end)) {
-      continue;
-    }
-    return { start: i, end };
-  }
-  return undefined;
-}
-
-/**
- * 只在「assistant 的每个 tool_use/tool_call 都能在本单元的结果消息里找到配对」时才允许丢弃。
- * 防止上游/客户端数据形状异常时丢出孤儿 tool_use(会让下一次请求 400)。
- */
-function exchangeUnitIdsConsistent(messages: unknown[], start: number, end: number): boolean {
-  const assistant = messages[start];
-  if (!isRecord(assistant)) {
-    return false;
-  }
-  const uses = new Set<string>();
-  const toolCalls = (assistant as { tool_calls?: unknown }).tool_calls;
-  if (Array.isArray(toolCalls)) {
-    for (const call of toolCalls) {
-      const id = isRecord(call) && typeof call.id === "string" ? call.id : "";
-      if (id) {
-        uses.add(id);
-      }
-    }
-  }
-  if (Array.isArray(assistant.content)) {
-    for (const block of assistant.content) {
-      if (isRecord(block) && block.type === "tool_use" && typeof block.id === "string" && block.id) {
-        uses.add(block.id);
-      }
-    }
-  }
-  const results = new Set<string>();
-  for (let i = start + 1; i <= end; i += 1) {
-    const message = messages[i];
-    if (!isRecord(message)) {
-      return false;
-    }
-    if (message.role === "tool" && typeof message.tool_call_id === "string" && message.tool_call_id) {
-      results.add(message.tool_call_id);
-    }
-    if (Array.isArray(message.content)) {
-      for (const block of message.content) {
-        if (isRecord(block) && block.type === "tool_result" &&
-            typeof block.tool_use_id === "string" && block.tool_use_id) {
-          results.add(block.tool_use_id);
-        }
-      }
-    }
-  }
-  if (uses.size === 0 || results.size !== uses.size) {
-    return false;
-  }
-  for (const id of uses) {
-    if (!results.has(id)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function isAssistantToolUseMessage(message: unknown): boolean {
-  if (!isRecord(message) || message.role !== "assistant") {
-    return false;
-  }
-  if (Array.isArray((message as { tool_calls?: unknown }).tool_calls) &&
-      ((message as { tool_calls?: unknown[] }).tool_calls?.length ?? 0) > 0) {
-    return true;
-  }
-  const content = message.content;
-  return Array.isArray(content) && content.some((block) => isRecord(block) && block.type === "tool_use");
-}
-
 /** 纯 tool_result 消息(OpenAI: role=tool;Anthropic: user + 全部块都是 tool_result)。 */
 function isPureToolResultMessage(message: unknown): boolean {
   if (!isRecord(message)) {
@@ -569,17 +567,6 @@ function isPureToolResultMessage(message: unknown): boolean {
     return false;
   }
   return message.content.every((block) => isRecord(block) && block.type === "tool_result");
-}
-
-function pureToolResultEnd(messages: unknown[], from: number): number {
-  let end = -1;
-  for (let i = from; i < messages.length; i += 1) {
-    if (!isPureToolResultMessage(messages[i])) {
-      break;
-    }
-    end = i;
-  }
-  return end;
 }
 
 // ============= 组装 =============
@@ -1119,21 +1106,37 @@ function tokenize(messages: unknown[]): number {
 }
 
 function transcriptOf(messages: unknown[]): string {
+  // 2026-11-08: 超长时保留**尾部**(折叠内容里最近的部分),而不是头部。
+  // 旧实现从第 0 条开始累计,超过上限就停 —— 折叠 1774 条时摘要只能看到很早的历史,
+  // 最近被折叠的内容(通常才是交接最需要的)反而被截掉。
   const lines: string[] = [];
   let total = 0;
-  for (let i = 0; i < messages.length; i += 1) {
+  let truncatedFrom = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i];
     const role = isRecord(message) && typeof message.role === "string" ? message.role : "user";
     const text = stringifyContent(isRecord(message) ? message.content : message);
     const entry = `## [${i}] ${role}\n${text}`;
     if (total + entry.length > MAX_SUMMARY_TRANSCRIPT_CHARS) {
-      lines.push(`## [${i}] ... (transcript truncated at ${MAX_SUMMARY_TRANSCRIPT_CHARS} chars)`);
+      if (lines.length === 0) {
+        // 单条最新消息就超限:截断它本身,保证摘要至少能看到最近内容。
+        const budget = Math.max(0, MAX_SUMMARY_TRANSCRIPT_CHARS - 200);
+        lines.push(`## [${i}] ${role}\n${text.slice(0, budget)}\n... (message truncated at ${budget} chars)`);
+      } else {
+        truncatedFrom = i;
+      }
       break;
     }
     total += entry.length;
     lines.push(entry);
   }
-  return lines.join("\n\n");
+  const ordered = lines.reverse();
+  if (truncatedFrom >= 0) {
+    ordered.unshift(
+      `## [0..${truncatedFrom}] ... (${truncatedFrom + 1} older messages omitted; transcript capped at ${MAX_SUMMARY_TRANSCRIPT_CHARS} chars, most recent kept)`
+    );
+  }
+  return ordered.join("\n\n");
 }
 
 function stringifyContent(content: unknown): string {
