@@ -477,3 +477,31 @@ test("HISTORY_RECALL_INSTRUCTION 含明确触发词 + 反例", () => {
   // 召回时的 with_media 决策
   assert.ok(text.includes("with_media"), "应提示 with_media 用途");
 });
+
+test("buildHistoryRecallIndex: 按原消息位置排序并截断(缓存前缀稳定)", () => {
+  const map = {};
+  // 插入顺序故意与位置顺序相反:模拟“先压后段、后压前段”
+  map.ffffffffffffffff = { blockOnly: true, kind: "tool_result", msgIdx: 60, q: "late output" };
+  map.aaaaaaaaaaaaaaaa = { blockOnly: true, kind: "tool_result", msgIdx: 10, q: "early output" };
+  map.bbbbbbbbbbbbbbbb = { blockOnly: true, kind: "tool_result", msgIdx: 30, q: "middle output" };
+  const index = buildHistoryRecallIndex(map);
+  const order = [...index.matchAll(/`([0-9a-f]{16})`/g)].map((m) => m[1]);
+  assert.deepEqual(order, ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "ffffffffffffffff"]);
+});
+
+test("hasQAPlaceholder: 识别 Anthropic tool_result.content 里的占位符(回归)", () => {
+  // 真实形态:占位符在 tool_result 的 content 字段,而不是 block.text
+  assert.equal(hasQAPlaceholder([
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "⟦QA:0123456789abcdef⟧" }] }
+  ]), true);
+  // content 为块数组
+  assert.equal(hasQAPlaceholder([
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: "⟦QA:0123456789abcdef⟧" }] }] }
+  ]), true);
+  // OpenAI role:tool 字符串
+  assert.equal(hasQAPlaceholder([{ role: "tool", content: "⟦QA:0123456789abcdef⟧" }]), true);
+  // 纯文本块
+  assert.equal(hasQAPlaceholder([{ role: "assistant", content: [{ type: "text", text: "⟦QA:0123456789abcdef⟧" }] }]), true);
+  // 无占位符
+  assert.equal(hasQAPlaceholder([{ role: "user", content: [{ type: "tool_result", content: "plain output" }] }]), false);
+});

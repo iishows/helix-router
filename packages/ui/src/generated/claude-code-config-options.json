@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-28T14:58:37.003Z",
+  "generatedAt": "2026-11-08T11:36:16.298Z",
   "generatedBy": "scripts/generate-claude-code-config-options.mjs",
   "sourceUrls": {
     "envEn": "https://code.claude.com/docs/en/env-vars.md",
@@ -52,8 +52,8 @@
       "valueKind": "boolean",
       "enumValues": [],
       "description": {
-        "en": "Allow Claude to send a push notification to your phone when it decides one is worth sending, for example when a long task finishes. Claude can send one while Remote Control is connected. Appears in /config as Push when Claude decides. When you change it there, Claude Code also saves the value to your account.",
-        "zh": "Allow Claude to send a push notification to your phone when it decides one is worth sending, for example when a long task finishes. Claude can send one while Remote Control is connected. Appears in /config as Push when Claude decides. When you change it there, Claude Code also saves the value to your account."
+        "en": "Allow Claude to send a push notification to your phone when it decides one is worth sending, for example when a long task finishes. In a local session, Claude can send one while Remote Control is connected. Appears in /config as Push when Claude decides. When you change it there, Claude Code also saves the value to your account.",
+        "zh": "Allow Claude to send a push notification to your phone when it decides one is worth sending, for example when a long task finishes. In a local session, Claude can send one while Remote Control is connected. Appears in /config as Push when Claude decides. When you change it there, Claude Code also saves the value to your account."
       }
     },
     {
@@ -658,7 +658,7 @@
       ],
       "scope": "Managed",
       "type": "Boolean",
-      "default": "unset; channels are blocked on Team and Enterprise plans and on Console accounts with managed settings, and allowed on Pro and Max plans and on Console accounts without managed settings",
+      "default": "unset; channels are blocked on Team and Enterprise plans and on Console accounts with managed settings, and allowed on Pro, Max, and Ultra plans and on Console accounts without managed settings",
       "example": "{\n  \"channelsEnabled\": true\n}",
       "valueKind": "boolean",
       "enumValues": [],
@@ -974,8 +974,8 @@
       "valueKind": "string",
       "enumValues": [],
       "description": {
-        "en": "Stop Claude Code from registering the claude-cli:// protocol handler with the operating system, which it otherwise does after you send the first prompt of an interactive session. Deep links let external tools open a Claude Code session with a pre-filled prompt. Set this in environments where protocol handler registration is restricted or managed separately.",
-        "zh": "Stop Claude Code from registering the claude-cli:// protocol handler with the operating system, which it otherwise does after you send the first prompt of an interactive session. Deep links let external tools open a Claude Code session with a pre-filled prompt. Set this in environments where protocol handler registration is restricted or managed separately."
+        "en": "Stop Claude Code from registering the claude-cli:// protocol handler with the operating system. Deep links let external tools open a Claude Code session with a pre-filled prompt. Set this in environments where protocol handler registration is restricted or managed separately.",
+        "zh": "Stop Claude Code from registering the claude-cli:// protocol handler with the operating system. Deep links let external tools open a Claude Code session with a pre-filled prompt. Set this in environments where protocol handler registration is restricted or managed separately."
       }
     },
     {
@@ -1286,8 +1286,8 @@
       "valueKind": "boolean",
       "enumValues": [],
       "description": {
-        "en": "Turn fast mode on for sessions where it's available, for interactive work like rapid iteration or live debugging where you want speed at a higher cost per token. You don't usually edit this key by hand: running /fast writes fastMode: true to ~/.claude/settings.json, and running it again to turn fast mode off removes the key. Fast mode runs only on Opus 5.5, Opus 5, and Opus 4.8: turning it on from another model switches you to Opus, and switching to an unsupported model turns it off. See Switch models while fast mode is on.",
-        "zh": "Turn fast mode on for sessions where it's available, for interactive work like rapid iteration or live debugging where you want speed at a higher cost per token. You don't usually edit this key by hand: running /fast writes fastMode: true to ~/.claude/settings.json, and running it again to turn fast mode off removes the key. Fast mode runs only on Opus 5.5, Opus 5, and Opus 4.8: turning it on from another model switches you to Opus, and switching to an unsupported model turns it off. See Switch models while fast mode is on."
+        "en": "Turn fast mode on for sessions where it's available, for interactive work such as rapid iteration or live debugging where you want speed at a higher cost per token. You don't usually edit this key yourself. Running /fast writes fastMode: true to ~/.claude/settings.json, and running it again to turn fast mode off removes the key.",
+        "zh": "Turn fast mode on for sessions where it's available, for interactive work such as rapid iteration or live debugging where you want speed at a higher cost per token. You don't usually edit this key yourself. Running /fast writes fastMode: true to ~/.claude/settings.json, and running it again to turn fast mode off removes the key."
       }
     },
     {
@@ -1302,8 +1302,8 @@
       "valueKind": "boolean",
       "enumValues": [],
       "description": {
-        "en": "Normally, running /fast saves fastMode to a person's user settings, so fast mode is on at the start of every later session. Set this key to true to stop that: a saved fastMode: true no longer turns fast mode on at session start, and each person has to run /fast in each session they want it. Claude Code leaves the fastMode key in their file, so turning this key off restores the old behavior.",
-        "zh": "Normally, running /fast saves fastMode to a person's user settings, so fast mode is on at the start of every later session. Set this key to true to stop that: a saved fastMode: true no longer turns fast mode on at session start, and each person has to run /fast in each session they want it. Claude Code leaves the fastMode key in their file, so turning this key off restores the old behavior."
+        "en": "Normally, running /fast saves fastMode to a person's user settings, so new sessions on a supported model start with fast mode on. Set this key to true to stop that: a saved fastMode: true no longer turns fast mode on at session start, and each person runs /fast in each session they want it. Claude Code leaves fastMode in their file, so turning this key off restores the old behavior.",
+        "zh": "Normally, running /fast saves fastMode to a person's user settings, so new sessions on a supported model start with fast mode on. Set this key to true to stop that: a saved fastMode: true no longer turns fast mode on at session start, and each person runs /fast in each session they want it. Claude Code leaves fastMode in their file, so turning this key off restores the old behavior."
       }
     },
     {
@@ -1422,8 +1422,8 @@
         "gateway"
       ],
       "description": {
-        "en": "Restrict which kind of account people can log in with. Set \"claudeai\" to allow only claude.ai accounts, \"console\" to allow only Claude Console accounts, or \"gateway\" to send people to a cloud gateway instead of a first-party login. Administrators set it in managed settings and pair it with forceLoginOrgUUID to keep developers' claude.ai logins inside one organization. If you set it to \"claudeai\" or \"console\" in any settings file, Claude Code also stops offering the keyless Console sign-in in the sessions that file applies to.",
-        "zh": "Restrict which kind of account people can log in with. Set \"claudeai\" to allow only claude.ai accounts, \"console\" to allow only Claude Console accounts, or \"gateway\" to send people to a cloud gateway instead of a first-party login. Administrators set it in managed settings and pair it with forceLoginOrgUUID to keep developers' claude.ai logins inside one organization. If you set it to \"claudeai\" or \"console\" in any settings file, Claude Code also stops offering the keyless Console sign-in in the sessions that file applies to."
+        "en": "Restrict which kind of account people can log in with. Set \"claudeai\" to allow only claude.ai accounts, \"console\" to allow only Claude Console accounts, or \"gateway\" to send people to a cloud gateway instead of a first-party login. Administrators set it in managed settings and pair it with forceLoginOrgUUID to keep developers' claude.ai logins inside one organization.",
+        "zh": "Restrict which kind of account people can log in with. Set \"claudeai\" to allow only claude.ai accounts, \"console\" to allow only Claude Console accounts, or \"gateway\" to send people to a cloud gateway instead of a first-party login. Administrators set it in managed settings and pair it with forceLoginOrgUUID to keep developers' claude.ai logins inside one organization."
       }
     },
     {
@@ -1431,7 +1431,7 @@
       "path": [
         "forceLoginOrgUUID"
       ],
-      "scope": "Any file. Only a managed source enforces the restriction; a single UUID in any other settings file pre-selects the organization during login without restricting it.",
+      "scope": "Any file. In a settings file that isn't a managed source, Claude Code doesn't check which organization a login belongs to, and a single UUID pre-selects the organization during login.",
       "type": "string, one UUID, or array of strings, several UUIDs",
       "default": "unset, so any organization can log in",
       "example": "{\n  \"forceLoginOrgUUID\": [\"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\", \"yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy\"]\n}",
@@ -1582,8 +1582,8 @@
       "valueKind": "boolean",
       "enumValues": [],
       "description": {
-        "en": "Get a push notification on your phone when a permission prompt or question is waiting for your input. Claude Code sends these only while Remote Control is connected. Appears in /config as Push when actions required.",
-        "zh": "Get a push notification on your phone when a permission prompt or question is waiting for your input. Claude Code sends these only while Remote Control is connected. Appears in /config as Push when actions required."
+        "en": "Get a push notification on your phone when a permission prompt or question is waiting for your input. In a local session, Claude Code sends these only while Remote Control is connected. Appears in /config as Push when actions required.",
+        "zh": "Get a push notification on your phone when a permission prompt or question is waiting for your input. In a local session, Claude Code sends these only while Remote Control is connected. Appears in /config as Push when actions required."
       }
     },
     {
@@ -1854,14 +1854,14 @@
         "permissions"
       ],
       "scope": "Any file",
-      "type": "object with allow, ask, deny, additionalDirectories, blockReadsOutsideWorkingDirectories, defaultMode, disableBypassPermissionsMode, and disableAutoMode",
+      "type": "object with allow, ask, deny, additionalDirectories, blockReadsOutsideWorkingDirectories, blockWritesOutsideWorkingDirectories, defaultMode, disableBypassPermissionsMode, and disableAutoMode",
       "default": "unset",
       "example": "{\n  \"permissions\": {\n    \"allow\": [\"Bash(npm run *)\"],\n    \"ask\": [\"Bash(git push *)\"],\n    \"deny\": [\"Read(./.env)\"],\n    \"defaultMode\": \"acceptEdits\"\n  }\n}",
       "valueKind": "object",
       "enumValues": [],
       "description": {
-        "en": "Control which tools Claude can use without asking, which ones always prompt, and which ones are blocked, and set the permission mode a session starts in. Every permissions.* key below nests under this object.",
-        "zh": "Control which tools Claude can use without asking, which ones always prompt, and which ones are blocked, and set the permission mode a session starts in. Every permissions.* key below nests under this object."
+        "en": "Control which tools Claude can use without asking, which ones prompt, and which ones are blocked. Also set the default permission mode for new sessions. Every permissions.* key below nests under this object.",
+        "zh": "Control which tools Claude can use without asking, which ones prompt, and which ones are blocked. Also set the default permission mode for new sessions. Every permissions.* key below nests under this object."
       }
     },
     {
@@ -1933,6 +1933,23 @@
       }
     },
     {
+      "key": "permissions.blockWritesOutsideWorkingDirectories",
+      "path": [
+        "permissions",
+        "blockWritesOutsideWorkingDirectories"
+      ],
+      "scope": "Any file. A true in any file the session loads applies, so a repository can turn the block on for itself but can't lift yours. In a cloud session, Claude Code might not apply the key, because the file tools run in a container that is itself the boundary.",
+      "type": "Boolean",
+      "default": "unset, so writes outside the working directories follow your permission mode. The block is also on while Claude Code can't read the permissions object in your managed settings.",
+      "example": "{\n  \"permissions\": {\n    \"blockWritesOutsideWorkingDirectories\": true\n  }\n}",
+      "valueKind": "boolean",
+      "enumValues": [],
+      "description": {
+        "en": "Make the Write, Edit, and NotebookEdit tools refuse paths outside your working directories in every permission mode, including bypassPermissions, apart from some of Claude Code's own files. The key doesn't limit shell commands, MCP tools, or the programs hooks run. To limit where shell commands write, turn on sandboxing. Requires Claude Code v2.1.314 or later.",
+        "zh": "Make the Write, Edit, and NotebookEdit tools refuse paths outside your working directories in every permission mode, including bypassPermissions, apart from some of Claude Code's own files. The key doesn't limit shell commands, MCP tools, or the programs hooks run. To limit where shell commands write, turn on sandboxing. Requires Claude Code v2.1.314 or later."
+      }
+    },
+    {
       "key": "permissions.defaultMode",
       "path": [
         "permissions",
@@ -1953,8 +1970,8 @@
         "manual"
       ],
       "description": {
-        "en": "Set the permission mode new sessions start in. When you leave it unset, sessions start in the built-in default for your surface.",
-        "zh": "Set the permission mode new sessions start in. When you leave it unset, sessions start in the built-in default for your surface."
+        "en": "Set the default permission mode for new sessions. When you leave it unset, the built-in default for your surface applies.",
+        "zh": "Set the default permission mode for new sessions. When you leave it unset, the built-in default for your surface applies."
       }
     },
     {
@@ -2634,8 +2651,8 @@
       "valueKind": "boolean",
       "enumValues": [],
       "description": {
-        "en": "Make Claude Code exit with an error at startup when sandbox.enabled is true but the sandbox can't start, because a dependency is missing or the platform is unsupported. Without this key, Claude Code runs commands unsandboxed. Managed deployments that require sandboxing as a security gate can use this setting.",
-        "zh": "Make Claude Code exit with an error at startup when sandbox.enabled is true but the sandbox can't start, because a dependency is missing or the platform is unsupported. Without this key, Claude Code runs commands unsandboxed. Managed deployments that require sandboxing as a security gate can use this setting."
+        "en": "Make Claude Code exit with an error at startup when sandbox.enabled is true but the sandbox can't start because the platform doesn't support it or the dependency check fails. Without this key, Claude Code runs commands unsandboxed. Managed deployments that require sandboxing as a security gate can use this setting.",
+        "zh": "Make Claude Code exit with an error at startup when sandbox.enabled is true but the sandbox can't start because the platform doesn't support it or the dependency check fails. Without this key, Claude Code runs commands unsandboxed. Managed deployments that require sandboxing as a security gate can use this setting."
       }
     },
     {
@@ -2865,8 +2882,8 @@
       "valueKind": "array",
       "enumValues": [],
       "description": {
-        "en": "List additional XPC and Mach service names the macOS sandbox may look up. Tools that communicate over XPC, such as the iOS Simulator or Playwright, need their services listed here.",
-        "zh": "List additional XPC and Mach service names the macOS sandbox may look up. Tools that communicate over XPC, such as the iOS Simulator or Playwright, need their services listed here."
+        "en": "List additional XPC and Mach service names the macOS sandbox may look up. Tools that communicate over XPC, such as the iOS Simulator or Playwright, need their services listed here. Sandboxed commands can reach outside the sandbox to each service that you list, and the sandbox doesn't confine what those services do for those commands.",
+        "zh": "List additional XPC and Mach service names the macOS sandbox may look up. Tools that communicate over XPC, such as the iOS Simulator or Playwright, need their services listed here. Sandboxed commands can reach outside the sandbox to each service that you list, and the sandbox doesn't confine what those services do for those commands."
       }
     },
     {
@@ -3283,14 +3300,14 @@
         "sshHostCommands"
       ],
       "scope": "User or managed. Only the desktop app reads this key. It reads managed entries from one managed settings file or MDM policy on the computer, and ignores the key in server-managed settings.",
-      "type": "array of objects, each with required id, name, and command and optional sshIdentityFile and startDirectory. Desktop starts command without a shell, so write it as a program and plain arguments.",
+      "type": "array of objects, each with required id, name, and command and optional sshIdentityFile and startDirectory. Desktop doesn't read command as shell syntax, so pipes and variables don't work: write it as a program and its arguments.",
       "default": "unset",
       "example": "{\n  \"sshHostCommands\": [\n    {\n      \"id\": \"devbox\",\n      \"name\": \"Dev box\",\n      \"command\": \"acme-dev create\"\n    }\n  ]\n}",
       "valueKind": "array",
       "enumValues": [],
       "description": {
-        "en": "Add SSH connections whose host comes from a command to the Desktop environment selector. When you create a connection or replace its host, Desktop runs the entry's command on your computer and connects to the host that the command prints. Requires Claude Desktop v3.6556.0 or later on macOS or Linux, signed in with a Claude account.",
-        "zh": "Add SSH connections whose host comes from a command to the Desktop environment selector. When you create a connection or replace its host, Desktop runs the entry's command on your computer and connects to the host that the command prints. Requires Claude Desktop v3.6556.0 or later on macOS or Linux, signed in with a Claude account."
+        "en": "Add SSH connections whose host comes from a command to the Desktop environment selector. When you create a connection or create another machine for it, Desktop runs the entry's command on your computer and connects to the host that the command prints.",
+        "zh": "Add SSH connections whose host comes from a command to the Desktop environment selector. When you create a connection or create another machine for it, Desktop runs the entry's command on your computer and connects to the host that the command prints."
       }
     },
     {

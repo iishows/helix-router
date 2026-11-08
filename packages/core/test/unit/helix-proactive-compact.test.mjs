@@ -14,7 +14,9 @@ import {
   applyHelixProactiveCompact,
   foldBoundary,
   isUsableSummaryResponse,
+  leadingSystemMessageCount,
   mergeSystemSummary,
+  planCompactFold,
   readProactiveCompactSettingsFromConfig,
   resolveCompactBudgetTokens,
   stripRecallPrefix
@@ -56,10 +58,13 @@ function testConfig(overrides = {}) {
 
 function settings(overrides = {}) {
   return {
+    // 旧用例断言的是「只按人类轮切点」的语义;激进折叠/最小收益门槛另有专门用例。
+    aggressiveFolding: false,
     cacheTtlMs: 3 * 24 * 60 * 60 * 1000,
     ceilingTokens: 120000,
     floorTokens: 48000,
     keepRecentTurns: 2,
+    minFoldedTokens: 0,
     minNewMessages: 0,
     model: "",
     percent: 0,
@@ -168,6 +173,8 @@ test("readProactiveCompactSettingsFromConfig: 缺省 + 覆盖", () => {
   const d = readProactiveCompactSettingsFromConfig(undefined);
   assert.equal(d.tokenBudget, 100000);
   assert.equal(d.keepRecentTurns, 2);
+  assert.equal(d.aggressiveFolding, true);
+  assert.equal(d.minFoldedTokens, 1024);
   assert.equal(d.timeoutMs, 60000);
   assert.equal(d.model, "");
   assert.equal(d.cacheTtlMs, 259200000);
@@ -691,16 +698,18 @@ test("积攒: 新增未达阈值 → 复用旧摘要 + 中间段留原文,零上
     const acc = await applyHelixProactiveCompact({
       body: { messages: grown, system: "sys" }, config: testConfig(), headers,
       model: "MiniMax-M3", postCompressionTokens: 999999,
-      settings: settings({ minNewMessages: 100 })
+      // 真实预算(不是测试默认的 10):复用受「2× 预算」上限约束。
+      settings: settings({ minNewMessages: 100, tokenBudget: 100000 })
     });
     assert.ok(acc);
-    assert.equal(acc.source, "accumulate");
-    assert.match(acc.diagnostic, /source=accumulate/);
-    assert.match(acc.diagnostic, /pending=2/);
+    // 2026-11-08: 复用路径改为「按旧摘要覆盖集合重建」,因此会精确命中缓存 key
+    //   (source=cache),不再走旧 accumulate 的 index 语义。
+    assert.equal(acc.source, "cache");
+    assert.match(acc.diagnostic, /source=cache/);
     assert.equal(calls.length, 0, "未达阈值不得再调上游");
-    // 复用旧摘要(matchedCount=6 之前) + 中间段 [6..boundary) 留原文
+    // 复用旧摘要(覆盖原 6 条) + 新增历史留原文
     assert.match(acc.requestBody.system, /FIRST HANDOFF/);
-    assert.equal(acc.requestBody.messages.length, grown.length - 6, "kept 从旧覆盖点(6)切起");
+    assert.equal(acc.requestBody.messages.length, grown.length - 6, "kept 从旧覆盖集合之后开始");
   });
 });
 
@@ -921,4 +930,259 @@ test("isUsableSummaryResponse: 只接受 JSON / SSE,拒绝 HTML 与非 JSON", ()
   assert.equal(isUsableSummaryResponse("<error>bad</error>", undefined), false);
   assert.equal(isUsableSummaryResponse("not json", "text/plain"), false);
   assert.equal(isUsableSummaryResponse("", "application/json"), false);
+});
+
+// ============= 2026-11-08 激进折叠 / 头部 system 保护 / 最小收益门槛 =============
+
+/** Anthropic 形态的完整 tool 交换对。 */
+function anthropicToolPair(id, outputChars) {
+  return [
+    { content: [{ input: { command: "echo hi" }, name: "Bash", type: "tool_use", id }], role: "assistant" },
+    { content: [{ content: "y".repeat(outputChars), tool_use_id: id, type: "tool_result" }], role: "user" }
+  ];
+}
+
+/** 真实生产形态:头部是压缩器插入的合成 system(recall 教学),后面才是人类轮。 */
+function agenticBody() {
+  return [
+    // helix compressor 往 messages 头部插入的合成 system 消息
+    { content: "<<HC_RECALL_INSTRUCTION_v2>> use ⟦QA:...⟧ placeholders", role: "system" },
+    { content: "task: wire the i18n copy", role: "user" },
+    ...Array.from({ length: 4 }, (_, i) => anthropicToolPair(`a${i}`, 6000)).flat(),
+    { content: "translate", role: "user" },
+    ...Array.from({ length: 4 }, (_, i) => anthropicToolPair(`b${i}`, 6000)).flat(),
+    { content: "only keep en/zh", role: "user" },
+    ...Array.from({ length: 4 }, (_, i) => anthropicToolPair(`c${i}`, 6000)).flat()
+  ];
+}
+
+function toolIds(messages) {
+  const uses = new Set();
+  const results = new Set();
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (block?.type === "tool_use") uses.add(block.id);
+      if (block?.type === "tool_result") results.add(block.tool_use_id);
+    }
+  }
+  return { results, uses };
+}
+
+test("leadingSystemMessageCount: 只统计头部连续 system", () => {
+  assert.equal(leadingSystemMessageCount([
+    { content: "s1", role: "system" },
+    { content: "s2", role: "system" },
+    { content: "q", role: "user" },
+    { content: "s3", role: "system" }
+  ]), 2);
+  assert.equal(leadingSystemMessageCount([{ content: "q", role: "user" }]), 0);
+});
+
+test("planCompactFold: 激进模式按预算继续整轮折叠", () => {
+  // 4 个人类轮,每轮 ~1 个大 assistant 消息;keepRecentTurns=2 的基线只保留后 2 轮。
+  const messages = [];
+  for (let t = 0; t < 4; t += 1) {
+    messages.push({ content: `q${t}`, role: "user" });
+    messages.push({ content: "x".repeat(4000), role: "assistant" });
+    messages.push(...anthropicToolPair(`t${t}`, 4000));
+  }
+  const base = planCompactFold(messages, 2, 100000, false);
+  assert.ok(base);
+  assert.equal(base.folded.length, 8, "4 条/轮 × 前 2 轮");
+  const aggressive = planCompactFold(messages, 2, 3000, true);
+  assert.ok(aggressive);
+  assert.ok(aggressive.folded.length > base.folded.length, "预算不足时应折叠更多整轮");
+  assert.equal(aggressive.usedIntraTurn, false, "整轮折叠足够时不应进入保留区");
+  assert.equal(aggressive.folded.length, 12, "压到只剩最后 1 轮");
+});
+
+test("planCompactFold: 保留区内只丢完整 tool 交换对,绝不拆对", () => {
+  const messages = [
+    { content: "task", role: "user" },
+    ...Array.from({ length: 6 }, (_, i) => anthropicToolPair(`k${i}`, 6000)).flat(),
+    { content: "next", role: "user" },
+    ...Array.from({ length: 4 }, (_, i) => anthropicToolPair(`n${i}`, 6000)).flat()
+  ];
+  const plan = planCompactFold(messages, 2, 500, true);
+  assert.ok(plan);
+  assert.equal(plan.usedIntraTurn, true);
+  const keptIds = toolIds(plan.kept);
+  assert.deepEqual([...keptIds.uses].sort(), [...keptIds.results].sort(), "kept 侧 tool_use/tool_result 必须成对");
+  const foldedIds = toolIds(plan.folded);
+  assert.deepEqual([...foldedIds.uses].sort(), [...foldedIds.results].sort(), "folded 侧也必须成对");
+  assert.notEqual(plan.kept.at(-1), undefined, "最后一条消息必须保留");
+});
+
+test("回归: 头部合成 system 消息绝不被折叠(生产事故 folded=1)", async () => {
+  resetCacheIndex();
+  const messages = agenticBody();
+  const protectedSystem = messages[0];
+  await withMockFetch(() => openAiSummaryResponse("AGENTIC HANDOFF"), async (calls) => {
+    const result = await applyHelixProactiveCompact({
+      body: { messages, system: "client system" },
+      config: testConfig(),
+      headers: { "x-session-id": "sess-agentic" },
+      model: "MiniMax-M3",
+      postCompressionTokens: 20000,
+      settings: settings({ aggressiveFolding: true, keepRecentTurns: 2, tokenBudget: 3000 })
+    });
+    assert.ok(result, "应折叠而不是只折 1 条 system 消息");
+    assert.ok(result.foldedCount > 1, `foldedCount 必须 > 1,实际 ${result.foldedCount}`);
+    assert.deepEqual(result.requestBody.messages[0], protectedSystem, "头部 system 必须原样保留");
+    assert.match(result.requestBody.system, /AGENTIC HANDOFF/);
+    assert.ok(result.tokensAfter < 20000, "折叠后 token 应显著下降");
+    const keptIds = toolIds(result.requestBody.messages);
+    assert.deepEqual([...keptIds.uses].sort(), [...keptIds.results].sort(), "输出侧不得有半个 tool 对");
+    assert.equal(calls.length, 1);
+  });
+});
+
+test("门槛: 折叠收益低于 minFoldedTokens → 不做(零 fetch)", async () => {
+  resetCacheIndex();
+  await withMockFetch(() => openAiSummaryResponse("SHOULD NOT BE USED"), async (calls) => {
+    const result = await applyHelixProactiveCompact({
+      body: { messages: multiTurnMessages() },
+      config: testConfig(),
+      headers: { "x-session-id": "sess-min-folded" },
+      model: "MiniMax-M3",
+      postCompressionTokens: 999999,
+      settings: settings({ minFoldedTokens: 100000 })
+    });
+    assert.equal(result, undefined);
+    assert.equal(calls.length, 0);
+  });
+});
+
+test("门槛: minFoldedTokens 达标时正常折叠", async () => {
+  resetCacheIndex();
+  await withMockFetch(() => openAiSummaryResponse("SMALL BUT ENOUGH"), async () => {
+    const result = await applyHelixProactiveCompact({
+      body: { messages: multiTurnMessages() },
+      config: testConfig(),
+      headers: { "x-session-id": "sess-min-folded-ok" },
+      model: "MiniMax-M3",
+      postCompressionTokens: 999999,
+      settings: settings({ minFoldedTokens: 1 })
+    });
+    assert.ok(result);
+    assert.match(result.requestBody.system, /SMALL BUT ENOUGH/);
+  });
+});
+
+test("planCompactFold: tool_call 与结果不配对时绝不丢弃该交换对(防孤儿 tool_use)", () => {
+  const openAiCall = (id) => ({ function: { arguments: "{}", name: "Bash" }, id, type: "function" });
+  const messages = [
+    { content: "task", role: "user" },
+    { content: "", role: "assistant", tool_calls: [openAiCall("a")] },
+    { content: "y".repeat(6000), role: "tool", tool_call_id: "a" },
+    { content: "next", role: "user" },
+    // assistant 声明 b、c 两个调用,却只有一个结果 → 整对不可丢
+    { content: "", role: "assistant", tool_calls: [openAiCall("b"), openAiCall("c")] },
+    { content: "y".repeat(6000), role: "tool", tool_call_id: "b" },
+    { content: "", role: "assistant", tool_calls: [openAiCall("d")] },
+    { content: "y".repeat(6000), role: "tool", tool_call_id: "d" }
+  ];
+  const plan = planCompactFold(messages, 2, 100, true);
+  assert.ok(plan, "合法的第一个交换对应被丢弃");
+  const keptText = JSON.stringify(plan.kept);
+  assert.match(keptText, /"id":"c"/, "不配对单元的 tool_call 必须保留");
+  assert.match(keptText, /"id":"b"/, "不配对单元的 tool_call 必须保留");
+  assert.match(keptText, /"tool_call_id":"b"/, "不配对单元的结果必须保留");
+  const foldedText = JSON.stringify(plan.folded);
+  assert.doesNotMatch(foldedText, /"id":"c"/, "不配对单元不得进入 folded");
+});
+
+// ============= 2026-11-08 缓存稳定:摘要复用必须让 body 保持纯前缀扩展 =============
+
+/** 长会话:固定内容,便于比较两轮 body 的前缀。 */
+function cacheStableBody(extraPairs = 0) {
+  const messages = [
+    { content: "task: wire i18n", role: "user" },
+    ...Array.from({ length: 4 }, (_, i) => anthropicToolPair(`s${i}`, 5000)).flat()
+  ];
+  if (extraPairs > 0) {
+    messages.push({ content: "next turn", role: "user" });
+    messages.push(...Array.from({ length: extraPairs }, (_, i) => anthropicToolPair(`x${i}`, 5000)).flat());
+  }
+  return messages;
+}
+
+function compactWith(messages, session, settingsOverrides = {}) {
+  return applyHelixProactiveCompact({
+    body: { messages, system: "client system" },
+    config: testConfig(),
+    headers: { "x-claude-code-session-id": session },
+    model: "MiniMax-M3",
+    postCompressionTokens: 100000,
+    settings: settings({
+      aggressiveFolding: true,
+      minFoldedTokens: 0,
+      minNewMessages: 100,
+      tokenBudget: 2500,
+      ...settingsOverrides
+    })
+  });
+}
+
+test("缓存稳定: 第二轮复用摘要,body 是首轮的纯前缀扩展(不打断上游缓存)", async () => {
+  resetCacheIndex();
+  const first = cacheStableBody(0);
+  const second = [...JSON.parse(JSON.stringify(first))];
+  second.push(...cacheStableBody(1).slice(first.length));
+  // 第二轮只追加了 1 个新用户轮 + 1 个 tool 对,新增待折内容远小于 minNewMessages
+
+  await withMockFetch(() => openAiSummaryResponse("STABLE HANDOFF"), async (calls) => {
+    const a = await compactWith(JSON.parse(JSON.stringify(first)), "sess-cache-stable");
+    assert.ok(a, "首轮应折叠并生成摘要");
+    assert.equal(calls.length, 1);
+    assert.equal(a.source, "model");
+
+    const b = await compactWith(second, "sess-cache-stable");
+    assert.ok(b, "第二轮应复用摘要并折叠");
+    assert.equal(calls.length, 1, "第二轮不得再发起摘要调用");
+    assert.equal(b.source, "cache");
+    assert.equal(b.requestBody.system, a.requestBody.system, "摘要文本必须逐字节不变");
+
+    const prefixLen = a.requestBody.messages.length;
+    assert.ok(b.requestBody.messages.length > prefixLen, "第二轮应在首轮 body 后追加消息");
+    assert.deepEqual(
+      b.requestBody.messages.slice(0, prefixLen),
+      a.requestBody.messages,
+      "第二轮 messages 必须以首轮 messages 为逐字节前缀(上游 prompt 缓存可整段复用)"
+    );
+  });
+});
+
+test("缓存稳定: 新增待折内容达到 minNewMessages 后才允许重生成摘要", async () => {
+  resetCacheIndex();
+  const first = cacheStableBody(0);
+  const second = cacheStableBody(1);
+
+  await withMockFetch(() => openAiSummaryResponse("REGENERATED HANDOFF"), async (calls) => {
+    await compactWith(JSON.parse(JSON.stringify(first)), "sess-cache-regen", { minNewMessages: 100 });
+    assert.equal(calls.length, 1);
+    // minNewMessages=1 → 本轮新增折叠内容超过阈值,允许重摘(仍可能命中同一缓存 key)
+    const b = await compactWith(second, "sess-cache-regen", { minNewMessages: 1 });
+    assert.ok(b);
+    assert.ok(calls.length <= 2, "允许重生成,但不得无限调用");
+  });
+});
+
+test("缓存稳定: 复用会让 body 超过 2× 预算时宁可重生成", async () => {
+  resetCacheIndex();
+  const first = cacheStableBody(0);
+  const grown = JSON.parse(JSON.stringify(first));
+  grown.push({ content: "huge turn", role: "user" });
+  grown.push({ role: "assistant", content: [{ type: "tool_use", id: "huge", name: "Bash", input: {} }] });
+  grown.push({ role: "user", content: [{ type: "tool_result", tool_use_id: "huge", content: "z".repeat(40000) }] });
+
+  await withMockFetch(() => openAiSummaryResponse("BOUNDED HANDOFF"), async (calls) => {
+    const a = await compactWith(JSON.parse(JSON.stringify(first)), "sess-cache-bound", { tokenBudget: 2500 });
+    assert.ok(a);
+    assert.equal(calls.length, 1);
+    const b = await compactWith(grown, "sess-cache-bound", { tokenBudget: 2500 });
+    assert.ok(b, "仍应输出折叠后的 body");
+    assert.equal(calls.length, 2, "复用会超过 2× 预算 → 必须重生成摘要");
+  });
 });

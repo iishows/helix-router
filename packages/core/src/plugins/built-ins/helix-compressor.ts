@@ -240,7 +240,12 @@ export interface HelixCompressorConfig {
   toolResultThresholdChars?: number;
   /** 最近 N 条 tool_result 永不压缩(默认 2)。 */
   keepRecentToolResults?: number;
-  /** 单请求 tool_result 压缩条数上限(默认 20)。 */
+  /**
+   * 单请求 tool_result 压缩条数上限(默认 2000)。
+   * 2026-11-08: 旧默认 200 + 超额按 savings 排序,会让旧占位符在后续轮次被还原成原文,
+   * 直接打断上游 prompt 前缀缓存(缓存价=输入价 2%)。现改为位置序保留,并把默认值抬高,
+   * 保证真实会话(实测 600+ 条工具输出)不会因为窗口滑动而回退。
+   */
   maxCompressToolResults?: number;
   /**
    * 主动 compact(2026-10-15):helix 压缩后提交 token 数 > 该预算时,网关折叠更早历史
@@ -296,6 +301,14 @@ export interface HelixCompressorConfig {
   compactBudgetCeilingTokens?: number;
   /** 按真实 model 名覆盖 percent(优先于全局 `compactBudgetPercent`)。 */
   compactBudgetPercentOverrides?: Record<string, number>;
+  /**
+   * 主动 compact 激进折叠(默认 true):只保留最近 N 轮仍超预算时,继续整轮向前折叠;
+   * 仍超预算则在保留区内丢弃完整 tool 交换对。agent 长循环里单个用户轮就能占满上下文,
+   * 旧的「只保留 N 轮」等于不折叠。设 false 恢复旧行为。
+   */
+  aggressiveFolding?: boolean;
+  /** 主动 compact 最小收益(token,默认 1024):折叠量低于该值不做,避免无意义摘要。 */
+  minFoldedTokens?: number;
 }
 
 /**
@@ -324,14 +337,17 @@ interface CompressResponse {
 // ============= 默认配置 =============
 
 export const HELIX_COMPRESSOR_DEFAULTS: HelixCompressorConfig = {
+  aggressiveFolding: true,
+  minFoldedTokens: 1024,
   compressMedia: true,
   compressToolResults: true,
   toolResultThresholdChars: 1000,
   keepRecentToolResults: 2,
   // 真实 agent 会话单请求可达 600+ 条 tool_result(实测某请求 662 条、278 条超阈值)。
-  // 旧默认 20 导致 95% 的超阈值工具输出原样明文发给上游(663k 字符仅压 20 条)。
-  // 放宽到 200 覆盖真实历史;真正的预算兜底是"压缩后超预算 → 主动 compact"。
-  maxCompressToolResults: 200,
+  // 2026-11-08: 上限的作用是性能兜底,不是压缩策略。旧值 200 在长会话里会因窗口滑动
+  //   把旧占位符还原成原文 → 深前缀缓存整段失效。现在超额按位置序保留(单调),
+  //   并把默认抬到 2000,覆盖真实会话长度。
+  maxCompressToolResults: 2000,
   keepRecentTurns: 2,
   proactiveCompactCacheTtlMs: 259200000,
   proactiveCompactMinNewMessages: 100,
@@ -459,7 +475,12 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
       });
       const cacheEntries = Object.entries(local.hashMap);
       if (cacheEntries.length > 0) {
-        recallIndex = buildHistoryRecallIndex(local.hashMap);
+        // 2026-11-08: 清单未满 TOPIC_LIMIT 前不注入。否则每新增一个占位符都会改写
+        //   头部 system 文本 → 整段 prompt 前缀缓存失效。满额后按位置取最旧的一批,
+        //   会话只追加时清单不再变化(一次性切换,可接受)。
+        recallIndex = cacheEntries.length >= HISTORY_RECALL_TOPIC_LIMIT
+          ? buildHistoryRecallIndex(local.hashMap)
+          : "";
         try {
           // 缓存目录默认 {DATADIR}/helix-recall;若外部已通过环境变量指定则由 store 读取该值。
           ensureLocalRecallCacheDir();
@@ -597,6 +618,8 @@ function parseConfig(value: unknown): HelixCompressorConfig {
     ...(typeof value.maxCompressToolResults === "number" ? { maxCompressToolResults: value.maxCompressToolResults } : {}),
     ...(typeof value.tokenBudget === "number" ? { tokenBudget: value.tokenBudget } : {}),
     ...(typeof value.keepRecentTurns === "number" ? { keepRecentTurns: value.keepRecentTurns } : {}),
+    ...(typeof value.aggressiveFolding === "boolean" ? { aggressiveFolding: value.aggressiveFolding } : {}),
+    ...(typeof value.minFoldedTokens === "number" ? { minFoldedTokens: value.minFoldedTokens } : {}),
     ...(typeof value.proactiveCompactTimeoutMs === "number" ? { proactiveCompactTimeoutMs: value.proactiveCompactTimeoutMs } : {}),
     ...(typeof value.proactiveCompactModel === "string" ? { proactiveCompactModel: value.proactiveCompactModel } : {}),
     ...(typeof value.proactiveCompactCacheTtlMs === "number" ? { proactiveCompactCacheTtlMs: value.proactiveCompactCacheTtlMs } : {}),
@@ -1084,15 +1107,34 @@ export function buildHistoryRecallIndex(
     a?: unknown;
     kind?: "text" | "media" | "tool_result";
     blockOnly?: boolean;
+    /** 块候选所在消息下标(位置序稳定性的依据)。 */
+    msgIdx?: number;
+    /** Q&A pair 的提问/回答消息下标。 */
+    qIdx?: number;
+    aIdx?: number;
   }>
 ): string {
+  // 2026-11-08: 按「原消息位置」排序后再截取前 N 条,而不是按 hashMap 的插入顺序。
+  //   该清单会被注入到 messages 头部;若其内容随新占位符插入而重排,会打断整段
+  //   上游 prompt 前缀缓存(缓存价=输入价 2%)。按位置取最旧的一批之后,会话只追加时
+  //   前 N 条保持不变 → 清单文本稳定。
+  const entries = Object.entries(hashMap)
+    .map(([hash, entry], order) => {
+      const position = typeof entry.msgIdx === "number"
+        ? entry.msgIdx
+        : typeof entry.qIdx === "number"
+          ? entry.qIdx
+          : typeof entry.aIdx === "number"
+            ? entry.aIdx
+            : Number.POSITIVE_INFINITY;
+      return { entry, hash, order, position };
+    })
+    .filter((item) => /^[0-9a-f]{16}$/.test(item.hash))
+    .sort((a, b) => (a.position - b.position) || (a.order - b.order));
   const lines: string[] = [];
-  let count = 0;
-  for (const [hash, entry] of Object.entries(hashMap)) {
-    if (count >= HISTORY_RECALL_TOPIC_LIMIT) break;
-    if (!/^[0-9a-f]{16}$/.test(hash)) continue;
+  for (const { entry, hash } of entries) {
+    if (lines.length >= HISTORY_RECALL_TOPIC_LIMIT) break;
     lines.push(`- \`${hash}\` — ${historyRecallTopic(entry)}`);
-    count++;
   }
   if (lines.length === 0) return "";
   return `### Compressed blocks in this conversation (hash → topic)\n${lines.join("\n")}\n`;
@@ -1133,20 +1175,24 @@ function coerceTopicText(value: unknown): string {
 /** 检测 ⟦QA:hash⟧ 占位符(V3.2 Q&A pair 压缩) */
 export function hasQAPlaceholder(messages: LLMMessage[]): boolean {
   if (!Array.isArray(messages)) return false;
-  // 必须同时处理字符串 content 与**数组块** content —— 真实 Claude Code 的
-  //   content 恒为 [{type:"text",text:"⟦QA:hash⟧"}] 数组形状,只检查字符串会永远漏检
-  //   → history_recall 工具与教学 prompt 从不注入(与 hasHCPlaceholder 对齐)。
+  // 2026-11-08: 之前只扫 content 字符串与 block.text。Anthropic 的 tool_result 占位符
+  //   落在 `block.content`(字符串或块数组)→ 永远漏检 → history_recall 教学 prompt /
+  //   model 改写从不注入(真实日志:212 个 ⟦QA⟧ + 无教学 marker + model 未改写)。
+  //   这里递归扫 text 与 content 两种承载形态。
   for (const msg of messages) {
-    if (!msg) continue;
-    const content = msg.content;
-    if (typeof content === "string" && content.includes("⟦QA:")) return true;
-    if (Array.isArray(content)) {
-      for (const block of content) {
-        if (block && typeof block === "object" && typeof block.text === "string" && block.text.includes("⟦QA:")) {
-          return true;
-        }
-      }
-    }
+    if (msg && containsQAPlaceholder(msg.content)) return true;
+  }
+  return false;
+}
+
+function containsQAPlaceholder(value: unknown, depth = 0): boolean {
+  if (depth > 3) return false;
+  if (typeof value === "string") return value.includes("⟦QA:");
+  if (Array.isArray(value)) return value.some((item) => containsQAPlaceholder(item, depth + 1));
+  if (value && typeof value === "object") {
+    const block = value as Record<string, unknown>;
+    if (typeof block.text === "string" && block.text.includes("⟦QA:")) return true;
+    if (block.content !== undefined) return containsQAPlaceholder(block.content, depth + 1);
   }
   return false;
 }

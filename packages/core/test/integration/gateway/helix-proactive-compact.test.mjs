@@ -72,7 +72,10 @@ function buildConfig() {
   config.plugins = [{
     config: {
       // 保留本地压缩但预算调低,确保压缩后仍超预算。
+      // 本文件验证「最近 N 轮」旧语义与 header 接线;激进折叠/最小收益门槛由单测覆盖。
+      aggressiveFolding: false,
       keepRecentTurns: 2,
+      minFoldedTokens: 0,
       proactiveCompactTimeoutMs: 5000,
       tokenBudget: 200
     },

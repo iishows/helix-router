@@ -28,6 +28,12 @@ export interface CompactSummaryEntry {
   summary: string;
   /** 该摘要覆盖的消息条数(= messageHashes.length)。 */
   coveredCount: number;
+  /**
+   * 生成摘要时**未被折叠**的会话消息条数(不含头部受保护 system)。
+   * 用于判断「本轮相对该摘要新增了多少条历史」→ 决定是复用摘要保缓存,还是重生成。
+   * 旧记录可能没有该字段。
+   */
+  keptCount?: number;
   /** 写入时间(ms)。 */
   createdAt?: number;
   /** 过期时间(ms)。 */
@@ -214,6 +220,7 @@ export function putCompactSummary(entry: CompactSummaryEntry, ttlMs: number = DE
   const line = JSON.stringify({
     e: expiresAt,
     h: entry.key,
+    ...(typeof entry.keptCount === "number" ? { k: entry.keptCount } : {}),
     mh: entry.messageHashes,
     n: entry.coveredCount ?? entry.messageHashes.length,
     s: entry.sessionId,
@@ -235,6 +242,23 @@ export function getCompactSummary(key: string, now: number = Date.now()): Compac
   const offset = idx.offsets.get(key);
   if (offset === undefined) return null;
   return parseEntry(readLineAt(idx.file, offset), key, now);
+}
+
+/**
+ * 取该会话**最近写入**的一条未过期摘要(不要求前缀匹配)。
+ * 主动 compact 的「缓存稳定」路径用它:只要新增的待折叠内容还不够多,就复用这条
+ * 摘要与它覆盖的消息集合,让 outbound body 保持纯追加 → 上游前缀缓存不被打断。
+ */
+export function findLatestSummary(sessionId: string, now: number = Date.now()): CompactSummaryEntry | null {
+  if (!sessionId) return null;
+  const idx = ensureIndex();
+  const rows = idx.sessionOffsets.get(sessionId);
+  if (!rows || rows.length === 0) return null;
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const entry = parseEntryLoose(readLineAt(idx.file, rows[i].offset), now);
+    if (entry) return entry;
+  }
+  return null;
 }
 
 /**
@@ -379,7 +403,7 @@ function parseEntry(line: string | undefined, key: string, now: number): Compact
 
 function parseEntryLoose(line: string | undefined, now: number): CompactSummaryEntry | null {
   if (!line) return null;
-  let obj: { e?: unknown; h?: unknown; mh?: unknown; n?: unknown; s?: unknown; sum?: unknown; t?: unknown };
+  let obj: { e?: unknown; h?: unknown; k?: unknown; mh?: unknown; n?: unknown; s?: unknown; sum?: unknown; t?: unknown };
   try {
     obj = JSON.parse(line) as typeof obj;
   } catch {
@@ -393,6 +417,7 @@ function parseEntryLoose(line: string | undefined, now: number): CompactSummaryE
   return {
     coveredCount: typeof obj.n === "number" ? obj.n : messageHashes.length,
     ...(typeof obj.e === "number" ? { expiresAt: obj.e } : {}),
+    ...(typeof obj.k === "number" ? { keptCount: obj.k } : {}),
     key: obj.h,
     messageHashes,
     sessionId: obj.s,

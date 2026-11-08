@@ -770,11 +770,14 @@ function selectToolResultCandidates(
   }
 
   if (candidates.length <= opts.maxCount) return candidates;
-  // 超额:按 savings 从大到小优先,保留前 maxCount 个,并按 msgIdx 还原顺序
-  return [...candidates]
-    .sort((a, b) => b.savings - a.savings)
-    .slice(0, opts.maxCount)
-    .sort((a, b) => (a.msgIdx - b.msgIdx) || (a.blockIdx - b.blockIdx));
+  // 2026-11-08: 超额时按「位置从旧到新」保留,不再按 savings 排序取前 N。
+  //   旧实现:新出现的大工具输出会把旧候选挤出 maxCount 窗口 → 下一轮旧消息从
+  //   ⟦QA/hash⟧ 还原成原文 → 上游 prompt 前缀缓存从该点整段失效。
+  //   上游缓存价 = 输入价的 2%(未命中贵 50 倍),这种「深前缀回退」实测是最大成本来源
+  //   (单会话 1041/2232 对相邻请求命中前缀被压缩器改写,多花约 $1.15)。
+  //   位置序保证「一旦压缩,永远压缩」:会话只追加 → 决策单调、前缀稳定。
+  //   candidates 本身已按消息/块的原始顺序收集。
+  return candidates.slice(0, opts.maxCount);
 }
 
 /** 汇总三类 block 候选:文本(受 threshold)/媒体(独立)/tool_result(独立)。 */

@@ -12,9 +12,16 @@
  * （零额外调用）;前缀变长→只摘要 delta 并与旧摘要合并。
  *
  * 设计约束:
- *   - 只做「丢前缀 + 改 system」，不动 role 序列 → 不会触发 role 交替 400。
- *   - 切点只落在「新用户轮起点」→ tool_use/tool_result 对绝不跨切点。
+ *   - 只丢完整消息 + 改 system，不动单条消息内部 → 不会触发 role 交替 400。
+ *   - 切点只落在「新用户轮起点」;保留区内折叠只丢**完整 tool 交换对**
+ *     (assistant tool_use + 其后纯 tool_result) → tool_use/tool_result 绝不跨切点。
+ *   - 头部连续 system 消息(含压缩器插入的合成 recall 教学)永远保留,不参与折叠。
+ *   - 折叠收益 < `minFoldedTokens` 时不做(避免「折叠 1 条」的无意义摘要)。
  *   - 任何失败（fetch 抛错 / 超时 / 非 2xx / 空文本）都返回 undefined，原 body 照常转发。
+ *
+ * 2026-11-08: 原实现只保留最近 `keepRecentTurns` 轮且把头部 system 也算进可折前缀,
+ *   在 agent 长循环里会退化成「折叠 1 条 system(2.5k)/预算 100k 却仍 220k」。
+ *   新增 `aggressiveFolding`:整轮折叠压不进预算时,继续在保留区内丢完整 tool 交换对。
  */
 
 import { createHash } from "node:crypto";
@@ -27,6 +34,7 @@ import { resolveModelContextWindow } from "@ccr/core/gateway/model-catalog";
 import { normalizeProviderProtocol } from "@ccr/core/providers/runtime-topology";
 import { parseProviderBaseUrl } from "@ccr/core/providers/url";
 import {
+  findLatestSummary,
   findPrefixSummary,
   getCompactSummary,
   putCompactSummary,
@@ -60,6 +68,18 @@ export interface ProactiveCompactSettings {
   ceilingTokens: number;
   /** 按真实 model 名覆盖 percent。 */
   percentOverrides: Record<string, number>;
+  /**
+   * 激进折叠(默认 true):保留轮数不足以压进预算时,继续整轮向前折叠;仍超预算时,
+   * 在保留区内按「完整 tool 交换对」从旧到新丢弃。agent 长循环里单个用户轮就能占满
+   * 整个上下文,只保留最近 N 轮等于不折叠(实测 220k 仍为 100k 预算的 2.2 倍)。
+   * 设 false = 旧行为(只保留最近 keepRecentTurns 轮,绝不进入保留区)。
+   */
+  aggressiveFolding: boolean;
+  /**
+   * 最小折叠收益(token,默认 1024)。折叠内容低于该值时不做 compact —— 避免
+   * 「折叠 1 条 / 省 2.5k」这种无意义摘要与缓存抖动。
+   */
+  minFoldedTokens: number;
 }
 
 export type ProactiveCompactSource = "accumulate" | "cache" | "incremental" | "model";
@@ -128,55 +148,100 @@ export async function applyHelixProactiveCompact(
     return undefined;
   }
 
-  const boundary = foldBoundary(messages, settings.keepRecentTurns);
-  if (boundary === undefined) {
+  // 2026-11-08: 折叠只在「会话消息」上进行。Anthropic 客户端的 system 在 messages 外,
+  // helix 压缩器会为 recall 教学 prompt 往 messages 头部插入一条 role=system 的合成消息。
+  // 旧实现把它算进可折叠前缀 → boundary=1、只折叠这条合成消息(实测省 2.5k / 预算 100k),
+  // 既没效果,还会把 recall 教学提示一起折掉。这里统一保护头部 system 消息。
+  const protectedCount = leadingSystemMessageCount(messages);
+  const protectedMessages = messages.slice(0, protectedCount);
+  const conversation = messages.slice(protectedCount);
+  if (conversation.length === 0) {
     return undefined;
   }
-  const folded = messages.slice(0, boundary);
-  const kept = messages.slice(boundary);
+  const protectedTokens = protectedCount > 0 ? tokenize(protectedMessages) : 0;
+  const plan = planCompactFold(
+    conversation,
+    settings.keepRecentTurns,
+    resolvedBudget.budget - protectedTokens,
+    settings.aggressiveFolding
+  );
+  if (!plan) {
+    return undefined;
+  }
+  let folded = plan.folded;
+  let kept = plan.kept;
+  let usedIntraTurn = plan.usedIntraTurn;
   if (folded.length === 0 || kept.length === 0) {
     return undefined;
   }
 
   const sessionId = resolveCompactSessionId(input.body, input.headers);
+  const minNew = Math.max(0, Math.floor(settings.minNewMessages));
+  // 缓存稳定(2026-11-08):只要「相对上一条摘要新增的历史」还不够多,就复用该摘要
+  //   与它覆盖的**原消息集合**,把新增内容当原文保留。这样 outbound body = 上一轮 body
+  //   + 追加消息(纯前缀扩展),上游 prompt 缓存不被打断。
+  //   背景:上游缓存价 = 输入价 2%;摘要文本挂在 system 尾部,一旦变化,后面所有 messages
+  //   全部失效(实测命中从 ~99% 掉到 18-33%)。
+  //   注意判据必须是「会话新增条数」而不是「本次计划折叠条数」:每次请求都携带完整历史,
+  //   预算驱动的折叠集合会随历史增长而变大,用它做判据会导致每轮都重生成摘要。
+  let reusedSummary: { summary: string; coveredCount: number } | undefined;
+  if (minNew > 0) {
+    const latest = findLatestSummary(sessionId);
+    if (latest && latest.keptCount !== undefined) {
+      const appended = conversation.length - (latest.coveredCount + latest.keptCount);
+      if (appended >= 0 && appended < minNew) {
+        const reuse = reconstructDroppedSet(conversation, latest.messageHashes);
+        // 复用会让 body 随新增历史增长;超过预算 2 倍时宁可重生成一次,避免上下文膨胀。
+        if (reuse && tokenize([...protectedMessages, ...reuse.kept]) <= resolvedBudget.budget * 2) {
+          folded = reuse.folded;
+          kept = reuse.kept;
+          usedIntraTurn = reuse.usedIntraTurn;
+          reusedSummary = { coveredCount: latest.coveredCount, summary: latest.summary };
+        }
+      }
+    }
+  }
+  if (folded.length === 0 || kept.length === 0) {
+    return undefined;
+  }
+  // 最小收益门槛:折叠 1 条/几百 token 不值得发起摘要调用,也避免缓存抖动。
+  if (settings.minFoldedTokens > 0 && tokenize(folded) < settings.minFoldedTokens) {
+    return undefined;
+  }
+  const keptOutput = [...protectedMessages, ...kept];
+  const diagnosticSuffix = usedIntraTurn ? ",intra=1" : "";
+
   const messageHashes = folded.map(messageHash);
   const foldHash = sha256(messageHashes.join("\n"));
   const key = sha256(`${sessionId}|${foldHash}`);
 
   const cached = getCompactSummary(key);
   if (cached) {
-    const keptTokens = tokenize(kept);
-    return assemble(input.body, kept, cached.summary, {
+    const keptTokens = tokenize(keptOutput);
+    return assemble(input.body, keptOutput, cached.summary, {
       budgetTokens: resolvedBudget.budget,
       coveredCount: cached.coveredCount,
-      diagnostic: `gen=${cached.coveredCount},source=cache,folded=${folded.length},tokens_after=${keptTokens},budget=${resolvedBudget.budget}`,
+      diagnostic: `gen=${cached.coveredCount},source=cache,folded=${folded.length},tokens_after=${keptTokens},budget=${resolvedBudget.budget}${diagnosticSuffix}`,
+      foldedCount: folded.length,
+      source: "cache",
+      tokensAfter: keptTokens
+    });
+  }
+  if (reusedSummary) {
+    // 复用集合与摘要都已确定时理论上 key 会命中;若索引/TTL 边界导致 miss,仍直接复用,
+    //   绝不因为一次查询落空就重新生成摘要(否则缓存前缀被打断)。
+    const keptTokens = tokenize(keptOutput);
+    return assemble(input.body, keptOutput, reusedSummary.summary, {
+      budgetTokens: resolvedBudget.budget,
+      coveredCount: reusedSummary.coveredCount,
+      diagnostic: `gen=${reusedSummary.coveredCount},source=cache,folded=${folded.length},tokens_after=${keptTokens},budget=${resolvedBudget.budget}${diagnosticSuffix}`,
       foldedCount: folded.length,
       source: "cache",
       tokensAfter: keptTokens
     });
   }
 
-  // 「积攒」:folded 前缀已有缓存摘要时,只有未覆盖的新历史累计到阈值才重摘。
-  const stored = findPrefixSummary(sessionId, messageHashes);
-  const minNew = Math.max(0, Math.floor(settings.minNewMessages));
-  if (stored && minNew > 0 && folded.length - stored.matchedCount < minNew) {
-    // 未达阈值 → 不重摘:复用旧摘要(matchedCount 之前已被它覆盖),
-    //   matchedCount..boundary 这段「新历史」当原文保留。folded 前缀逐字节不变 ⇒ 零上游调用。
-    const coverage = stored.matchedCount;
-    const keptAcc = messages.slice(coverage);
-    if (keptAcc.length > 0) {
-      const keptTokens = tokenize(keptAcc);
-      return assemble(input.body, keptAcc, stored.entry.summary, {
-        budgetTokens: resolvedBudget.budget,
-        coveredCount: stored.entry.coveredCount,
-        diagnostic: `gen=${stored.entry.coveredCount},source=accumulate,pending=${folded.length - coverage},folded=${coverage},tokens_after=${keptTokens},budget=${resolvedBudget.budget}`,
-        foldedCount: coverage,
-        source: "accumulate",
-        tokensAfter: keptTokens
-      });
-    }
-  }
-
+  const stored = usedIntraTurn ? null : findPrefixSummary(sessionId, messageHashes);
   const target = resolveSummaryTarget(input.config, settings.model || input.model);
   if (!target) {
     return undefined;
@@ -184,6 +249,7 @@ export async function applyHelixProactiveCompact(
 
   const summary = await summarizeFolded({
     folded,
+    keptCount: conversation.length - folded.length,
     key,
     prefix: stored,
     sessionId,
@@ -195,12 +261,12 @@ export async function applyHelixProactiveCompact(
     return undefined;
   }
   const source: ProactiveCompactSource = stored ? "incremental" : "model";
-  const keptTokens = tokenize(kept);
+  const keptTokens = tokenize(keptOutput);
   const summaryTokens = tokenize([{ content: summary.text, role: "assistant" }]);
-  return assemble(input.body, kept, summary.text, {
+  return assemble(input.body, keptOutput, summary.text, {
     budgetTokens: resolvedBudget.budget,
     coveredCount: summary.coveredCount,
-    diagnostic: `gen=${summary.coveredCount},source=${source},folded=${folded.length},tokens_after=${keptTokens},summary_tokens=${summaryTokens},budget=${resolvedBudget.budget}`,
+    diagnostic: `gen=${summary.coveredCount},source=${source},folded=${folded.length},tokens_after=${keptTokens},summary_tokens=${summaryTokens},budget=${resolvedBudget.budget}${diagnosticSuffix}`,
     foldedCount: folded.length,
     source,
     summaryTokens,
@@ -242,6 +308,278 @@ function isNewUserTurnStart(message: unknown): boolean {
     return false;
   }
   return !content.some((block) => isRecord(block) && block.type === "tool_result");
+}
+
+/** 头部连续 system 消息的条数:这些是协议/合成消息(如 recall 教学 prompt),永远不折叠。 */
+export function leadingSystemMessageCount(messages: unknown[]): number {
+  let count = 0;
+  while (count < messages.length) {
+    const message = messages[count];
+    if (!isRecord(message) || message.role !== "system") {
+      break;
+    }
+    count += 1;
+  }
+  return count;
+}
+
+type CompactFoldPlan = {
+  /** 被折叠的消息(按原始顺序;含保留区内被丢弃的完整 tool 交换对)。 */
+  folded: unknown[];
+  /** 保留的消息(不含头部受保护的 system 消息)。 */
+  kept: unknown[];
+  /** 是否在保留区内做了 tool 交换对折叠(此时 folded 不是会话前缀)。 */
+  usedIntraTurn: boolean;
+};
+
+/**
+ * 计算折叠计划(2026-11-08 重写):
+ *   1. 基线 = 保留最近 keepRecentTurns 个「新用户轮」;
+ *   2. aggressive 时,若仍超预算,继续整轮向前折叠(保留轮数逐轮减到 1);
+ *   3. 仍超预算 → 在保留区内从旧到新丢弃「完整 tool 交换对」
+ *      (assistant tool_use + 其后纯 tool_result 消息),绝不拆半个 tool 对,
+ *      且绝不丢弃最后一条交换对/最后一条消息。
+ *
+ * 之所以需要 3:agent 长循环里单个用户轮就能占满整个上下文(实测一轮 202k/224k token),
+ * 只按「人类轮」切点永远压不进预算。
+ */
+export function planCompactFold(
+  conversation: unknown[],
+  keepRecentTurns: number,
+  budget: number,
+  aggressive: boolean
+): CompactFoldPlan | undefined {
+  const turns = Math.max(1, Math.floor(keepRecentTurns));
+  const starts: number[] = [];
+  for (let i = 0; i < conversation.length; i += 1) {
+    if (isNewUserTurnStart(conversation[i])) {
+      starts.push(i);
+    }
+  }
+  if (starts.length === 0 || (!aggressive && starts.length < turns)) {
+    return undefined;
+  }
+  // 非激进模式:必须保留 keepRecentTurns 个完整轮,且只有更早历史可折(旧行为)。
+  // 激进模式:人类轮可能不足(agent 单轮循环),允许 boundary=0 / 轮数不足,
+  //   之后交给预算驱动的整轮折叠与保留区内交换对折叠。
+  const keepCount = aggressive ? Math.min(turns, starts.length) : turns;
+  let boundary = starts[starts.length - keepCount];
+  if (!aggressive && !(boundary > 0)) {
+    return undefined;
+  }
+
+  if (aggressive && budget > 0) {
+    // 整轮追加折叠:保留轮数逐轮减少,直到压进预算或只剩最后一轮。
+    let keptTokens = tokenize(conversation.slice(boundary));
+    for (let keep = keepCount - 1; keep >= 1 && keptTokens > budget; keep -= 1) {
+      const index = starts[starts.length - keep];
+      if (!(index > boundary)) {
+        continue;
+      }
+      boundary = index;
+      keptTokens = tokenize(conversation.slice(boundary));
+    }
+  }
+
+  const dropped = new Set<number>();
+  for (let i = 0; i < boundary; i += 1) {
+    dropped.add(i);
+  }
+
+  let usedIntraTurn = false;
+  if (aggressive && budget > 0 && tokenize(conversation.slice(boundary)) > budget) {
+    // 保留区内折叠:逐条扣减 token,避免每丢一个单元都重新 tokenize 整个会话。
+    const perMessageTokens = conversation.map((message) => tokenize([message]));
+    let keptTokens = 0;
+    for (let i = boundary; i < conversation.length; i += 1) {
+      keptTokens += perMessageTokens[i] ?? 0;
+    }
+    let cursor = boundary;
+    while (keptTokens > budget) {
+      const unit = findDroppableExchangeUnit(conversation, cursor);
+      if (!unit || unit.end >= conversation.length - 1) {
+        break;
+      }
+      for (let i = unit.start; i <= unit.end; i += 1) {
+        dropped.add(i);
+        keptTokens -= perMessageTokens[i] ?? 0;
+      }
+      usedIntraTurn = true;
+      cursor = unit.end + 1;
+    }
+  }
+
+  if (dropped.size === 0) {
+    return undefined;
+  }
+  const folded: unknown[] = [];
+  const kept: unknown[] = [];
+  for (let i = 0; i < conversation.length; i += 1) {
+    (dropped.has(i) ? folded : kept).push(conversation[i]);
+  }
+  if (folded.length === 0 || kept.length === 0) {
+    return undefined;
+  }
+  return { folded, kept, usedIntraTurn };
+}
+
+/**
+ * 按「上一次摘要覆盖的消息 hash 多重集」重建 keep/fold。
+ *   - 必须每条 stored hash 都能在当前会话里找到(逐条消费,支持重复内容);
+ *   - 重建后 kept 的第一条不能是孤立 tool_result;
+ *   - 返回的 usedIntraTurn 以最终集合是否「连续前缀」为准。
+ * 任何一步不满足 → undefined(退回正常折叠/重摘,绝不冒险)。
+ */
+function reconstructDroppedSet(
+  conversation: unknown[],
+  storedHashes: string[]
+): { folded: unknown[]; kept: unknown[]; usedIntraTurn: boolean } | undefined {
+  if (!Array.isArray(storedHashes) || storedHashes.length === 0) {
+    return undefined;
+  }
+  const wanted = new Map<string, number>();
+  for (const hash of storedHashes) {
+    wanted.set(hash, (wanted.get(hash) ?? 0) + 1);
+  }
+  const dropped = new Set<number>();
+  for (let i = 0; i < conversation.length && wanted.size > 0; i += 1) {
+    const hash = messageHash(conversation[i]);
+    const remaining = wanted.get(hash);
+    if (!remaining) {
+      continue;
+    }
+    dropped.add(i);
+    if (remaining === 1) {
+      wanted.delete(hash);
+    } else {
+      wanted.set(hash, remaining - 1);
+    }
+  }
+  if (wanted.size > 0 || dropped.size === 0) {
+    return undefined;
+  }
+  const folded: unknown[] = [];
+  const kept: unknown[] = [];
+  for (let i = 0; i < conversation.length; i += 1) {
+    (dropped.has(i) ? folded : kept).push(conversation[i]);
+  }
+  if (kept.length === 0 || isPureToolResultMessage(kept[0])) {
+    return undefined;
+  }
+  let prefix = 0;
+  while (prefix < conversation.length && dropped.has(prefix)) {
+    prefix += 1;
+  }
+  return { folded, kept, usedIntraTurn: dropped.size !== prefix };
+}
+
+type ExchangeUnit = { start: number; end: number };
+
+/** 在 [from, len) 里找最早的「完整 tool 交换对」:assistant(tool_use) + 其后纯 tool_result 消息。 */
+function findDroppableExchangeUnit(messages: unknown[], from: number): ExchangeUnit | undefined {
+  for (let i = Math.max(1, from); i < messages.length - 1; i += 1) {
+    if (!isAssistantToolUseMessage(messages[i])) {
+      continue;
+    }
+    const end = pureToolResultEnd(messages, i + 1);
+    if (end < 0 || !exchangeUnitIdsConsistent(messages, i, end)) {
+      continue;
+    }
+    return { start: i, end };
+  }
+  return undefined;
+}
+
+/**
+ * 只在「assistant 的每个 tool_use/tool_call 都能在本单元的结果消息里找到配对」时才允许丢弃。
+ * 防止上游/客户端数据形状异常时丢出孤儿 tool_use(会让下一次请求 400)。
+ */
+function exchangeUnitIdsConsistent(messages: unknown[], start: number, end: number): boolean {
+  const assistant = messages[start];
+  if (!isRecord(assistant)) {
+    return false;
+  }
+  const uses = new Set<string>();
+  const toolCalls = (assistant as { tool_calls?: unknown }).tool_calls;
+  if (Array.isArray(toolCalls)) {
+    for (const call of toolCalls) {
+      const id = isRecord(call) && typeof call.id === "string" ? call.id : "";
+      if (id) {
+        uses.add(id);
+      }
+    }
+  }
+  if (Array.isArray(assistant.content)) {
+    for (const block of assistant.content) {
+      if (isRecord(block) && block.type === "tool_use" && typeof block.id === "string" && block.id) {
+        uses.add(block.id);
+      }
+    }
+  }
+  const results = new Set<string>();
+  for (let i = start + 1; i <= end; i += 1) {
+    const message = messages[i];
+    if (!isRecord(message)) {
+      return false;
+    }
+    if (message.role === "tool" && typeof message.tool_call_id === "string" && message.tool_call_id) {
+      results.add(message.tool_call_id);
+    }
+    if (Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (isRecord(block) && block.type === "tool_result" &&
+            typeof block.tool_use_id === "string" && block.tool_use_id) {
+          results.add(block.tool_use_id);
+        }
+      }
+    }
+  }
+  if (uses.size === 0 || results.size !== uses.size) {
+    return false;
+  }
+  for (const id of uses) {
+    if (!results.has(id)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isAssistantToolUseMessage(message: unknown): boolean {
+  if (!isRecord(message) || message.role !== "assistant") {
+    return false;
+  }
+  if (Array.isArray((message as { tool_calls?: unknown }).tool_calls) &&
+      ((message as { tool_calls?: unknown[] }).tool_calls?.length ?? 0) > 0) {
+    return true;
+  }
+  const content = message.content;
+  return Array.isArray(content) && content.some((block) => isRecord(block) && block.type === "tool_use");
+}
+
+/** 纯 tool_result 消息(OpenAI: role=tool;Anthropic: user + 全部块都是 tool_result)。 */
+function isPureToolResultMessage(message: unknown): boolean {
+  if (!isRecord(message)) {
+    return false;
+  }
+  if (message.role === "tool") {
+    return true;
+  }
+  if (message.role !== "user" || !Array.isArray(message.content) || message.content.length === 0) {
+    return false;
+  }
+  return message.content.every((block) => isRecord(block) && block.type === "tool_result");
+}
+
+function pureToolResultEnd(messages: unknown[], from: number): number {
+  let end = -1;
+  for (let i = from; i < messages.length; i += 1) {
+    if (!isPureToolResultMessage(messages[i])) {
+      break;
+    }
+    end = i;
+  }
+  return end;
 }
 
 // ============= 组装 =============
@@ -293,6 +631,8 @@ export function mergeSystemSummary(system: unknown, summary: string): unknown {
 
 async function summarizeFolded(input: {
   folded: unknown[];
+  /** 生成摘要时未被折叠的会话消息条数(用于后续「增量是否够大」的判断)。 */
+  keptCount: number;
   key: string;
   prefix: { entry: CompactSummaryEntry; matchedCount: number } | null;
   sessionId: string;
@@ -321,6 +661,7 @@ async function summarizeFolded(input: {
     putCompactSummary(
       {
         key: input.key,
+        keptCount: input.keptCount,
         messageHashes: input.folded.map(messageHash),
         sessionId: input.sessionId,
         summary: text,
@@ -676,9 +1017,11 @@ function readProactiveCompactSettings(pluginConfig: unknown): ProactiveCompactSe
       )
     : {};
   return {
+    aggressiveFolding: config.aggressiveFolding !== false,
     cacheTtlMs: num(config.proactiveCompactCacheTtlMs, 3 * 24 * 60 * 60 * 1000),
     ceilingTokens: Math.max(0, num(config.compactBudgetCeilingTokens, 120000)),
     floorTokens: Math.max(0, num(config.compactBudgetFloorTokens, 48000)),
+    minFoldedTokens: Math.max(0, num(config.minFoldedTokens, 1024)),
     keepRecentTurns: Math.max(1, Math.floor(num(config.keepRecentTurns, 2))),
     minNewMessages: Math.max(0, Math.floor(num(config.proactiveCompactMinNewMessages, 100))),
     model: typeof config.proactiveCompactModel === "string" ? config.proactiveCompactModel : "",

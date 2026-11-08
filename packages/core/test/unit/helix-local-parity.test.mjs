@@ -5,6 +5,10 @@
  * 金值由 tools/helix-golden-gen.mjs 生成(该脚本 import 云端 hc.js),命令:
  *   node --no-warnings tools/helix-golden-gen.mjs
  *
+ * 有意偏离(2026-11-08):`maxCompressToolResults` 超额时的选择由「savings 最大优先」
+ * 改为「位置从旧到新」。云端排序会让旧占位符在后续轮次被还原成原文,打断上游 prompt
+ * 前缀缓存(缓存价=输入价 2%)。其余压缩语义仍保持 parity。
+ *
  * 覆盖:
  *   - computeHash 纯函数值
  *   - compressV3x 的 hash key 集合 / 输出 messages
@@ -340,6 +344,38 @@ test("user with tool_result+text paired with plain assistant keeps the tool_use"
   assert.ok(JSON.stringify(r.messages).includes('"T1"'));
 });
 
+// 真实世界最常见的形态:长文本 user + 纯 tool_use assistant(assistant 无 text 块)。
+// 注意配对候选门槛是 qText+aText >= minChars*2,而纯 tool_use 的 assistant 贡献 0 文本,
+// 所以 user 文本必须自身跨过门槛这对才会成为候选(否则整对跳过、连 user 也不压)。
+// 成为候选后:user 文本换成占位符,assistant 因无 text 块走
+// replaceTextBlocksWithPlaceholder 的 `if (!hasText) return msg` 原样返回 —
+// 绝不能退化成 cloud 的「整条删除 assistant」,否则 tool_result 变孤儿。
+test("big-text user + pure tool_use assistant: text compressed, tool_use kept verbatim", () => {
+  const bigText = TOOL_LONG.repeat(4);
+  const msgs = [
+    { role: "user", content: bigText },
+    { role: "assistant", content: [{ type: "tool_use", id: "T1", name: "Bash", input: { cmd: "ls -la" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "T1", content: "file1\nfile2" }] },
+    { role: "user", content: "Final question: what did we decide?" }
+  ];
+  const r = compressV3x(JSON.parse(JSON.stringify(msgs)), { keepRecentPairs: 1, minChars: 500 });
+
+  // 消息数不减(无整条删除)
+  assert.equal(r.messages.length, 4);
+  // user 长文本被压成占位符(证明这一对确实成了候选并走了压缩分支)
+  assert.match(String(r.messages[0].content), /^⟦QA:[a-f0-9]{16}⟧$/);
+  // assistant 的 tool_use 原样保留(含 id、name 与 input)
+  const aBlocks = r.messages[1].content;
+  assert.ok(Array.isArray(aBlocks), "assistant content 仍是块数组");
+  const useBlocks = aBlocks.filter((b) => b && b.type === "tool_use");
+  assert.equal(useBlocks.length, 1);
+  assert.equal(useBlocks[0].id, "T1");
+  assert.equal(useBlocks[0].name, "Bash");
+  assert.deepEqual(useBlocks[0].input, { cmd: "ls -la" });
+  // 无孤儿 tool_result
+  assert.deepEqual(orphanToolResults(r), []);
+});
+
 test("string-content pair still drops assistant (cloud parity preserved)", () => {
   const r = compressV3x(FIXTURE, { keepRecentPairs: 1, minChars: 500 });
   assert.equal(r.messages.length, 3);
@@ -522,11 +558,78 @@ test("toolResultThresholdChars gates small outputs", () => {
   assert.deepEqual(Object.keys(r.hashMap), []);
 });
 
-test("maxCompressToolResults caps count (largest savings first)", () => {
-  const msgs = makeToolHistory(4000, 8);
-  const r = compressV3x(msgs, { keepRecentToolResults: 0, maxCompressToolResults: 3 });
-  const compressed = toolResultBlocks(r.messages).filter((b) => String(b.content).includes("⟦QA:"));
-  assert.equal(compressed.length, 3);
+// 2026-11-08: 超额选择由「savings 最大优先」改为「位置从旧到新」。
+// 这是对 cloud hc.js 的**有意偏离**:savings 排序会让新出现的大工具输出把旧候选挤出窗口,
+// 下一轮旧消息从 ⟦QA⟧ 还原成原文 → 上游 prompt 前缀缓存整段失效(缓存价=输入价 2%)。
+// 位置序保证「一旦压缩,永远压缩」,会话只追加时决策单调。
+test("maxCompressToolResults caps by position (oldest first) — cache-stable", () => {
+  const sizes = [1200, 1300, 1400, 9000, 8000, 7000]; // 后 3 条 savings 更大
+  const msgs = [{ role: "system", content: "sys" }];
+  sizes.forEach((size, i) => {
+    msgs.push({
+      role: "user",
+      content: [
+        { type: "text", text: `read ${i}` },
+        { type: "tool_result", tool_use_id: `call_${i}`, content: `OUT${i} ` + "x".repeat(size) }
+      ]
+    });
+    msgs.push({
+      role: "assistant",
+      content: [{ type: "text", text: `ok ${i}` }, { type: "tool_use", id: `call_${i}`, name: "Read", input: {} }]
+    });
+  });
+  const r = compressV3x(structuredClone(msgs), { keepRecentToolResults: 0, maxCompressToolResults: 3 });
+  const compressedIds = new Set(
+    toolResultBlocks(r.messages).filter((b) => String(b.content).includes("⟦QA:")).map((b) => b.tool_use_id)
+  );
+  // 第一条 user 消息是 anchor(恒跳过,与云端一致),所以位置序保留 call_1..call_3;
+  // 若仍按 savings 排序会选 call_5/call_4/call_3。
+  assert.deepEqual([...compressedIds].sort(), ["call_1", "call_2", "call_3"]);
+});
+
+test("compression decisions are monotonic as the session grows", () => {
+  // 尺寸递增:若回退到 savings 排序,首轮会选后 3 条;追加超大输出后再选就会挤掉一条旧的。
+  const sizes = [1200, 1400, 1600, 1800, 2000, 2200];
+  const base = [{ role: "system", content: "sys" }];
+  sizes.forEach((size, i) => {
+    base.push({
+      role: "user",
+      content: [
+        { type: "text", text: `read ${i}` },
+        { type: "tool_result", tool_use_id: `call_${i}`, content: `OUT${i} ` + "x".repeat(size) }
+      ]
+    });
+    base.push({
+      role: "assistant",
+      content: [{ type: "text", text: `ok ${i}` }, { type: "tool_use", id: `call_${i}`, name: "Read", input: {} }]
+    });
+  });
+  const first = compressV3x(structuredClone(base), { keepRecentToolResults: 0, maxCompressToolResults: 3 });
+  const compressedFirst = new Set(
+    toolResultBlocks(first.messages).filter((b) => String(b.content).includes("⟦QA:")).map((b) => b.tool_use_id)
+  );
+  assert.equal(compressedFirst.size, 3);
+
+  // 追加一条更大的工具输出:savings 排序会把它塞进前 3、挤掉一条旧的;位置序不会。
+  const grown = structuredClone(base);
+  grown.push({
+    role: "user",
+    content: [
+      { type: "text", text: "read huge" },
+      { type: "tool_result", tool_use_id: "call_huge", content: "HUGE " + "y".repeat(20000) }
+    ]
+  });
+  grown.push({
+    role: "assistant",
+    content: [{ type: "text", text: "ok huge" }, { type: "tool_use", id: "call_huge", name: "Read", input: {} }]
+  });
+  const second = compressV3x(grown, { keepRecentToolResults: 0, maxCompressToolResults: 3 });
+  const compressedSecond = new Set(
+    toolResultBlocks(second.messages).filter((b) => String(b.content).includes("⟦QA:")).map((b) => b.tool_use_id)
+  );
+  for (const id of compressedFirst) {
+    assert.ok(compressedSecond.has(id), `已压缩的消息不得被还原:${id}`);
+  }
 });
 
 test("default maxCompressToolResults covers real agent sessions (not capped at 20)", () => {
