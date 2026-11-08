@@ -1245,3 +1245,12 @@ test("buildSummaryPrompt: transcript 超限时保留尾部(最近折叠内容)",
   assert.ok(!prompt.includes("MSG_0_"), "最旧消息应被省略");
   assert.ok(prompt.length < 204000, `prompt 总长必须受控,实际 ${prompt.length}`);
 });
+
+test("默认 minNewMessages = 200(降低重摘频率,减少摘要改写导致的整段前缀失效)", () => {
+  // 背景:每次重摘都会改写 system 尾部摘要 → 全 prompt 前缀缓存失效(实测 pro 单次 ~$0.018)。
+  //   复用条件下 threshold 与断点频率成反比,故默认从 100 提到 200;显式配置仍优先。
+  const defaults = readProactiveCompactSettingsFromConfig({});
+  assert.equal(defaults.minNewMessages, 200);
+  const explicit = readProactiveCompactSettingsFromConfig({ proactiveCompactMinNewMessages: 100 });
+  assert.equal(explicit.minNewMessages, 100);
+});

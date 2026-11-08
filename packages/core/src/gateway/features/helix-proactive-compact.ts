@@ -1010,7 +1010,11 @@ function readProactiveCompactSettings(pluginConfig: unknown): ProactiveCompactSe
     floorTokens: Math.max(0, num(config.compactBudgetFloorTokens, 48000)),
     minFoldedTokens: Math.max(0, num(config.minFoldedTokens, 1024)),
     keepRecentTurns: Math.max(1, Math.floor(num(config.keepRecentTurns, 2))),
-    minNewMessages: Math.max(0, Math.floor(num(config.proactiveCompactMinNewMessages, 100))),
+    // 2026-11-08: 100 → 200。每次重摘都会改写 system 里的摘要 → 整段 prompt 前缀
+    //   缓存失效(实测 pro 会话单次断点约 12.8 万 token 未命中、~$0.018)。重摘频率
+    //   与阈值成反比;多保留的上下文全部走 2% 缓存价,成本可忽略,而复用路径本身
+    //   仍有 2× 预算上限兜底,不会无限膨胀。
+    minNewMessages: Math.max(0, Math.floor(num(config.proactiveCompactMinNewMessages, 200))),
     model: typeof config.proactiveCompactModel === "string" ? config.proactiveCompactModel : "",
     percent: Math.max(0, num(config.compactBudgetPercent, 0)),
     percentOverrides: overrides,

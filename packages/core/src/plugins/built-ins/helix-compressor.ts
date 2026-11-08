@@ -350,7 +350,9 @@ export const HELIX_COMPRESSOR_DEFAULTS: HelixCompressorConfig = {
   maxCompressToolResults: 2000,
   keepRecentTurns: 2,
   proactiveCompactCacheTtlMs: 259200000,
-  proactiveCompactMinNewMessages: 100,
+  // 2026-11-08: 100 → 200。重摘会改写 system 摘要 → 全前缀缓存失效(实测单次 ~$0.018);
+  //   阈值翻倍让断点频率减半,多保留的上下文走 2% 缓存价,复用路径另有 2× 预算上限。
+  proactiveCompactMinNewMessages: 200,
   proactiveCompactModel: "",
   proactiveCompactTimeoutMs: 60000,
   tokenBudget: 100000,
