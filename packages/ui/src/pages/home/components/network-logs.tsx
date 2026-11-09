@@ -6,6 +6,7 @@ import {
   AnimatedIconSwap, Check, ChevronDown, ChevronLeft,
   ChevronRight, clampNumber, clientInitial, cn, Copy, copyTextToClipboard,
   createLogBodyPreviewText, Database, Dialog, DialogBody, DialogContent, DialogHeader, DialogTitle, formatBytes, formatCompactNumber, formatDuration,
+  compactReuseDecisionLabel,
   compactSourceLabel,
   formatLogDateTime, formatLogCompressSummary, formatLogTokenSummary, formatNetworkRequestRaw, formatNetworkResponseRaw, formatPercentFixed, formatRouteTracePath, formatUsdCost,
   FormattedLogBody,
@@ -1644,6 +1645,13 @@ function LogCompressDetails({ entry }: { entry: RequestLogEntry }) {
           label={t("compact 折叠条数")}
           value={`${compact.foldedCount.toLocaleString()} 条`}
           hint={t("累计覆盖 ${covered} 条历史").replace("${covered}", compact.coveredCount.toLocaleString())}
+        />
+      ) : null}
+      {compact && compactReuseDecisionLabel(compact) ? (
+        <LogMetric
+          label={t("compact 重摘判定")}
+          value={compactReuseDecisionLabel(compact)!}
+          hint={t("新增条数 < 阈值(minNewMessages)时复用旧摘要,保证 body 纯前缀扩展;达到阈值才重摘(会打断一次缓存)")}
         />
       ) : null}
       {compact && compact.summaryTokens !== undefined ? (

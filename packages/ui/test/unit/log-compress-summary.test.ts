@@ -202,6 +202,48 @@ test("主动 compact: entry 字段存在时 title 带 compact 明细", () => {
   assert.match(title, /120,000→12,000 tok/);
 });
 
+test("主动 compact: title 直接显示重摘判定(新增条数 / 阈值)", () => {
+  const { title } = formatLogCompressSummary(
+    entry({
+      compressionProactiveCompact: {
+        coveredCount: 899,
+        foldedCount: 236,
+        minNewMessages: 200,
+        newMessages: 150,
+        preCompactTokens: 136000,
+        reuseDecision: "reuse",
+        source: "cache",
+        tokensAfter: 98000
+      },
+      inputTokens: 1200,
+      cacheReadTokens: 134000
+    }),
+    t
+  );
+  assert.match(title, /重摘判定: 复用摘要（新增 150 \/ 阈值 200）/);
+});
+
+test("主动 compact: 达到阈值时判定显示「重摘」", () => {
+  const { title } = formatLogCompressSummary(
+    entry({
+      compressionProactiveCompact: {
+        coveredCount: 1099,
+        foldedCount: 394,
+        minNewMessages: 200,
+        newMessages: 200,
+        preCompactTokens: 158000,
+        reuseDecision: "regenerate",
+        source: "model",
+        tokensAfter: 98300
+      },
+      inputTokens: 135000,
+      cacheReadTokens: 1000
+    }),
+    t
+  );
+  assert.match(title, /重摘判定: 重摘（新增 200 \/ 阈值 200）/);
+});
+
 // ============== 2026-10-17: 召回回填 == 0 的显式渲染 ==============
 
 test("压缩过但召回回填 0 → title 显式画「召回回填 0 tok（本轮模型未调用）」", () => {

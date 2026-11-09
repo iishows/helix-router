@@ -101,6 +101,16 @@ export type ProactiveCompactResult = {
   summaryTokens?: number;
   /** 本次生效的 compact 预算(percent 路径时为 clamp 后的值,否则 = tokenBudget)。 */
   budgetTokens?: number;
+  /** 相对上一条摘要新增的会话消息条数(无上条摘要时为空)。 */
+  newMessages?: number;
+  /** 生效的「积攒」阈值(minNewMessages)。 */
+  minNewMessages?: number;
+  /**
+   * 重摘判定(2026-11-09,可观测性):reuse=复用上条摘要 / regenerate=新增已达阈值 /
+   * no-summary=无可用摘要 / reconstruct-failed=哈希重建失败 / over-2x-budget=复用会超 2× 预算 /
+   * history-shrank=会话回退 / off=阈值关闭。
+   */
+  reuseDecision?: string;
 };
 
 export type ProactiveCompactInput = {
@@ -185,18 +195,32 @@ export async function applyHelixProactiveCompact(
   //   注意判据必须是「会话新增条数」而不是「本次计划折叠条数」:每次请求都携带完整历史,
   //   预算驱动的折叠集合会随历史增长而变大,用它做判据会导致每轮都重生成摘要。
   let reusedSummary: { summary: string; coveredCount: number } | undefined;
+  // 2026-11-09: 把「新增了多少条 / 阈值多少 / 为什么复用或重摘」变成日志可见的诊断字段。
+  //   此前只能从摘要账本反推,无法直接判断 minNewMessages 是否生效。
+  let appendedMessages: number | undefined;
+  let reuseDecision = minNew > 0 ? "no-summary" : "off";
   if (minNew > 0) {
     const latest = findLatestSummary(sessionId);
     if (latest && latest.keptCount !== undefined) {
       const appended = conversation.length - (latest.coveredCount + latest.keptCount);
-      if (appended >= 0 && appended < minNew) {
+      appendedMessages = appended;
+      if (appended < 0) {
+        reuseDecision = "history-shrank";
+      } else if (appended >= minNew) {
+        reuseDecision = "regenerate";
+      } else {
         const reuse = reconstructDroppedSet(conversation, latest.messageHashes);
         // 复用会让 body 随新增历史增长;超过预算 2 倍时宁可重生成一次,避免上下文膨胀。
-        if (reuse && tokenize([...protectedMessages, ...reuse.kept]) <= resolvedBudget.budget * 2) {
+        if (!reuse) {
+          reuseDecision = "reconstruct-failed";
+        } else if (tokenize([...protectedMessages, ...reuse.kept]) > resolvedBudget.budget * 2) {
+          reuseDecision = "over-2x-budget";
+        } else {
           folded = reuse.folded;
           kept = reuse.kept;
           usedIntraTurn = reuse.usedIntraTurn;
           reusedSummary = { coveredCount: latest.coveredCount, summary: latest.summary };
+          reuseDecision = "reuse";
         }
       }
     }
@@ -209,7 +233,13 @@ export async function applyHelixProactiveCompact(
     return undefined;
   }
   const keptOutput = [...protectedMessages, ...kept];
-  const diagnosticSuffix = usedIntraTurn ? ",intra=1" : "";
+  const diagnosticSuffix = `${usedIntraTurn ? ",intra=1" : ""},new_msgs=${appendedMessages ?? "-"},min_new=${settings.minNewMessages},reuse=${reuseDecision}`;
+  const observe = (result: ProactiveCompactResult): ProactiveCompactResult => ({
+    ...result,
+    ...(appendedMessages !== undefined ? { newMessages: appendedMessages } : {}),
+    minNewMessages: settings.minNewMessages,
+    reuseDecision
+  });
 
   const messageHashes = folded.map(messageHash);
   const foldHash = sha256(messageHashes.join("\n"));
@@ -218,27 +248,27 @@ export async function applyHelixProactiveCompact(
   const cached = getCompactSummary(key);
   if (cached) {
     const keptTokens = tokenize(keptOutput);
-    return assemble(input.body, keptOutput, cached.summary, {
+    return observe(assemble(input.body, keptOutput, cached.summary, {
       budgetTokens: resolvedBudget.budget,
       coveredCount: cached.coveredCount,
       diagnostic: `gen=${cached.coveredCount},source=cache,folded=${folded.length},tokens_after=${keptTokens},budget=${resolvedBudget.budget}${diagnosticSuffix}`,
       foldedCount: folded.length,
       source: "cache",
       tokensAfter: keptTokens
-    });
+    }));
   }
   if (reusedSummary) {
     // 复用集合与摘要都已确定时理论上 key 会命中;若索引/TTL 边界导致 miss,仍直接复用,
     //   绝不因为一次查询落空就重新生成摘要(否则缓存前缀被打断)。
     const keptTokens = tokenize(keptOutput);
-    return assemble(input.body, keptOutput, reusedSummary.summary, {
+    return observe(assemble(input.body, keptOutput, reusedSummary.summary, {
       budgetTokens: resolvedBudget.budget,
       coveredCount: reusedSummary.coveredCount,
       diagnostic: `gen=${reusedSummary.coveredCount},source=cache,folded=${folded.length},tokens_after=${keptTokens},budget=${resolvedBudget.budget}${diagnosticSuffix}`,
       foldedCount: folded.length,
       source: "cache",
       tokensAfter: keptTokens
-    });
+    }));
   }
 
   const stored = usedIntraTurn ? null : findPrefixSummary(sessionId, messageHashes);
@@ -263,7 +293,7 @@ export async function applyHelixProactiveCompact(
   const source: ProactiveCompactSource = stored ? "incremental" : "model";
   const keptTokens = tokenize(keptOutput);
   const summaryTokens = tokenize([{ content: summary.text, role: "assistant" }]);
-  return assemble(input.body, keptOutput, summary.text, {
+  return observe(assemble(input.body, keptOutput, summary.text, {
     budgetTokens: resolvedBudget.budget,
     coveredCount: summary.coveredCount,
     diagnostic: `gen=${summary.coveredCount},source=${source},folded=${folded.length},tokens_after=${keptTokens},summary_tokens=${summaryTokens},budget=${resolvedBudget.budget}${diagnosticSuffix}`,
@@ -271,7 +301,7 @@ export async function applyHelixProactiveCompact(
     source,
     summaryTokens,
     tokensAfter: keptTokens
-  });
+  }));
 }
 
 // ============= 切点 =============

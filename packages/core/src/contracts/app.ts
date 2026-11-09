@@ -2337,6 +2337,12 @@ export type CompressionProactiveCompactStat = {
   budgetTokens?: number;
   /** compact 之前(仅 helix 压缩后)的 token 数,用于对比。 */
   preCompactTokens: number;
+  /** 相对上一条摘要新增的会话消息条数(无上条摘要时为空)。 */
+  newMessages?: number;
+  /** 生效的「积攒」阈值。 */
+  minNewMessages?: number;
+  /** 重摘判定:reuse / regenerate / no-summary / reconstruct-failed / over-2x-budget / history-shrank / off。 */
+  reuseDecision?: string;
 };
 
 export type RequestLogEntry = {

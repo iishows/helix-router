@@ -2426,3 +2426,29 @@ test("parseProactiveCompactJson: 非法/缺字段返回 undefined", async () => 
     { coveredCount: 0, foldedCount: 0, preCompactTokens: 100, source: "cache", tokensAfter: 10 }
   );
 });
+
+test("parseProactiveCompactJson: 重摘判定字段(新增条数/阈值/结论)必须透传,不得被白名单丢弃", async () => {
+  const { parseProactiveCompactJson } = await import("@ccr/core/observability/request-log-store.ts");
+  assert.deepEqual(
+    parseProactiveCompactJson(JSON.stringify({
+      coveredCount: 899,
+      foldedCount: 236,
+      minNewMessages: 200,
+      newMessages: 150,
+      preCompactTokens: 136000,
+      reuseDecision: "reuse",
+      source: "cache",
+      tokensAfter: 98000
+    })),
+    {
+      coveredCount: 899,
+      foldedCount: 236,
+      minNewMessages: 200,
+      newMessages: 150,
+      preCompactTokens: 136000,
+      reuseDecision: "reuse",
+      source: "cache",
+      tokensAfter: 98000
+    }
+  );
+});

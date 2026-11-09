@@ -222,6 +222,8 @@ export function formatLogCompressSummary(
     titleParts.push(
       `主动 compact(${sourceLabel}): 折叠 ${compact.foldedCount.toLocaleString()} 条 · ${compact.preCompactTokens.toLocaleString()}→${compact.tokensAfter.toLocaleString()} tok${budgetPart}`
     );
+    const decision = compactReuseDecisionLabel(compact);
+    if (decision) titleParts.push(`重摘判定: ${decision}`);
   }
   if (hashCount > 0) titleParts.push(`hash 占位 ${hashCount}`);
   if (qaCompressed > 0) titleParts.push(`Q&A 对占位 ${qaCompressed}`);
@@ -279,6 +281,9 @@ function parseCompactHeader(
     if (tokensAfter === undefined || preCompactTokens === undefined) return undefined;
     const summaryTokens = num(parsed.summaryTokens);
     const budgetTokens = num(parsed.budgetTokens);
+    const newMessages = num(parsed.newMessages);
+    const minNewMessages = num(parsed.minNewMessages);
+    const reuseDecision = typeof parsed.reuseDecision === "string" ? parsed.reuseDecision : undefined;
     return {
       coveredCount: num(parsed.coveredCount) ?? 0,
       foldedCount: num(parsed.foldedCount) ?? 0,
@@ -286,10 +291,47 @@ function parseCompactHeader(
       source: parsed.source,
       ...(summaryTokens !== undefined ? { summaryTokens } : {}),
       ...(budgetTokens !== undefined ? { budgetTokens } : {}),
+      ...(newMessages !== undefined ? { newMessages } : {}),
+      ...(minNewMessages !== undefined ? { minNewMessages } : {}),
+      ...(reuseDecision !== undefined ? { reuseDecision } : {}),
       tokensAfter
     };
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * 2026-11-09: compact 重摘判定的人话标签(日志 title / 详情共用)。
+ *   判定值由 gateway 的 applyHelixProactiveCompact 写入,含实际新增条数与阈值。
+ */
+export function compactReuseDecisionLabel(compact: {
+  reuseDecision?: string;
+  newMessages?: number;
+  minNewMessages?: number;
+}): string | undefined {
+  const decision = compact.reuseDecision;
+  if (!decision) return undefined;
+  const counts = compact.newMessages !== undefined && compact.minNewMessages !== undefined
+    ? `（新增 ${compact.newMessages.toLocaleString()} / 阈值 ${compact.minNewMessages.toLocaleString()}）`
+    : "";
+  switch (decision) {
+    case "reuse":
+      return `复用摘要${counts}`;
+    case "regenerate":
+      return `重摘${counts}`;
+    case "no-summary":
+      return "无历史摘要（首次生成）";
+    case "reconstruct-failed":
+      return `复用失败（哈希重建不匹配），已重摘${counts}`;
+    case "over-2x-budget":
+      return `复用会超 2× 预算，已重摘${counts}`;
+    case "history-shrank":
+      return `会话历史回退，已重摘${counts}`;
+    case "off":
+      return "阈值关闭（minNewMessages=0）";
+    default:
+      return decision;
   }
 }
 

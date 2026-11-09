@@ -6197,6 +6197,9 @@ export function parseProactiveCompactJson(raw: string | undefined): CompressionP
   }
   const summaryTokens = num(parsed.summaryTokens);
   const budgetTokens = num(parsed.budgetTokens);
+  const newMessages = num(parsed.newMessages);
+  const minNewMessages = num(parsed.minNewMessages);
+  const reuseDecision = typeof parsed.reuseDecision === "string" ? parsed.reuseDecision : undefined;
   return {
     coveredCount: num(parsed.coveredCount) ?? 0,
     foldedCount: num(parsed.foldedCount) ?? 0,
@@ -6204,6 +6207,9 @@ export function parseProactiveCompactJson(raw: string | undefined): CompressionP
     source: parsed.source,
     ...(summaryTokens !== undefined ? { summaryTokens } : {}),
     ...(budgetTokens !== undefined ? { budgetTokens } : {}),
+    ...(newMessages !== undefined ? { newMessages } : {}),
+    ...(minNewMessages !== undefined ? { minNewMessages } : {}),
+    ...(reuseDecision !== undefined ? { reuseDecision } : {}),
     tokensAfter
   };
 }

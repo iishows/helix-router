@@ -224,6 +224,8 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       "不压缩时 prompt (同口径估算)": "Prompt without compression (same basis)",
       "上游实收 prompt (含 system/tools)": "Upstream prompt (incl. system/tools)",
       "端到端节省 (prompt 口径)": "End-to-end saving (prompt basis)",
+      "compact 重摘判定": "Compaction re-summary decision",
+      "新增条数 < 阈值(minNewMessages)时复用旧摘要,保证 body 纯前缀扩展;达到阈值才重摘(会打断一次缓存)": "Reuses the previous summary while new messages stay below minNewMessages, keeping the body a pure prefix extension; a re-summary happens only at the threshold (which breaks the cache once).",
       "只统计会被压缩的 messages(user/assistant);system prompt 与 tools 不计入,所以不能直接和「上游实收 prompt」比较": "Counts only compressible messages (user/assistant); system prompt and tools are excluded, so this is not directly comparable to the upstream prompt.",
       "= baseline + 本次实际上下文开销(system/tools)。与下一行「上游实收 prompt」同口径,可直接相减": "= baseline + the actual system/tools overhead of this request. Same basis as the upstream prompt below, so they can be subtracted directly.",
       "= LLM input + cache_read。含从不被压缩的 system/tools,与上一行同口径;不要直接和 baseline 相减": "= LLM input + cache_read, including system/tools that are never compressed. Same basis as the row above; do not subtract it from baseline directly.",

@@ -1117,6 +1117,9 @@ async function applyHelixCompressorTransform(
           source: compacted.source,
           ...(compacted.summaryTokens !== undefined ? { summaryTokens: compacted.summaryTokens } : {}),
           ...(compacted.budgetTokens !== undefined ? { budgetTokens: compacted.budgetTokens } : {}),
+          ...(compacted.newMessages !== undefined ? { newMessages: compacted.newMessages } : {}),
+          ...(compacted.minNewMessages !== undefined ? { minNewMessages: compacted.minNewMessages } : {}),
+          ...(compacted.reuseDecision !== undefined ? { reuseDecision: compacted.reuseDecision } : {}),
           tokensAfter: compacted.tokensAfter
         };
         const compactJson = JSON.stringify({
@@ -1126,6 +1129,9 @@ async function applyHelixCompressorTransform(
           source: compacted.source,
           ...(compacted.summaryTokens !== undefined ? { summaryTokens: compacted.summaryTokens } : {}),
           ...(compacted.budgetTokens !== undefined ? { budgetTokens: compacted.budgetTokens } : {}),
+          ...(compacted.newMessages !== undefined ? { newMessages: compacted.newMessages } : {}),
+          ...(compacted.minNewMessages !== undefined ? { minNewMessages: compacted.minNewMessages } : {}),
+          ...(compacted.reuseDecision !== undefined ? { reuseDecision: compacted.reuseDecision } : {}),
           tokensAfter: compacted.tokensAfter
         });
         // 跨进程通道必须是 `x-helix-compressor-*` 命名空间 —— 落到上游 provider 边界的

@@ -1273,15 +1273,25 @@ test("minNewMessages=200 边界: 追加 150 条仍复用, 满 200 条才重生�
     assert.ok(a, "首轮应折叠并生成摘要");
     assert.equal(a.source, "model");
     assert.equal(calls.length, 1);
+    assert.equal(a.reuseDecision, "no-summary", "首轮无历史摘要");
+    assert.equal(a.minNewMessages, 200);
+    assert.equal(a.newMessages, undefined);
 
     const b = await compactWith(append(150), "sess-threshold-200", { minNewMessages: 200 });
     assert.ok(b, "追加 150 条后仍应压缩");
     assert.equal(b.source, "cache", "追加 150 < 200 必须复用摘要");
     assert.equal(calls.length, 1, "未达阈值不得发起新的摘要调用");
+    assert.equal(b.reuseDecision, "reuse");
+    assert.equal(b.newMessages, 150, "诊断必须记录实际新增条数");
+    assert.equal(b.minNewMessages, 200);
+    assert.match(b.diagnostic, /new_msgs=150,min_new=200,reuse=reuse/);
 
     const c = await compactWith(append(210), "sess-threshold-200", { minNewMessages: 200 });
     assert.ok(c, "追加 210 条后仍应压缩");
     assert.ok(c.source === "model" || c.source === "incremental", "达到阈值应允许重生成摘要");
     assert.equal(calls.length, 2, "达到阈值应新增一次摘要调用");
+    assert.equal(c.reuseDecision, "regenerate");
+    assert.equal(c.newMessages, 210);
+    assert.match(c.diagnostic, /new_msgs=210,min_new=200,reuse=regenerate/);
   });
 });
