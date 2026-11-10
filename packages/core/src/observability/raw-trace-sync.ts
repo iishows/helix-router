@@ -1723,7 +1723,9 @@ function recallTokensFromInternalToolStats(
   }
 }
 
-const maxRecallTokenizeChars = 200_000;
+// 2026-11-10: 200_000 → 4_096。gpt-tokenizer 对长重复串呈二次方级变慢(实测
+//   `'x'.repeat(200_000)` >30s,会卡死网关主线程);采样 4K 约 40ms,按比例外推足够。
+const maxRecallTokenizeChars = 4_096;
 
 function readUnknownHeader(headers: unknown, name: string): unknown {
   if (!isRecord(headers)) return undefined;
