@@ -25,7 +25,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { encode as gptEncode } from "gpt-tokenizer";
+import { countTokensCapped } from "@ccr/core/token-count";
 import type { AppConfig, GatewayProviderConfig, GatewayProviderProtocol } from "@ccr/core/contracts/app";
 import { HELIX_RECALL_MODEL_PREFIX } from "@ccr/core/contracts/app";
 import { hasExplicitCompactSignal, extractArchiveAssistantText } from "@ccr/core/gateway/context-archive/protocol";
@@ -1133,7 +1133,7 @@ function sha256(value: string): string {
 function tokenize(messages: unknown[]): number {
   if (!Array.isArray(messages) || messages.length === 0) return 0;
   try {
-    return gptEncode(JSON.stringify(messages)).length;
+    return countTokensCapped(JSON.stringify(messages));
   } catch {
     return 0;
   }

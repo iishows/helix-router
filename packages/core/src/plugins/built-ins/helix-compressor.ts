@@ -14,7 +14,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { encode as gptEncode } from "gpt-tokenizer";
+import { countTokensCapped } from "@ccr/core/token-count";
 import type {
   GatewayPluginRequestTransformHandler,
   GatewayPluginRequestTransformResult,
@@ -715,7 +715,7 @@ function tokenizeMessages(messages: LLMMessage[]): number {
   // 用 messages 的 JSON 表示做 token 化(更接近实际 LLM 看到的格式)
   try {
     const serialized = JSON.stringify(messages);
-    return gptEncode(serialized).length;
+    return countTokensCapped(serialized);
   } catch {
     // fallback:chars 估算
     return Math.round((countChars(messages) / 3) * 1.05);
@@ -1362,7 +1362,7 @@ export const helixCompressorResponseHook: GatewayPluginResponseHookHandler = asy
   //   从 post(压缩后 messages)口径里扣掉(上游实收 = post + 召回回填 + system/tools)。
   //   用与 baseline 相同的 gpt-tokenizer(cl100k_base)口径,保证和 post 可比。
   const recallTokens = messagesToAppend.length > 0
-    ? gptEncode(JSON.stringify(messagesToAppend)).length
+    ? countTokensCapped(JSON.stringify(messagesToAppend))
     : 0;
 
   // 审计日志(V2 hc_recall + V3.2 history_recall 合并统计)

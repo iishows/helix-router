@@ -1,7 +1,7 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
-import { encode as gptEncode } from "gpt-tokenizer";
+import { countTokensCapped } from "@ccr/core/token-count";
 import type { ApiKeyConfig, AppConfig, GatewayProviderConfig, GatewayProviderProtocol, ProfileConfig, RouterRule } from "@ccr/core/contracts/app";
 import { HELIX_RECALL_MODEL_PREFIX } from "@ccr/core/contracts/app";
 import {
@@ -1063,7 +1063,7 @@ async function applyHelixCompressorTransform(
   if (reqBody && Array.isArray(reqBody.messages)) {
     try {
       // 拿全部 messages 序列化为 JSON,tokenize — 与 plugin 现有的 tokenizeMessages 走同一路径
-      preCompressionTokens = gptEncode(JSON.stringify(reqBody.messages)).length;
+      preCompressionTokens = countTokensCapped(JSON.stringify(reqBody.messages));
     } catch {
       preCompressionTokens = 0;
     }
