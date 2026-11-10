@@ -1,6 +1,6 @@
 {
   "name": "@claude-code-router/electron",
-  "version": "3.2.14",
+  "version": "3.2.15",
   "private": true,
   "description": "Claude Code Router Electron desktop shell.",
   "author": "musistudio",
