@@ -295,6 +295,8 @@ export interface HelixCompressorConfig {
   textUploadMinChars?: number;
   /** 上传后保留的预览字符数(默认 400)。 */
   textUploadPreviewChars?: number;
+  /** MCP 请求体上限(字节,默认 4MB)。超过时图片先压缩再上传;服务端上限调大后可同步调大。 */
+  imageUploadMaxBodyBytes?: number;
   /** 主动 compact 摘要缓存 TTL(ms,默认 3 天)。 */
   proactiveCompactCacheTtlMs?: number;
   /**
@@ -402,6 +404,7 @@ export const HELIX_COMPRESSOR_DEFAULTS: HelixCompressorConfig = {
   textUploadEnabled: COS_UPLOAD_DEFAULTS.textEnabled,
   textUploadMinChars: COS_UPLOAD_DEFAULTS.textMinChars,
   textUploadPreviewChars: COS_UPLOAD_DEFAULTS.textPreviewChars,
+  imageUploadMaxBodyBytes: COS_UPLOAD_DEFAULTS.maxBodyBytes,
   recallModelPatterns: [],
   recallModelExcludePatterns: [],
   recallModelDetected: false,
@@ -789,7 +792,8 @@ function imageUploadSettings(config: HelixCompressorConfig): CosUploadSettings {
     scope,
     textEnabled: config.textUploadEnabled !== false,
     textMinChars: positive(config.textUploadMinChars, COS_UPLOAD_DEFAULTS.textMinChars),
-    textPreviewChars: positive(config.textUploadPreviewChars, COS_UPLOAD_DEFAULTS.textPreviewChars)
+    textPreviewChars: positive(config.textUploadPreviewChars, COS_UPLOAD_DEFAULTS.textPreviewChars),
+    maxBodyBytes: positive(config.imageUploadMaxBodyBytes, COS_UPLOAD_DEFAULTS.maxBodyBytes)
   };
 }
 
@@ -816,6 +820,7 @@ function parseConfig(value: unknown): HelixCompressorConfig {
     ...(typeof value.textUploadEnabled === "boolean" ? { textUploadEnabled: value.textUploadEnabled } : {}),
     ...(typeof value.textUploadMinChars === "number" ? { textUploadMinChars: value.textUploadMinChars } : {}),
     ...(typeof value.textUploadPreviewChars === "number" ? { textUploadPreviewChars: value.textUploadPreviewChars } : {}),
+    ...(typeof value.imageUploadMaxBodyBytes === "number" ? { imageUploadMaxBodyBytes: value.imageUploadMaxBodyBytes } : {}),
     ...(typeof value.keepRecentTurns === "number" ? { keepRecentTurns: value.keepRecentTurns } : {}),
     ...(typeof value.aggressiveFolding === "boolean" ? { aggressiveFolding: value.aggressiveFolding } : {}),
     ...(typeof value.minFoldedTokens === "number" ? { minFoldedTokens: value.minFoldedTokens } : {}),

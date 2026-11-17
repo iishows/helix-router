@@ -20,6 +20,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { downscaleImageDataAsync, IMAGE_DOWNSCALE_DEFAULTS } from "./image-downscale";
 
 export type CosUploadScope = "tool" | "all";
 
@@ -37,6 +38,14 @@ export type CosUploadSettings = {
   textMinChars: number;
   /** 替换后保留的预览字符数(默认 400)。 */
   textPreviewChars: number;
+  /**
+   * MCP tools/call 请求体上限(字节,默认 4MB)。
+   *
+   * 线上 /mcp 在未调大服务端上限时会以 413 拒绝 >4MB 的请求。超过该预算的图片
+   * **先降采样压缩**再上传;压缩后仍超限则放弃这次上传(消息由调用方折成标记)。
+   * 服务端上限调大后可同步调大此值,从而上传原图。
+   */
+  maxBodyBytes: number;
 };
 
 export const COS_UPLOAD_DEFAULTS: CosUploadSettings = {
@@ -50,7 +59,9 @@ export const COS_UPLOAD_DEFAULTS: CosUploadSettings = {
   scope: "all",
   textEnabled: true,
   textMinChars: 32 * 1024,
-  textPreviewChars: 400
+  textPreviewChars: 400,
+  // 线上 /mcp 的请求体硬上限(实测 5MB 图返回 413 request body exceeds 4194304 bytes)。
+  maxBodyBytes: 4 * 1024 * 1024
 };
 
 type MediaSlot = {
@@ -158,15 +169,53 @@ export async function uploadImageBase64(
   if (cached) return cached;
   if (isUploadFailed(key)) return undefined;
 
+  // 超过 MCP 请求体预算的图片先压缩再上传(否则 /mcp 会以 413 拒绝整份请求)。
+  let uploadData = data;
+  let uploadMime = mime || "image/png";
+  if (uploadData.length > bodyBudget(settings)) {
+    const compressed = await compressForUpload(uploadData, uploadMime, bodyBudget(settings));
+    if (!compressed) return undefined;
+    uploadData = compressed.data;
+    uploadMime = compressed.mime;
+  }
+
   const url = await callCosUpload({
-    data,
-    contentType: mime || "image/png",
-    filename: `ccr-${requestId ? requestId.slice(0, 24) : "image"}-${key.slice(0, 8)}${mimeToExt(mime)}`,
+    data: uploadData,
+    contentType: uploadMime,
+    filename: `ccr-${requestId ? requestId.slice(0, 24) : "image"}-${key.slice(0, 8)}${mimeToExt(uploadMime)}`,
     settings,
     cacheKey: key
   });
   if (url) cacheUpload(key, url);
   return url;
+}
+
+/** 请求体除 base64 外的固定开销(JSON-RPC 信封/字段名)按 4KB 预留。 */
+const BODY_OVERHEAD_BYTES = 4 * 1024;
+
+/** MCP 请求体中可用于载荷(base64 字符 ≈ 字节)的预算。 */
+function bodyBudget(settings: CosUploadSettings): number {
+  return Math.max(64 * 1024, settings.maxBodyBytes - BODY_OVERHEAD_BYTES);
+}
+
+/**
+ * 把超出 MCP 请求体预算的图片降采样压缩。返回 undefined 表示压不下来(调用方放弃上传)。
+ * 目标预算内尽量保画质:不追求召回场景的小尺寸,只保证能塞进请求体。
+ */
+async function compressForUpload(
+  data: string,
+  mime: string,
+  budget: number
+): Promise<{ data: string; mime: string } | undefined> {
+  const down = await downscaleImageDataAsync(data, mime, {
+    ...IMAGE_DOWNSCALE_DEFAULTS,
+    minDataChars: 1,
+    maxEdge: 2048,
+    jpegQuality: 80,
+    targetMaxChars: Math.floor(budget * 0.95)
+  });
+  if (!down || down.data.length > budget) return undefined;
+  return { data: down.data, mime: down.mime };
 }
 
 /**
@@ -228,8 +277,12 @@ export async function uploadTextContent(
   if (isUploadFailed(key)) return undefined;
 
   const json = looksLikeJson(text);
+  const encoded = Buffer.from(text, "utf8").toString("base64");
+  // 文本无法像图片那样降采样;超过请求体预算就直接放弃,交给占位符/召回兜底,
+  // 避免白白触发一次 413 与负缓存。
+  if (encoded.length > bodyBudget(settings)) return undefined;
   const url = await callCosUpload({
-    data: Buffer.from(text, "utf8").toString("base64"),
+    data: encoded,
     contentType: json ? "application/json" : "text/plain",
     filename: `ccr-${requestId ? requestId.slice(0, 24) : "text"}-${key.slice(0, 8)}${json ? ".json" : ".txt"}`,
     settings,

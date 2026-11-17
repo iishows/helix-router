@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import http from "node:http";
+import { PNG } from "pngjs";
 import {
   uploadMessagesMedia,
   uploadLargeToolOutputs,
@@ -18,9 +19,10 @@ import { helixCompressorTransform } from "@ccr/core/plugins/built-ins/helix-comp
 
 const TEST_MODEL = "MiniMax-M2.7";
 
-function startFakeMcp({ fail = false } = {}) {
+function startFakeMcp({ fail = false, maxBodyBytes = Infinity } = {}) {
   let calls = 0;
   let initCalls = 0;
+  let maxBodySeen = 0;
   const seen = [];
   const server = http.createServer((req, res) => {
     let body = "";
@@ -30,6 +32,12 @@ function startFakeMcp({ fail = false } = {}) {
       try { payload = JSON.parse(body); } catch { /* ignore */ }
       if (payload.method === "initialize") {
         initCalls += 1;
+      }
+      maxBodySeen = Math.max(maxBodySeen, Buffer.byteLength(body, "utf-8"));
+      if (Buffer.byteLength(body, "utf-8") > maxBodyBytes) {
+        res.statusCode = 413;
+        res.end("request body exceeds 4194304 bytes");
+        return;
       }
       if (fail) {
         res.statusCode = 500;
@@ -67,7 +75,7 @@ function startFakeMcp({ fail = false } = {}) {
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {
       const { port } = server.address();
-      resolve({ url: `http://127.0.0.1:${port}/mcp`, calls: () => calls, initCalls: () => initCalls, seen: () => seen, close: () => server.close() });
+      resolve({ url: `http://127.0.0.1:${port}/mcp`, calls: () => calls, initCalls: () => initCalls, seen: () => seen, maxBodySeen: () => maxBodySeen, close: () => server.close() });
     });
   });
 }
@@ -445,6 +453,99 @@ test("生产路径:大文本工具输出在 transform 中被换成 COS URL", asy
     assert.ok(serialized.includes("[tool output uploaded:"), "应包含上传标记");
     assert.ok(serialized.includes("https://cos.example.test/"), "应包含 COS URL");
     assert.ok(!serialized.includes(big), "原始大文本不应再发给上游");
+  } finally {
+    mcp.close();
+  }
+});
+
+// ============= 超过 MCP 请求体上限:先压缩再上传 =============
+
+/** 生成不可压缩(噪声)PNG:用来逼出「原图超过请求体预算」的场景。 */
+function noisyPng(width, height) {
+  const png = new PNG({ width, height });
+  let seed = 0x12345678;
+  for (let i = 0; i < png.data.length; i += 4) {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    png.data[i] = seed & 0xff;
+    png.data[i + 1] = (seed >>> 8) & 0xff;
+    png.data[i + 2] = (seed >>> 16) & 0xff;
+    png.data[i + 3] = 255;
+  }
+  return PNG.sync.write(png);
+}
+
+test("超过请求体上限的图片先压缩再上传,不再 413", async () => {
+  _clearUploadCacheForTest();
+  const limit = 256 * 1024;
+  const mcp = await startFakeMcp({ maxBodyBytes: limit });
+  try {
+    const data = noisyPng(700, 700).toString("base64");
+    assert.ok(data.length > limit, "测试前置:原图 base64 必须超过上限");
+
+    const input = [{
+      role: "user",
+      content: [{ type: "image", source: { type: "base64", media_type: "image/png", data } }]
+    }];
+    const result = await uploadMessagesMedia(input, settingsFor(mcp.url, { maxBodyBytes: limit }));
+
+    assert.equal(result.uploaded, 1, "压缩后应上传成功");
+    assert.equal(mcp.calls(), 1);
+    assert.ok(mcp.maxBodySeen() <= limit, `请求体必须在 ${limit} 字节内,实测 ${mcp.maxBodySeen()}`);
+    assert.equal(mcp.seen()[0].content_type, "image/jpeg", "不透明 PNG 压缩后按 JPEG 上传");
+    assert.match(result.messages[0].content[0].source.url, /^https:\/\/cos\.example\.test\//);
+    assert.ok(!JSON.stringify(result.messages).includes(data), "消息里不应留下原 base64");
+  } finally {
+    mcp.close();
+  }
+});
+
+test("上限以内的小图不做压缩,原样上传", async () => {
+  _clearUploadCacheForTest();
+  const limit = 1024 * 1024;
+  const mcp = await startFakeMcp({ maxBodyBytes: limit });
+  try {
+    const result = await uploadMessagesMedia(messages(), settingsFor(mcp.url, { maxBodyBytes: limit }));
+    assert.equal(result.uploaded, 2);
+    assert.equal(mcp.seen()[0].content_type, "image/png", "小图保持原格式");
+    assert.ok(mcp.maxBodySeen() <= limit);
+  } finally {
+    mcp.close();
+  }
+});
+
+test("超大且无法解码的媒体:放弃上传,不触发 413", async () => {
+  _clearUploadCacheForTest();
+  const limit = 128 * 1024;
+  const mcp = await startFakeMcp({ maxBodyBytes: limit });
+  try {
+    const junk = "A".repeat(200 * 1024); // 不是合法图片,压缩无从下手
+    const input = [{
+      role: "user",
+      content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: junk } }]
+    }];
+    const result = await uploadMessagesMedia(input, settingsFor(mcp.url, { maxBodyBytes: limit }));
+    assert.equal(result.uploaded, 0);
+    assert.equal(result.failed, 1);
+    assert.equal(mcp.calls(), 0, "不应发出必被 413 拒绝的请求");
+    assert.ok(mcp.maxBodySeen() <= limit, "不得把超限请求打到 /mcp");
+  } finally {
+    mcp.close();
+  }
+});
+
+test("超过请求体上限的文本:跳过上传,不触发 413", async () => {
+  _clearUploadCacheForTest();
+  const limit = 128 * 1024;
+  const mcp = await startFakeMcp({ maxBodyBytes: limit });
+  try {
+    const big = "T".repeat(150 * 1024); // base64 后 ~200KB > 预算
+    const input = [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: big }] }];
+    const result = await uploadLargeToolOutputs(input, settingsFor(mcp.url, { maxBodyBytes: limit, textMinChars: 10 }));
+    assert.equal(result.uploaded, 0);
+    assert.equal(result.failed, 1);
+    assert.equal(mcp.calls(), 0);
+    assert.ok(mcp.maxBodySeen() <= limit, "不得把超限请求打到 /mcp");
+    assert.equal(result.messages[0].content[0].content, big, "原文保持不动,交给占位符兜底");
   } finally {
     mcp.close();
   }
