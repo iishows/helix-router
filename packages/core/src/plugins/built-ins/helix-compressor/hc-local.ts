@@ -47,6 +47,25 @@ const LEGACY_PLACEHOLDER_PREFIX = "⟦CCR:";
 /** V4.5.10: media block 类型常量（budget.js 共享） */
 export const MEDIA_BLOCK_TYPES = new Set(["image", "image_url", "document", "video", "audio"]);
 
+/**
+ * V1.15(2026-11-17):最近消息里「内嵌 tool_result 的媒体」破例压缩阈值(JSON 字符数)。
+ *
+ * 背景:Anthropic 形状下客户端工具结果是
+ *   `{role:"user", content:[{type:"tool_result", content:[{type:"image", source:{...}}]}]}`,
+ * 媒体块嵌在 tool_result.content 内 —— 旧实现只看消息顶层块,这张图对媒体 pass 完全不可见;
+ * 且最近 2 条消息受 `skipIndices`(当前轮)保护。线上事故:一次 Read 1.2MB JPEG 返回
+ * 1.64MB base64,本地压缩与主动 compact 都无法处理,最终 981k tokens 提交,上游 400
+ * (`Input exceeds the context limit`)。
+ *
+ * 保护语义不变:当前轮的小图仍保留(模型正要看的图);只有单块大到足以撑爆上下文时才
+ * 破例压成占位符(原文进召回缓存,可经 hc_recall 取回)。
+ *
+ * 取值与降采样默认目标(targetMaxChars=128KB)对齐:降采样前置 pass 成功后,近期
+ * Read 图片通常已 ≤128KB,应保留给模型看;128KB 仍 ≈87k tokens,是「一张图吃掉
+ * 一个小上下文」的量级,再大就必须折成占位符。无法解码的格式(降采样失败)也由这里兜底。
+ */
+const RECENT_TOOL_RESULT_MEDIA_OVERRIDE_CHARS = 128 * 1024;
+
 // ============= 类型 =============
 
 export interface LocalCompressMessage {
@@ -342,6 +361,35 @@ function replaceTextBlocksWithPlaceholder(
  *   - Local 修正:protectFinalUserQuestion=true 时,最后一条 user 消息的索引
  *     从候选范围中剔除(云端 [0, keepFrom) 会把它包含进去)。
  */
+/**
+ * V1.16:压缩器「当前轮保护」的消息下标集合。
+ *
+ * 规则与 `collectBlockCandidates` 完全一致:第一条 user 消息 + 末尾
+ * `keepRecentPairs * 2` 条 user/assistant 消息。
+ *
+ * 暴露给 helix-compressor 的降采样前置 pass:这些消息里的媒体不会被折成占位符
+ * (当前轮图片必须让模型看见),先降采样它们,避免压缩器把大图整条折掉。
+ */
+export function recentCompressionSkipIndices(
+  messages: Array<{ role?: unknown } | null | undefined>,
+  keepRecentPairs: number
+): Set<number> {
+  const skip = new Set<number>();
+  if (!Array.isArray(messages) || messages.length === 0) return skip;
+  const pairLimit = Math.max(0, Math.floor(keepRecentPairs)) * 2;
+  const firstUser = messages.findIndex((message) => message?.role === "user");
+  if (firstUser >= 0) skip.add(firstUser);
+  let recent = 0;
+  for (let i = messages.length - 1; i >= 0 && recent < pairLimit; i -= 1) {
+    const role = messages[i]?.role;
+    if (role === "user" || role === "assistant") {
+      skip.add(i);
+      recent += 1;
+    }
+  }
+  return skip;
+}
+
 function selectCompressibleIndices(
   messages: LocalCompressMessage[],
   keepRecentPairs: number,
@@ -466,6 +514,11 @@ interface BlockCandidate {
    * content 是"块数组的 JSON 字符串",可能含多张图;召回时 `qMedia` 需带回全部。
    */
   mediaBlocks?: Array<Record<string, unknown>>;
+  /**
+   * V1.15:媒体块嵌套在 `tool_result.content` 内时,内层下标(外层 `blockIdx` 指向
+   * tool_result 块)。Anthropic 形状的 Read 图片就是这种结构。
+   */
+  innerBlockIdx?: number;
   toolResultBlock?: Record<string, unknown>;
 }
 
@@ -578,32 +631,56 @@ function selectMediaCandidates(
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (!msg) continue;
-    if (skipIndices.has(i)) continue;
+    const recent = skipIndices.has(i);
     // V1.13:归一化 content,使"块数组的 JSON 字符串"(真实 OpenAI 形状的 tool 消息)
     //   里的媒体块也能被识别,否则内层图片对媒体 pass 不可见。
     const blocks = normalizeContentBlocks(msg.content);
     if (blocks) {
-      const media = blocks.filter(
-        (b) => b && typeof b === "object" && MEDIA_BLOCK_TYPES.has(b.type as string)
-      );
-      if (media.length === 0) continue;
-      const joined = JSON.stringify(media);
-      if (joined.includes(PLACEHOLDER_PREFIX) || joined.includes(LEGACY_PLACEHOLDER_PREFIX)) continue;
-      // V1.13:content 是"块数组的 JSON 字符串"(顶层字符串,非数组)→ 整条换成一个占位符,
-      //   召回时带回全部媒体块;原始数组则逐块替换(与既有逐块语义一致)。
-      if (typeof msg.content === "string") {
-        candidates.push(makeStringMediaCandidate(i, media));
-      } else {
-        for (let bi = 0; bi < blocks.length; bi++) {
-          const b = blocks[bi];
+      // 顶层媒体:当前轮/最近消息受保护(模型正要提问的那张图不压)。
+      if (!recent) {
+        const media = blocks.filter(
+          (b) => b && typeof b === "object" && MEDIA_BLOCK_TYPES.has(b.type as string)
+        );
+        if (media.length > 0) {
+          const joined = JSON.stringify(media);
+          if (!joined.includes(PLACEHOLDER_PREFIX) && !joined.includes(LEGACY_PLACEHOLDER_PREFIX)) {
+            // V1.13:content 是"块数组的 JSON 字符串"(顶层字符串,非数组)→ 整条换成一个占位符,
+            //   召回时带回全部媒体块;原始数组则逐块替换(与既有逐块语义一致)。
+            if (typeof msg.content === "string") {
+              candidates.push(makeStringMediaCandidate(i, media));
+            } else {
+              for (let bi = 0; bi < blocks.length; bi++) {
+                const b = blocks[bi];
+                if (!b || typeof b !== "object" || !MEDIA_BLOCK_TYPES.has(b.type as string)) continue;
+                const mediaJson = JSON.stringify(b);
+                if (mediaJson.includes(PLACEHOLDER_PREFIX) || mediaJson.includes(LEGACY_PLACEHOLDER_PREFIX)) continue;
+                candidates.push(makeMediaCandidate(i, bi, b));
+              }
+            }
+          }
+          continue;
+        }
+      }
+      // V1.15:Anthropic 形状的工具结果 —— 媒体嵌在 `tool_result.content` 内。
+      //   旧实现只看顶层块 → 这类图片永远漏压(线上 1.64MB base64 撑爆 1M 上下文)。
+      //   最近消息只在单块足够大时破例(见 RECENT_TOOL_RESULT_MEDIA_OVERRIDE_CHARS)。
+      for (let bi = 0; bi < blocks.length; bi++) {
+        const outer = blocks[bi];
+        if (!outer || typeof outer !== "object" || outer.type !== "tool_result") continue;
+        const inner = normalizeContentBlocks(outer.content);
+        if (!inner) continue;
+        for (let ii = 0; ii < inner.length; ii++) {
+          const b = inner[ii];
           if (!b || typeof b !== "object" || !MEDIA_BLOCK_TYPES.has(b.type as string)) continue;
           const mediaJson = JSON.stringify(b);
           if (mediaJson.includes(PLACEHOLDER_PREFIX) || mediaJson.includes(LEGACY_PLACEHOLDER_PREFIX)) continue;
-          candidates.push(makeMediaCandidate(i, bi, b));
+          if (recent && mediaJson.length < RECENT_TOOL_RESULT_MEDIA_OVERRIDE_CHARS) continue;
+          candidates.push(makeNestedMediaCandidate(i, bi, ii, b));
         }
       }
       continue;
     }
+    if (recent) continue;
     // 纯字符串(非块数组 JSON):若整体是 data URL 图片,按单个媒体块处理。
     if (typeof msg.content === "string") {
       const b = mediaBlockFromString(msg.content);
@@ -611,6 +688,31 @@ function selectMediaCandidates(
     }
   }
   return candidates;
+}
+
+/** V1.15:内嵌在 `tool_result.content` 里的媒体块候选。 */
+function makeNestedMediaCandidate(
+  msgIdx: number,
+  blockIdx: number,
+  innerBlockIdx: number,
+  b: Record<string, unknown>
+): BlockCandidate {
+  const mediaJson = JSON.stringify(b);
+  const hash = computeHash(mediaJson);
+  const placeholder = makePlaceholder(hash);
+  return {
+    msgIdx,
+    blockIdx,
+    innerBlockIdx,
+    text: mediaJson,
+    hash,
+    placeholder,
+    originalLen: mediaJson.length,
+    placeholderLen: placeholder.length,
+    savings: mediaJson.length - placeholder.length,
+    kind: "media",
+    mediaBlock: b
+  };
 }
 
 /**
@@ -711,7 +813,7 @@ function toolResultText(block: Record<string, unknown>): string {
 function selectToolResultCandidates(
   messages: LocalCompressMessage[],
   skipIndices: Set<number>,
-  opts: { threshold: number; keepRecent: number; maxCount: number }
+  opts: { threshold: number; keepRecent: number; maxCount: number; skipBlocks?: Set<string> }
 ): BlockCandidate[] {
   if (opts.threshold <= 0 || opts.maxCount <= 0) return [];
 
@@ -750,6 +852,8 @@ function selectToolResultCandidates(
   for (const item of all) {
     if (skipIndices.has(item.msgIdx)) continue;
     if (protectedSet.has(`${item.msgIdx}:${item.blockIdx}`)) continue;
+    // V1.15:已由内嵌媒体 pass 认领的 tool_result 块不再整块折叠。
+    if (opts.skipBlocks?.has(`${item.msgIdx}:${item.blockIdx}`)) continue;
     const text = item.text;
     if (text.length < opts.threshold) continue;
     if (isPlaceholderOnly(text)) continue;
@@ -798,8 +902,12 @@ function collectBlockCandidates(
   //   占位符(两 pass 争抢同一 blockIdx=-1 + 同一 msgIdx,后者会覆盖成 kind:"text")。
   const mediaCands = opts.compressMedia ? selectMediaCandidates(messages, skipIndices) : [];
   const mediaClaimed = new Set<number>();
+  // V1.15:内嵌媒体占用的 tool_result 块不能再被 tool_result pass 整块覆盖,否则
+  //   媒体占位符被冲掉、召回的图片条目变成孤儿。
+  const mediaClaimedToolResults = new Set<string>();
   for (const bc of mediaCands) {
     if (bc.blockIdx === -1) mediaClaimed.add(bc.msgIdx);
+    else if (bc.innerBlockIdx !== undefined) mediaClaimedToolResults.add(`${bc.msgIdx}:${bc.blockIdx}`);
   }
   const downstreamSkip =
     mediaClaimed.size > 0 ? new Set<number>([...skipIndices, ...mediaClaimed]) : skipIndices;
@@ -815,7 +923,8 @@ function collectBlockCandidates(
     ? selectToolResultCandidates(messages, downstreamSkip, {
         threshold: opts.toolResultThresholdChars,
         keepRecent: opts.keepRecentToolResults,
-        maxCount: opts.maxCompressToolResults
+        maxCount: opts.maxCompressToolResults,
+        skipBlocks: mediaClaimedToolResults
       })
     : [];
   return [...textCands, ...mediaCands, ...toolCands];
@@ -836,6 +945,23 @@ function applyBlockCandidate(m: LocalCompressMessage, bc: BlockCandidate): void 
     return;
   }
   const newBlocks = content.slice();
+  // V1.15:媒体块嵌在 tool_result.content 内(Anthropic 形状的 Read 图片)。
+  //   只替换内层媒体块,保留 tool_result / tool_use_id 配对。
+  if (bc.innerBlockIdx !== undefined) {
+    const block = content[bc.blockIdx] as Record<string, unknown> | undefined;
+    if (!block || typeof block !== "object") return;
+    const innerIsString = typeof block.content === "string";
+    const inner = normalizeContentBlocks(block.content);
+    if (!inner || bc.innerBlockIdx < 0 || bc.innerBlockIdx >= inner.length) return;
+    const nextInner = inner.slice();
+    nextInner[bc.innerBlockIdx] = { type: "text", text: bc.placeholder };
+    newBlocks[bc.blockIdx] = {
+      ...block,
+      content: innerIsString ? JSON.stringify(nextInner) : nextInner
+    };
+    m.content = newBlocks;
+    return;
+  }
   if (bc.kind === "tool_result") {
     const block = content[bc.blockIdx] as Record<string, unknown>;
     const newContent = Array.isArray(block.content)
@@ -975,17 +1101,7 @@ export function compressV3x(
       blockPlaceholderTotal = 0,
       blockCompressedCount = 0;
     if (blockThresholdChars > 0 || compressMedia || compressToolResults) {
-      const skipMsgIndices = new Set<number>();
-      const firstUserIdx = newMessages.findIndex((m) => m?.role === "user");
-      if (firstUserIdx >= 0) skipMsgIndices.add(firstUserIdx);
-      let recentCount = 0;
-      for (let i = newMessages.length - 1; i >= 0 && recentCount < keepRecentPairs * 2; i--) {
-        const role = newMessages[i]?.role;
-        if (role === "user" || role === "assistant") {
-          skipMsgIndices.add(i);
-          recentCount++;
-        }
-      }
+      const skipMsgIndices = recentCompressionSkipIndices(newMessages, keepRecentPairs);
       blockCandidates = collectBlockCandidates(newMessages, skipMsgIndices, {
         blockThresholdChars,
         compressMedia,
@@ -1110,17 +1226,7 @@ export function compressV3x(
   let blockPlaceholderTotal = 0;
   let blockCompressedCount = 0;
   if (blockThresholdChars > 0 || compressMedia || compressToolResults) {
-    const skipMsgIndices = new Set<number>();
-    const firstUserIdx = filteredMessages.findIndex((m) => m?.role === "user");
-    if (firstUserIdx >= 0) skipMsgIndices.add(firstUserIdx);
-    let recentCount = 0;
-    for (let i = filteredMessages.length - 1; i >= 0 && recentCount < keepRecentPairs * 2; i--) {
-      const role = filteredMessages[i]?.role;
-      if (role === "user" || role === "assistant") {
-        skipMsgIndices.add(i);
-        recentCount++;
-      }
-    }
+    const skipMsgIndices = recentCompressionSkipIndices(filteredMessages, keepRecentPairs);
     filteredMessages.forEach((m, i) => {
       if (skipMsgIndices.has(i)) return;
       if (!m) return;
