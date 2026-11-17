@@ -314,8 +314,21 @@ export function cleanup(now: number = Date.now()): number {
   const file = pathJoin(dir, CACHE_FILE_NAME);
   if (!existsSync(file)) return 0;
   const idx = ensureIndex();
+  // 没有任何过期条目时不再重写:重写只是把同样的内容复制一遍。
+  // 2026-11-17 实测生产目录 69MB/1.4 万条的重写需要 12.3s(逐条 openSync + 杀软扫描),
+  // 而 TTL 3 天内通常一条都没过期 —— 白白卡住事件循环。
+  let expired = 0;
+  for (const [, meta] of idx.offsets) {
+    if (meta.expires > 0 && meta.expires <= now) expired += 1;
+  }
+  if (expired === 0) {
+    lastCompactAt = Date.now();
+    return idx.offsets.size;
+  }
   const tmp = `${file}.tmp-${process.pid}`;
   const out = openSync(tmp, "w");
+  // 复用同一个 fd 读取:1.4 万次 openSync 在 Windows + 杀软下是主要的耗时来源。
+  let input: number | undefined;
   let kept = 0;
   // 批量写:旧实现每条记录一次 writeFileSync(70MB/14000 条 = 14000 次同步写),
   // 在 Windows + 杀软下能到几十秒,直接把请求卡住。这里攒到 ~1MB 再写。
@@ -328,8 +341,9 @@ export function cleanup(now: number = Date.now()): number {
     pendingBytes = 0;
   };
   try {
+    input = openSync(file, "r");
     for (const [, meta] of idx.offsets) {
-      const raw = readLineAt(file, meta.offset);
+      const raw = readLineFromFd(input, meta.offset);
       if (!raw) continue;
       const entry = safeParse(raw);
       if (!entry) continue;
@@ -343,6 +357,9 @@ export function cleanup(now: number = Date.now()): number {
     flush();
   } finally {
     closeSync(out);
+    if (input !== undefined) {
+      try { closeSync(input); } catch { /* ignore */ }
+    }
   }
   renameSync(tmp, file);
   index = undefined;
@@ -356,6 +373,19 @@ function readLineAt(file: string, offset: number): string | undefined {
   let fd: number | undefined;
   try {
     fd = openSync(file, "r");
+    return readLineFromFd(fd, offset);
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+}
+
+/** 在已打开的 fd 上读取 offset 处的一整行(compaction 批量读取时复用同一个 fd)。 */
+function readLineFromFd(fd: number, offset: number): string | undefined {
+  try {
     const chunks: Buffer[] = [];
     let pos = offset;
     let total = 0;
@@ -378,10 +408,6 @@ function readLineAt(file: string, offset: number): string | undefined {
     return undefined;
   } catch {
     return undefined;
-  } finally {
-    if (fd !== undefined) {
-      try { closeSync(fd); } catch { /* ignore */ }
-    }
   }
 }
 

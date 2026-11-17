@@ -148,6 +148,24 @@ test("cleanup removes expired and rewrites compacted file", () => {
   }
 });
 
+test("cleanup skips the rewrite when nothing is expired", () => {
+  const dir = freshDir();
+  try {
+    putBatch([["live1", { q: "1", a: "" }], ["live2", { q: "2", a: "" }]]);
+    const file = path.join(dir, "cache.jsonl");
+    const before = statSync(file);
+    const kept = cleanup();
+    const after = statSync(file);
+    assert.equal(kept, 2, "仍应报告所有未过期条目");
+    // 不重写:大小与 inode 都不变(renameSync 会换 inode)
+    assert.equal(after.size, before.size);
+    assert.equal(after.ino, before.ino);
+    assert.equal(get("live1").q, "1");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("resolveCacheDir throws when env not set", () => {
   const saved = process.env.HELIX_RECALL_CACHE_DIR;
   delete process.env.HELIX_RECALL_CACHE_DIR;
