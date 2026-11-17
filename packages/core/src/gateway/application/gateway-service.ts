@@ -36,10 +36,12 @@ import { normalizeRouteScriptResult, scriptResultPreview } from "@ccr/core/routi
 import { mediaService } from "@ccr/core/media/service";
 import { mediaToolsGatewayEndpoint } from "@ccr/core/mcp/grok-media-config";
 import { browserAutomationMcpEnabled } from "@ccr/core/mcp/toolhub-config";
+import { installConsoleWriteGuard } from "@ccr/core/platform/console-guard";
 import { installSocketTypeOfServiceCompat } from "@ccr/core/platform/socket-compat";
 import { profileApiKeyId } from "@ccr/core/profiles/api-key";
 import { setExternalLiveTokenRateSnapshot } from "@ccr/core/observability/stream-experience";
 
+installConsoleWriteGuard();
 installSocketTypeOfServiceCompat();
 
 const coreGatewayLiveTokenRateSourceId = "core-gateway";

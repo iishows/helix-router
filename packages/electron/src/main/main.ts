@@ -1,10 +1,12 @@
 import { app, dialog } from "electron";
 import { mkdirSync } from "node:fs";
+import { installConsoleWriteGuard } from "@ccr/core/platform/console-guard";
 import { installSocketTypeOfServiceCompat } from "@ccr/core/platform/socket-compat";
 import { markDesktopAppRuntime } from "@ccr/core/runtime/desktop-app";
 import { resolveRuntimeDataDir, setRuntimeAppPaths } from "@ccr/core/runtime/app-paths";
 import { copyMissingDirectoryContents, sameFilesystemPath } from "@ccr/core/storage/migration";
 
+installConsoleWriteGuard();
 installSocketTypeOfServiceCompat();
 markDesktopAppRuntime();
 
