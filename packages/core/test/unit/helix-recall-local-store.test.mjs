@@ -45,12 +45,28 @@ test("putBatch + get round-trips entries", () => {
   }
 });
 
-test("same hash written twice → last wins (idempotent, content-addressed)", () => {
+test("same hash: repeated putBatch is idempotent and does not grow the file", () => {
   const dir = freshDir();
   try {
-    putBatch([["h1", { q: "old", a: "" }]]);
-    putBatch([["h1", { q: "new", a: "" }]]);
-    assert.equal(get("h1").q, "new");
+    putBatch([["h1", { q: "same", a: "" }]]);
+    const file = path.join(dir, "cache.jsonl");
+    const before = statSync(file).size;
+    putBatch([["h1", { q: "same", a: "" }]]);
+    assert.equal(statSync(file).size, before, "同一 hash 不应重复追加");
+    assert.equal(get("h1").q, "same");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("expired entry is refreshed by a later putBatch", () => {
+  const dir = freshDir();
+  try {
+    putBatch([["h2", { q: "old", a: "" }]], 1);
+    const until = Date.now() + 5;
+    while (Date.now() < until) { /* wait for TTL */ }
+    putBatch([["h2", { q: "new", a: "" }]]);
+    assert.equal(get("h2").q, "new");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -258,6 +274,17 @@ test("multi-byte text within char budget can exceed byte budget", () => {
     assert.equal(entryFitsBudget("h-cjk", entry), false);
     assert.equal(putBatch([["h-cjk", entry]]), 0);
     assert.equal(get("h-cjk"), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("putBatch forceHashes overwrites an existing hash", () => {
+  const dir = freshDir();
+  try {
+    putBatch([["h3", { q: "old", a: "" }]]);
+    putBatch([["h3", { q: "new", a: "" }]], undefined, new Set(["h3"]));
+    assert.equal(get("h3").q, "new");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -20,12 +20,10 @@
     "@the-next-ai/bot-gateway-sdk": "^0.1.0",
     "better-sqlite3": "^12.11.1",
     "gpt-tokenizer": "^4.0.0",
-    "jpeg-js": "^0.4.4",
     "mammoth": "^1.13.0",
     "node-forge": "^1.4.0",
     "pdfjs-dist": "^6.4.299",
     "pm2": "^7.0.3",
-    "pngjs": "^7.0.0",
     "undici": "^7.29.0"
   }
 }

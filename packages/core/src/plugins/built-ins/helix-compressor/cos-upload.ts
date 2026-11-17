@@ -31,6 +31,12 @@ export type CosUploadSettings = {
   minDataChars: number;
   timeoutMs: number;
   scope: CosUploadScope;
+  /** 大文本工具输出上传开关(默认 true,随 enabled 生效)。 */
+  textEnabled: boolean;
+  /** tool 输出文本 ≥ 该字符数才上传(默认 32KB)。 */
+  textMinChars: number;
+  /** 替换后保留的预览字符数(默认 400)。 */
+  textPreviewChars: number;
 };
 
 export const COS_UPLOAD_DEFAULTS: CosUploadSettings = {
@@ -41,7 +47,10 @@ export const COS_UPLOAD_DEFAULTS: CosUploadSettings = {
   minDataChars: 1,
   timeoutMs: 30_000,
   // V1.17:启用上传后,用户图与工具图都必须走 URL(配置要求:不外发 base64)。
-  scope: "all"
+  scope: "all",
+  textEnabled: true,
+  textMinChars: 32 * 1024,
+  textPreviewChars: 400
 };
 
 type MediaSlot = {
@@ -69,7 +78,25 @@ let uploadBackoffUntil = 0;
 export function _clearUploadCacheForTest(): void {
   uploadCache.clear();
   sessions.clear();
+  failedUploads.clear();
   uploadBackoffUntil = 0;
+  lastRejectionWarningAt = 0;
+}
+
+/** 小并发执行(默认 3),用于同请求内多张图片/多段文本的上传。 */
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, async () => {
+    while (true) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 /**
@@ -92,19 +119,25 @@ export async function uploadMessagesMedia(
 
   let uploaded = 0;
   let failed = 0;
-  const replacements: Array<{ slot: MediaSlot; url: string }> = [];
-  // 同一请求内的重复图片只尝试一次(失败也不反复打 MCP)。
-  const attempted = new Map<string, string | undefined>();
-  for (const slot of eligible) {
+  // 同一请求内的重复图片只上传一次;上传并发 3,缩短多图首轮的等待。
+  const pending = new Map<string, Promise<string | undefined>>();
+  const urls = await mapLimit(eligible, 3, (slot) => {
     const key = createHash("sha256").update(slot.data).digest("hex");
-    const known = attempted.has(key);
-    const url = known ? attempted.get(key) : await uploadImageBase64(slot.data, slot.mime, settings, requestId);
-    if (!known) attempted.set(key, url);
+    let promise = pending.get(key);
+    if (!promise) {
+      promise = uploadImageBase64(slot.data, slot.mime, settings, requestId);
+      pending.set(key, promise);
+    }
+    return promise;
+  });
+  const replacements: Array<{ slot: MediaSlot; url: string }> = [];
+  for (let index = 0; index < eligible.length; index += 1) {
+    const url = urls[index];
     if (!url) {
       failed += 1;
       continue;
     }
-    replacements.push({ slot, url });
+    replacements.push({ slot: eligible[index], url });
     uploaded += 1;
   }
   if (replacements.length === 0) return { messages, uploaded, failed };
@@ -123,8 +156,98 @@ export async function uploadImageBase64(
   const key = createHash("sha256").update(data).digest("hex");
   const cached = uploadCache.get(key);
   if (cached) return cached;
+  if (isUploadFailed(key)) return undefined;
 
-  const session = await ensureSession(settings);
+  const url = await callCosUpload({
+    data,
+    contentType: mime || "image/png",
+    filename: `ccr-${requestId ? requestId.slice(0, 24) : "image"}-${key.slice(0, 8)}${mimeToExt(mime)}`,
+    settings,
+    cacheKey: key
+  });
+  if (url) cacheUpload(key, url);
+  return url;
+}
+
+/**
+ * 上传大段文本工具输出并替换成 URL + 预览。
+ *
+ * 适用:tool_result / role:"tool" 的纯文本内容 ≥ textMinChars。
+ * 替换后模型只看到 URL 与短预览;需要全文时由客户端的 fetch 工具按需读取
+ * (COS 是公网可访问的)。上传失败保持原文,后续仍由占位符/召回压缩兜底。
+ */
+export async function uploadLargeToolOutputs(
+  messages: unknown[],
+  settings: CosUploadSettings,
+  requestId?: string
+): Promise<{ messages: unknown[]; uploaded: number; failed: number }> {
+  if (!settings.enabled || !settings.textEnabled || !settings.mcpUrl) {
+    return { messages, uploaded: 0, failed: 0 };
+  }
+  const targets = collectToolTextTargets(messages, settings.textMinChars);
+  if (targets.length === 0) return { messages, uploaded: 0, failed: 0 };
+
+  let uploaded = 0;
+  let failed = 0;
+  const pending = new Map<string, Promise<string | undefined>>();
+  const urls = await mapLimit(targets, 3, (target) => {
+    const key = createHash("sha256").update("text:").update(target.text).digest("hex");
+    let promise = pending.get(key);
+    if (!promise) {
+      promise = uploadTextContent(target.text, settings, requestId);
+      pending.set(key, promise);
+    }
+    return promise;
+  });
+  const output = messages.slice();
+  for (let index = 0; index < targets.length; index += 1) {
+    const url = urls[index];
+    if (!url) {
+      failed += 1;
+      continue;
+    }
+    uploaded += 1;
+    const target = targets[index];
+    const marker = textMarker(target.text, url, settings.textPreviewChars);
+    output[target.msgIndex] = applyToolTextReplacement(output[target.msgIndex], target, marker);
+  }
+  return { messages: uploaded > 0 ? output : messages, uploaded, failed };
+}
+
+/** 单段文本上传(带 sha256 缓存)。 */
+export async function uploadTextContent(
+  text: string,
+  settings: CosUploadSettings,
+  requestId?: string
+): Promise<string | undefined> {
+  if (!settings.enabled || !settings.mcpUrl || !text) return undefined;
+  if (Date.now() < uploadBackoffUntil) return undefined;
+  const key = createHash("sha256").update("text:").update(text).digest("hex");
+  const cached = uploadCache.get(key);
+  if (cached) return cached;
+  if (isUploadFailed(key)) return undefined;
+
+  const json = looksLikeJson(text);
+  const url = await callCosUpload({
+    data: Buffer.from(text, "utf8").toString("base64"),
+    contentType: json ? "application/json" : "text/plain",
+    filename: `ccr-${requestId ? requestId.slice(0, 24) : "text"}-${key.slice(0, 8)}${json ? ".json" : ".txt"}`,
+    settings,
+    cacheKey: key
+  });
+  if (url) cacheUpload(key, url);
+  return url;
+}
+
+/** 上传到 COS(图片/文本共用),返回公网 URL。 */
+async function callCosUpload(input: {
+  data: string;
+  contentType: string;
+  filename: string;
+  settings: CosUploadSettings;
+  cacheKey: string;
+}): Promise<string | undefined> {
+  const session = await ensureSession(input.settings);
   if (!session) {
     uploadBackoffUntil = Date.now() + UPLOAD_BACKOFF_MS;
     return undefined;
@@ -136,27 +259,72 @@ export async function uploadImageBase64(
     params: {
       name: "cos_upload_image",
       arguments: {
-        image_base64: data,
-        content_type: mime || "image/png",
-        filename: `ccr-${requestId ? requestId.slice(0, 24) : "image"}-${key.slice(0, 8)}${mimeToExt(mime)}`
+        image_base64: input.data,
+        content_type: input.contentType,
+        filename: input.filename
       }
     }
   };
-  const response = await postMcp(session, payload, settings);
-  const url = extractUrl(response);
-  if (!url) {
-    // 会话可能已过期:丢掉会话并进入退避窗口,避免每轮都重试。
-    sessions.delete(sessionKey(settings));
-    uploadBackoffUntil = Date.now() + UPLOAD_BACKOFF_MS;
+  const response = await postMcp(session, payload, input.settings);
+  const url = extractUrl(response.payload);
+  if (url) return url;
+
+  const looksHtml = response.text.trimStart().startsWith("<");
+  const deterministic = looksHtml || (response.status >= 400 && response.status < 500);
+  if (deterministic) {
+    // 典型的 Nginx/WAF 请求体上限(返回 200 + HTML)。这是“这份内容太大”的确定性拒绝,
+    // 不是服务故障:不要全局退避(会连累小图),只对该内容做短期负缓存。
+    markUploadFailed(input.cacheKey);
+    warnDeterministicRejection(response.status, looksHtml);
     return undefined;
   }
+  // 会话可能已过期/服务临时故障:丢掉会话并进入退避窗口。
+  sessions.delete(sessionKey(input.settings));
+  uploadBackoffUntil = Date.now() + UPLOAD_BACKOFF_MS;
+  return undefined;
+}
+
+const FAILED_UPLOAD_TTL_MS = 10 * 60 * 1000;
+const failedUploads = new Map<string, number>();
+let lastRejectionWarningAt = 0;
+
+function markUploadFailed(key: string): void {
+  failedUploads.set(key, Date.now() + FAILED_UPLOAD_TTL_MS);
+  while (failedUploads.size > 512) {
+    const oldest = failedUploads.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    failedUploads.delete(oldest);
+  }
+}
+
+function isUploadFailed(key: string): boolean {
+  const until = failedUploads.get(key);
+  if (until === undefined) return false;
+  if (until > Date.now()) return true;
+  failedUploads.delete(key);
+  return false;
+}
+
+function warnDeterministicRejection(status: number, looksHtml: boolean): void {
+  const now = Date.now();
+  if (now - lastRejectionWarningAt < 5 * 60 * 1000) return;
+  lastRejectionWarningAt = now;
+  const detail = looksHtml ? "HTML body (HTTP " + status + ")" : "HTTP " + status;
+  console.warn(
+    `[helix-compressor] COS upload rejected by gateway: ${detail}. ` +
+      "This usually means the /mcp endpoint's Nginx/WAF request-body limit is too small " +
+      "(raise client_max_body_size / parameter buffer, or whitelist /mcp). " +
+      "Oversized media will be replaced with markers until uploads succeed."
+  );
+}
+
+function cacheUpload(key: string, url: string): void {
   uploadCache.set(key, url);
   while (uploadCache.size > UPLOAD_CACHE_MAX) {
     const oldest = uploadCache.keys().next().value as string | undefined;
     if (oldest === undefined) break;
     uploadCache.delete(oldest);
   }
-  return url;
 }
 
 // ============= MCP 会话 =============
@@ -210,7 +378,7 @@ async function postMcp(
   session: McpSession,
   payload: unknown,
   settings: CosUploadSettings
-): Promise<unknown> {
+): Promise<{ payload?: unknown; status: number; text: string }> {
   try {
     const res = await fetchWithTimeout(session.url, {
       method: "POST",
@@ -218,10 +386,9 @@ async function postMcp(
       body: JSON.stringify(payload)
     }, settings.timeoutMs);
     const text = await res.text();
-    if (!res.ok) return undefined;
-    return parseJsonRpc(text);
+    return { payload: res.ok ? parseJsonRpc(text) : undefined, status: res.status, text };
   } catch {
-    return undefined;
+    return { status: 0, text: "" };
   }
 }
 
@@ -277,6 +444,108 @@ function extractUrl(response: unknown): string | undefined {
     if (match) return match[0];
   }
   return undefined;
+}
+
+// ============= 大文本工具输出 =============
+
+type ToolTextTarget =
+  | { kind: "openai"; msgIndex: number; text: string }
+  | { kind: "string"; msgIndex: number; blockIndex: number; text: string }
+  | { kind: "blocks"; msgIndex: number; blockIndex: number; textIndexes: number[]; text: string };
+
+function collectToolTextTargets(messages: unknown[], minChars: number): ToolTextTarget[] {
+  const targets: ToolTextTarget[] = [];
+  for (let msgIndex = 0; msgIndex < messages.length; msgIndex += 1) {
+    const message = messages[msgIndex];
+    if (!isRecord(message)) continue;
+    const content = message.content;
+    if (typeof content === "string") {
+      if (message.role !== "tool") continue;
+      if (isUploadMarker(content)) continue;
+      if (content.length >= minChars) {
+        targets.push({ kind: "openai", msgIndex, text: content });
+      }
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    for (let blockIndex = 0; blockIndex < content.length; blockIndex += 1) {
+      const block = content[blockIndex];
+      if (!isRecord(block) || block.type !== "tool_result") continue;
+      if (typeof block.content === "string") {
+        if (isUploadMarker(block.content)) continue;
+        if (block.content.length >= minChars) {
+          targets.push({ msgIndex, blockIndex, kind: "string", text: block.content });
+        }
+        continue;
+      }
+      const inner = normalizeBlocks(block.content);
+      if (!inner) continue;
+      const textIndexes: number[] = [];
+      const parts: string[] = [];
+      for (let index = 0; index < inner.length; index += 1) {
+        const item = inner[index];
+        if (isRecord(item) && item.type === "text" && typeof item.text === "string") {
+          textIndexes.push(index);
+          parts.push(item.text);
+        }
+      }
+      const text = parts.join("\n");
+      if (textIndexes.length === 0 || text.length < minChars || isUploadMarker(text)) continue;
+      targets.push({ msgIndex, blockIndex, kind: "blocks", textIndexes, text });
+    }
+  }
+  return targets;
+}
+
+function applyToolTextReplacement(
+  message: unknown,
+  target: ToolTextTarget,
+  marker: string
+): unknown {
+  const msg = message as Record<string, unknown>;
+  if (target.kind === "openai") {
+    return { ...msg, content: marker };
+  }
+  const content = ((msg.content as unknown[]) ?? []).slice();
+  const block = content[target.blockIndex] as Record<string, unknown>;
+  if (target.kind === "string") {
+    content[target.blockIndex] = { ...block, content: marker };
+    return { ...msg, content };
+  }
+  const inner = (normalizeBlocks(block.content) ?? []).slice();
+  const first = target.textIndexes[0];
+  const textIndexes = new Set(target.textIndexes);
+  const nextInner: Array<Record<string, unknown>> = [];
+  for (let index = 0; index < inner.length; index += 1) {
+    if (textIndexes.has(index)) {
+      if (index === first) nextInner.push({ type: "text", text: marker });
+      continue;
+    }
+    nextInner.push(inner[index]);
+  }
+  content[target.blockIndex] = { ...block, content: nextInner };
+  return { ...msg, content };
+}
+
+function textMarker(text: string, url: string, previewChars: number): string {
+  const limit = Math.max(0, Math.floor(previewChars));
+  const preview = text.slice(0, limit).replace(/\s+/g, " ").trim();
+  return `[tool output uploaded: ${text.length} chars; url: ${url}; preview: ${preview}${text.length > limit ? "..." : ""}]`;
+}
+
+function isUploadMarker(text: string): boolean {
+  return text.trimStart().startsWith("[tool output uploaded:");
+}
+
+function looksLikeJson(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return false;
+  try {
+    JSON.parse(trimmed);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ============= 消息遍历/替换 =============
@@ -338,6 +607,60 @@ function collectMediaSlots(messages: unknown[]): MediaSlot[] {
     }
   }
   return slots;
+}
+
+/**
+ * V1.17:把所有残余 base64 媒体替换成文本标记(上传失败/未启用上传时的兜底)。
+ * 不写召回、不留原文——召回也不会再把大 base64 带回来。
+ */
+export function stripBase64Media(
+  messages: unknown[],
+  marker: (mime: string, dataLength: number) => string
+): { messages: unknown[]; stripped: number } {
+  const slots = collectMediaSlots(messages);
+  if (slots.length === 0) return { messages, stripped: 0 };
+  const replacements = slots.map((slot) => ({ slot, text: marker(slot.mime, slot.data.length) }));
+  return { messages: replaceMediaWithText(messages, replacements), stripped: slots.length };
+}
+
+function replaceMediaWithText(
+  messages: unknown[],
+  replacements: Array<{ slot: MediaSlot; text: string }>
+): unknown[] {
+  const byMessage = new Map<number, Array<{ slot: MediaSlot; text: string }>>();
+  for (const replacement of replacements) {
+    const list = byMessage.get(replacement.slot.msgIndex);
+    if (list) list.push(replacement);
+    else byMessage.set(replacement.slot.msgIndex, [replacement]);
+  }
+  const output = messages.slice();
+  for (const [msgIndex, list] of byMessage) {
+    const message = messages[msgIndex] as Record<string, unknown>;
+    if (list.every(({ slot }) => slot.blockIndex === -1)) {
+      const inner = (normalizeBlocks(message.content) ?? []).slice();
+      for (const { slot, text } of list) {
+        inner[slot.innerIndex!] = { type: "text", text };
+      }
+      output[msgIndex] = { ...message, content: JSON.stringify(inner) };
+      continue;
+    }
+    const content = ((message.content as unknown[]) ?? []).slice();
+    for (const { slot, text } of list) {
+      if (slot.innerIndex === undefined) {
+        content[slot.blockIndex] = { type: "text", text };
+        continue;
+      }
+      const outer = content[slot.blockIndex] as Record<string, unknown>;
+      const inner = (normalizeBlocks(outer.content) ?? []).slice();
+      inner[slot.innerIndex] = { type: "text", text };
+      content[slot.blockIndex] = {
+        ...outer,
+        content: slot.innerIsString ? JSON.stringify(inner) : inner
+      };
+    }
+    output[msgIndex] = { ...message, content };
+  }
+  return output;
 }
 
 function replaceMediaWithUrls(

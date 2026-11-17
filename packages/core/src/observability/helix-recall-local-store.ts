@@ -13,7 +13,7 @@
  *   - TTL 默认 3 天。
  */
 
-import { appendFileSync, existsSync, mkdirSync, openSync, readSync, closeSync, renameSync, statSync, writeFileSync, unlinkSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, openSync, readdirSync, readSync, writeSync, closeSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { join as pathJoin } from "node:path";
 
 export interface RecallCacheEntry {
@@ -72,8 +72,8 @@ interface CacheIndex {
   scanned: number;
   /** 上次扫描时文件的 inode;被 compaction(renameSync)替换后会变化 */
   ino: number;
-  /** hash -> 该 hash 最近一次出现的行起始字节偏移 */
-  offsets: Map<string, number>;
+  /** hash -> 行偏移与过期时间(毫秒;0 = 不过期) */
+  offsets: Map<string, { offset: number; expires: number }>;
 }
 
 let index: CacheIndex | undefined;
@@ -106,12 +106,35 @@ function ensureIndex(): CacheIndex {
   }
   // 首次建立,或文件被替换/截断 → 整体重建。
   index = { dir, file, scanned: 0, ino: 0, offsets: new Map() };
+  cleanupStaleTempFiles(dir);
   if (existsSync(file)) {
     const st = statSync(file);
     index.ino = st.ino;
     scanInto(index, st.size);
   }
   return index;
+}
+
+/**
+ * 清理中断的 compaction 留下的临时文件(`cache.jsonl.tmp-<pid>`)。
+ * 2026-11-17 实测线上残留 500MB+ 的 tmp 文件(进程被重启/升级杀掉时产生)。
+ * 只删除 1 小时前的,避免误删正在写入的文件。
+ */
+const STALE_TMP_MS = 60 * 60 * 1000;
+function cleanupStaleTempFiles(dir: string): void {
+  try {
+    for (const name of readdirSync(dir)) {
+      if (!name.startsWith(`${CACHE_FILE_NAME}.tmp-`)) continue;
+      const file = pathJoin(dir, name);
+      try {
+        if (Date.now() - statSync(file).mtimeMs > STALE_TMP_MS) unlinkSync(file);
+      } catch {
+        // 单个文件失败不影响索引建立
+      }
+    }
+  } catch {
+    // 目录不可读时忽略
+  }
 }
 
 /**
@@ -163,19 +186,20 @@ function scanInto(idx: CacheIndex, limit: number): void {
 }
 
 function registerLine(idx: CacheIndex, lineBuf: Buffer, offset: number): void {
-  const hash = extractHash(lineBuf);
-  if (hash) {
-    idx.offsets.set(hash, offset);
+  const header = extractHeader(lineBuf);
+  if (header) {
+    idx.offsets.set(header.hash, { offset, expires: header.expires });
   }
 }
 
-function extractHash(lineBuf: Buffer): string | undefined {
-  // 快速解析:信任写入方格式 {"h":"<hash>",...}
+function extractHeader(lineBuf: Buffer): { hash: string; expires: number } | undefined {
+  // 快速解析:信任写入方格式 {"h":"<hash>",...,"e":<ts>}
   try {
     const text = lineBuf.toString("utf-8");
     if (!text) return undefined;
-    const obj = JSON.parse(text) as { h?: unknown };
-    return typeof obj.h === "string" ? obj.h : undefined;
+    const obj = JSON.parse(text) as { h?: unknown; e?: unknown };
+    if (typeof obj.h !== "string") return undefined;
+    return { hash: obj.h, expires: typeof obj.e === "number" ? obj.e : 0 };
   } catch {
     return undefined;
   }
@@ -211,7 +235,12 @@ export function entryFitsBudget(hash: string, content: RecallCacheEntry): boolea
 }
 
 /** 追加写入(内容寻址,幂等)。返回写入条数。 */
-export function putBatch(entries: Array<[string, RecallCacheEntry]>, ttlMs: number = DEFAULT_TTL_MS): number {
+export function putBatch(
+  entries: Array<[string, RecallCacheEntry]>,
+  ttlMs: number = DEFAULT_TTL_MS,
+  /** 这些 hash 即使已存在也强制追加新版本(用于“内容被安全策略收紧”的覆写)。 */
+  forceHashes?: Set<string>
+): number {
   if (!entries || entries.length === 0) return 0;
   const dir = resolveCacheDir();
   mkdirSync(dir, { recursive: true });
@@ -223,6 +252,17 @@ export function putBatch(entries: Array<[string, RecallCacheEntry]>, ttlMs: numb
   let written = 0;
   for (const [hash, content] of entries) {
     if (typeof hash !== "string" || !hash) continue;
+    // 内容寻址幂等:已存在且未过期则不再追加。否则每个请求都会把同一批大条目
+    // 重写一遍,文件在两次 compaction 之间膨胀到数百 MB(2026-11-17 实测 70MB 抖动)。
+    const existing = idx.offsets.get(hash);
+    if (
+      existing &&
+      !forceHashes?.has(hash) &&
+      (existing.expires === 0 || existing.expires > now)
+    ) {
+      written += 1; // 已可召回,视同写入成功(调用方据此判断“没有孤儿”)
+      continue;
+    }
     const line = serializeEntryLine(hash, content, now, expiresAt);
     // 与 readLineAt 共用 MAX_ENTRY_BYTES:超限条目宁可丢弃,也不写入一条永远读不回的记录。
     // 调用方应先经 entryFitsBudget 预检,避免这里丢弃后留下孤儿占位符。
@@ -230,7 +270,7 @@ export function putBatch(entries: Array<[string, RecallCacheEntry]>, ttlMs: numb
     lines += line;
     written++;
   }
-  if (!lines) return 0;
+  if (!lines) return written;
   const beforeSize = existsSync(idx.file) ? statSync(idx.file).size : 0;
   appendFileSync(idx.file, lines, "utf-8");
   // 增量续扫刚追加的部分,而不是丢弃索引让下一次调用整体重扫 60MB+ 文件:
@@ -247,9 +287,10 @@ export function putBatch(entries: Array<[string, RecallCacheEntry]>, ttlMs: numb
 /** 读取单条(hash → 原文)。未命中 / 过期 → null。 */
 export function get(hash: string, now: number = Date.now()): RecallCacheEntry | null {
   const idx = ensureIndex();
-  const offset = idx.offsets.get(hash);
-  if (offset === undefined) return null;
-  const line = readLineAt(idx.file, offset);
+  const meta = idx.offsets.get(hash);
+  if (!meta) return null;
+  if (meta.expires > 0 && meta.expires <= now) return null;
+  const line = readLineAt(idx.file, meta.offset);
   return parseEntry(line, hash, now);
 }
 
@@ -259,9 +300,9 @@ export function batchGet(hashes: string[], now: number = Date.now()): Record<str
   if (!Array.isArray(hashes)) return out;
   const idx = ensureIndex();
   for (const hash of hashes) {
-    const offset = idx.offsets.get(hash);
-    if (offset === undefined) continue;
-    const entry = parseEntry(readLineAt(idx.file, offset), hash, now);
+    const meta = idx.offsets.get(hash);
+    if (!meta) continue;
+    const entry = parseEntry(readLineAt(idx.file, meta.offset), hash, now);
     if (entry) out[hash] = entry;
   }
   return out;
@@ -276,23 +317,36 @@ export function cleanup(now: number = Date.now()): number {
   const tmp = `${file}.tmp-${process.pid}`;
   const out = openSync(tmp, "w");
   let kept = 0;
+  // 批量写:旧实现每条记录一次 writeFileSync(70MB/14000 条 = 14000 次同步写),
+  // 在 Windows + 杀软下能到几十秒,直接把请求卡住。这里攒到 ~1MB 再写。
+  const pending: Buffer[] = [];
+  let pendingBytes = 0;
+  const flush = () => {
+    if (pending.length === 0) return;
+    writeSync(out, Buffer.concat(pending));
+    pending.length = 0;
+    pendingBytes = 0;
+  };
   try {
-    // 逐行读取并写入临时文件,不再把所有原文行收集到 Map / join 成一个 60MB+
-    // 字符串 —— 那会在 compaction 时把内存峰值抬到数百 MB。
-    for (const [, offset] of idx.offsets) {
-      const raw = readLineAt(file, offset);
+    for (const [, meta] of idx.offsets) {
+      const raw = readLineAt(file, meta.offset);
       if (!raw) continue;
       const entry = safeParse(raw);
       if (!entry) continue;
       if (typeof entry.e === "number" && entry.e <= now) continue;
-      writeFileSync(out, raw.endsWith("\n") ? raw : raw + "\n", "utf-8");
+      const line = raw.endsWith("\n") ? raw : `${raw}\n`;
+      pending.push(Buffer.from(line, "utf-8"));
+      pendingBytes += line.length;
       kept += 1;
+      if (pendingBytes >= 1024 * 1024) flush();
     }
+    flush();
   } finally {
     closeSync(out);
   }
   renameSync(tmp, file);
   index = undefined;
+  lastCompactAt = Date.now();
   return kept;
 }
 
@@ -349,12 +403,22 @@ function parseEntry(line: string | undefined, hash: string, now: number): Recall
   return c as RecallCacheEntry;
 }
 
+/**
+ * 超过阈值才 compaction,且**限频**。
+ *
+ * 2026-11-17 事故:缓存到 70MB 后,旧实现每个请求都跑一次全量重写(70MB),
+ * 图片会话单次 transform 20-83s。现在最多每 10 分钟一次。
+ */
+const COMPACT_MIN_INTERVAL_MS = 10 * 60 * 1000;
+let lastCompactAt = 0;
 function maybeCompact(dir: string): void {
   const file = pathJoin(dir, CACHE_FILE_NAME);
   if (!existsSync(file)) return;
-  if (statSync(file).size >= COMPACT_SIZE_BYTES) {
-    try { cleanup(); } catch { /* best-effort */ }
-  }
+  if (statSync(file).size < COMPACT_SIZE_BYTES) return;
+  const now = Date.now();
+  if (now - lastCompactAt < COMPACT_MIN_INTERVAL_MS) return;
+  lastCompactAt = now;
+  try { cleanup(); } catch { /* best-effort */ }
 }
 
 /** 仅供测试:重置进程内索引缓存。 */

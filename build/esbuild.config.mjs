@@ -332,7 +332,6 @@ export function createMainBuildOptions({ mode = "production", plugins = [] } = {
       path.join(coreSourceRoot, "routing", "route-script-worker.ts"),
       localAgentAuthProviderHookInput,
       routerPluginInput,
-      path.join(coreSourceRoot, "plugins", "built-ins", "helix-compressor", "image-downscale-worker.ts"),
       upstreamHeaderSanitizerInput,
       electronUndiciProxyAgentInput,
       path.join(electronSourceRoot, "main", "preload.ts")
@@ -369,7 +368,6 @@ export function createCliBuildOptions({ mode = "production", plugins = [] } = {}
       path.join(coreSourceRoot, "routing", "route-script-worker.ts"),
       localAgentAuthProviderHookInput,
       routerPluginInput,
-      path.join(coreSourceRoot, "plugins", "built-ins", "helix-compressor", "image-downscale-worker.ts"),
       upstreamHeaderSanitizerInput
     ],
     external: nodeExternals.filter((moduleName) => moduleName !== "electron"),
@@ -403,7 +401,6 @@ export function createCoreServerBuildOptions({ mode = "production", plugins = []
       path.join(coreSourceRoot, "routing", "route-script-worker.ts"),
       localAgentAuthProviderHookInput,
       routerPluginInput,
-      path.join(coreSourceRoot, "plugins", "built-ins", "helix-compressor", "image-downscale-worker.ts"),
       upstreamHeaderSanitizerInput
     ],
     external: nodeExternals.filter((moduleName) => moduleName !== "electron"),

@@ -10,22 +10,18 @@ import test from "node:test";
 import http from "node:http";
 import {
   uploadMessagesMedia,
+  uploadLargeToolOutputs,
   _clearUploadCacheForTest,
   COS_UPLOAD_DEFAULTS
 } from "@ccr/core/plugins/built-ins/helix-compressor/cos-upload.ts";
 import { helixCompressorTransform } from "@ccr/core/plugins/built-ins/helix-compressor.ts";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { configureCacheDir, get as getRecallEntry } from "@ccr/core/observability/helix-recall-local-store";
-
-configureCacheDir(mkdtempSync(join(tmpdir(), "helix-cos-upload-")));
 
 const TEST_MODEL = "MiniMax-M2.7";
 
 function startFakeMcp({ fail = false } = {}) {
   let calls = 0;
   let initCalls = 0;
+  const seen = [];
   const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (chunk) => { body += chunk; });
@@ -53,6 +49,7 @@ function startFakeMcp({ fail = false } = {}) {
       }
       if (payload.method === "tools/call") {
         calls += 1;
+        seen.push(payload.params?.arguments ?? {});
         const name = payload.params?.arguments?.filename ?? "image";
         const text = `✅ 已上传到 COS\nurl: https://cos.example.test/${calls}-${name}`;
         res.setHeader("content-type", "text/event-stream");
@@ -70,7 +67,7 @@ function startFakeMcp({ fail = false } = {}) {
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {
       const { port } = server.address();
-      resolve({ url: `http://127.0.0.1:${port}/mcp`, calls: () => calls, initCalls: () => initCalls, close: () => server.close() });
+      resolve({ url: `http://127.0.0.1:${port}/mcp`, calls: () => calls, initCalls: () => initCalls, seen: () => seen, close: () => server.close() });
     });
   });
 }
@@ -260,7 +257,7 @@ test("MCP 故障后退避:60s 内不重复初始化", async () => {
   }
 });
 
-test("强制上传:上传失败时消息里绝不保留 base64,改为可召回占位符", async () => {
+test("强制上传:上传失败时消息里绝不保留 base64,改为文本标记", async () => {
   _clearUploadCacheForTest();
   const imageData = "A".repeat(8192);
   const input = [
@@ -311,24 +308,144 @@ test("强制上传:上传失败时消息里绝不保留 base64,改为可召回�
   assert.ok(result);
   const serialized = JSON.stringify(result.body.messages);
   assert.ok(!serialized.includes(imageData), "绝不能把 base64 发给上游");
-  assert.ok(serialized.includes("⟦QA:"), "应折成可召回占位符");
+  assert.ok(serialized.includes("[image omitted:"), "应替换成明确的文本标记");
+  assert.ok(!serialized.includes("⟦QA:"), "不回传原文,也不留下会召回大图的占位符");
+});
 
-  const placeholderTexts = [];
-  for (const message of result.body.messages) {
-    if (!Array.isArray(message.content)) continue;
-    for (const block of message.content) {
-      if (block?.type === "text" && typeof block.text === "string" && /^⟦QA:/.test(block.text)) placeholderTexts.push(block.text);
-      if (block?.type === "tool_result" && Array.isArray(block.content)) {
-        for (const inner of block.content) {
-          if (inner?.type === "text" && typeof inner.text === "string" && /^⟦QA:/.test(inner.text)) placeholderTexts.push(inner.text);
-        }
+test("大文本工具输出:超过阈值上传并替换为 URL+预览,小文本不动", async () => {
+  _clearUploadCacheForTest();
+  const mcp = await startFakeMcp();
+  try {
+    const big = "L".repeat(40 * 1024);
+    const small = "short output";
+    const input = [
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "t1", content: big }]
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "t2", content: small }]
       }
-    }
+    ];
+    const result = await uploadLargeToolOutputs(input, settingsFor(mcp.url));
+    assert.equal(result.uploaded, 1);
+    const replaced = result.messages[0].content[0].content;
+    assert.match(replaced, /^\[tool output uploaded: \d+ chars; url: https:\/\/cos\.example\.test\//);
+    assert.ok(!replaced.includes(big));
+    assert.equal(result.messages[1].content[0].content, small);
+    assert.equal(mcp.seen()[0].content_type, "text/plain");
+  } finally {
+    mcp.close();
   }
-  const hash = placeholderTexts[0]?.match(/^⟦QA:([0-9a-f]{16})⟧$/)?.[1];
-  assert.ok(hash);
-  const stored = getRecallEntry(hash);
-  assert.ok(stored, "占位符必须可召回");
-  assert.equal(stored.qMedia, undefined, "压不动的图片不能把原文存进召回");
-  assert.ok(stored.q.length < 200);
+});
+
+test("大文本:块数组里的多个 text 块合并成一个 URL 标记,图片块保留", async () => {
+  _clearUploadCacheForTest();
+  const mcp = await startFakeMcp();
+  try {
+    const input = [{
+      role: "user",
+      content: [{
+        type: "tool_result",
+        tool_use_id: "t1",
+        content: [
+          { type: "text", text: "A".repeat(20 * 1024) },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+          { type: "text", text: "B".repeat(20 * 1024) }
+        ]
+      }]
+    }];
+    const result = await uploadLargeToolOutputs(input, settingsFor(mcp.url));
+    assert.equal(result.uploaded, 1);
+    const inner = result.messages[0].content[0].content;
+    assert.equal(inner.length, 2, "两个 text 块应收敛为一个标记,图片块保留");
+    assert.equal(inner[0].type, "text");
+    assert.match(inner[0].text, /^\[tool output uploaded: /);
+    assert.equal(inner[1].type, "image");
+  } finally {
+    mcp.close();
+  }
+});
+
+test("大文本:OpenAI role:tool 字符串整体替换;重复内容只上传一次", async () => {
+  _clearUploadCacheForTest();
+  const mcp = await startFakeMcp();
+  try {
+    const big = JSON.stringify({ rows: Array.from({ length: 3000 }, (_, i) => ({ i, v: "x".repeat(20) })) });
+    const input = [{ role: "tool", tool_call_id: "c1", content: big }];
+    const first = await uploadLargeToolOutputs(input, settingsFor(mcp.url));
+    assert.equal(first.uploaded, 1);
+    assert.match(first.messages[0].content, /^\[tool output uploaded: /);
+    assert.equal(mcp.seen()[0].content_type, "application/json", "JSON 内容应按 application/json 上传");
+
+    const second = await uploadLargeToolOutputs(input, settingsFor(mcp.url));
+    assert.equal(second.uploaded, 1);
+    assert.equal(mcp.calls(), 1, "同一内容只上传一次");
+  } finally {
+    mcp.close();
+  }
+});
+
+test("大文本上传失败:内容保持原样,不产生 URL 标记", async () => {
+  _clearUploadCacheForTest();
+  const mcp = await startFakeMcp({ fail: true });
+  try {
+    const big = "Z".repeat(40 * 1024);
+    const input = [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: big }] }];
+    const result = await uploadLargeToolOutputs(input, settingsFor(mcp.url));
+    assert.equal(result.uploaded, 0);
+    assert.equal(result.messages[0].content[0].content, big);
+  } finally {
+    mcp.close();
+  }
+});
+
+test("生产路径:大文本工具输出在 transform 中被换成 COS URL", async () => {
+  _clearUploadCacheForTest();
+  const mcp = await startFakeMcp();
+  try {
+    const big = "Q".repeat(40 * 1024);
+    const result = await helixCompressorTransform(
+      {
+        body: {
+          model: TEST_MODEL,
+          messages: [
+            { role: "user", content: "run it" },
+            { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: big }] }
+          ]
+        },
+        headers: {},
+        method: "POST",
+        path: "/v1/messages",
+        requestId: "test-cos-text-1",
+        routedModel: TEST_MODEL,
+        url: "/v1/messages"
+      },
+      {
+        config: {},
+        logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+        paths: { configDir: "", dataDir: "", pluginDataDir: "" },
+        permissions: [],
+        pluginId: "helix-compressor",
+        pluginConfig: {
+          imageUploadEnabled: true,
+          imageUploadMcpUrl: mcp.url,
+          imageUploadMcpToken: "test-token",
+          imageUploadMinChars: 1,
+          textUploadMinChars: 1024
+        },
+        openSqliteStore: async () => { throw new Error("not implemented"); }
+      }
+    );
+
+    assert.ok(result);
+    const serialized = JSON.stringify(result.body.messages);
+    assert.ok(serialized.includes("[tool output uploaded:"), "应包含上传标记");
+    assert.ok(serialized.includes("https://cos.example.test/"), "应包含 COS URL");
+    assert.ok(!serialized.includes(big), "原始大文本不应再发给上游");
+  } finally {
+    mcp.close();
+  }
 });

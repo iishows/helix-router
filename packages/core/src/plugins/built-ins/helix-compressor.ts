@@ -24,20 +24,11 @@ import type {
 import { helixCompressorRecallToolName, helixCompressorMaxRecallPerRequest, helixCompressorLoopTimeoutMs, helixRecallProfileMaxToolCalls, helixRecallProfileMaxTurns } from "@ccr/core/gateway/core-runtime/router-plugin-contract";
 import {
   compressV3x,
-  computeHash,
-  makePlaceholder,
-  recentCompressionSkipIndices,
   type LocalCompressMessage
 } from "@ccr/core/plugins/built-ins/helix-compressor/hc-local";
 import {
-  collectBase64MediaSlots,
-  downscaleImageDataAsync,
-  downscaleMessagesMedia,
-  replaceBase64MediaSlots,
-  IMAGE_DOWNSCALE_DEFAULTS,
-  type ImageDownscaleSettings
-} from "@ccr/core/plugins/built-ins/helix-compressor/image-downscale";
-import {
+  stripBase64Media,
+  uploadLargeToolOutputs,
   uploadMessagesMedia,
   COS_UPLOAD_DEFAULTS,
   type CosUploadScope,
@@ -281,25 +272,6 @@ export interface HelixCompressorConfig {
   /** 主动 compact 摘要模型覆盖(默认空 = 用当前路由模型)。 */
   proactiveCompactModel?: string;
   /**
-   * V1.16(2026-11-17):大图降采样。默认 true。
-   *
-   * 历史媒体可以折成召回占位符,但**当前轮用户上传的图必须让模型看见**,只能缩小它。
-   * 线上事故:1.2MB JPEG 的 1.64MB base64 按文本计入上游 token(≈110 万),直接撑爆
-   * 1M 上下文。降采样按 `imageDownscaleMaxEdge → 768 → 512` 降档,直到
-   * ≤ `imageDownscaleTargetMaxChars`。任何解码失败都保持原图。
-   */
-  imageDownscale?: boolean;
-  /** 仅当 base64 字符数 ≥ 此值才尝试降采样(默认 64KB)。 */
-  imageDownscaleMinChars?: number;
-  /** 降采样目标最长边(默认 1024px)。 */
-  imageDownscaleMaxEdge?: number;
-  /** 输出 JPEG 质量(默认 72)。 */
-  imageDownscaleJpegQuality?: number;
-  /** 编码后 base64 目标上限(默认 128KB),超过则继续降档。 */
-  imageDownscaleTargetMaxChars?: number;
-  /** 单请求全部 base64 媒体的总量上限(默认 8MB),超过则从最大的继续压。 */
-  imageDownscaleTotalMaxChars?: number;
-  /**
    * V1.17:把 base64 图片上传到 COS,消息里只留 URL。
    *
    * 实测:tool 消息里的 base64 按文本计费(同一张图 53k tokens),而 http 图片 URL
@@ -317,6 +289,12 @@ export interface HelixCompressorConfig {
   imageUploadTimeoutMs?: number;
   /** 上传范围(默认 all)。启用上传后,未上传的 base64 会被折成占位符,绝不再外发。 */
   imageUploadScope?: "all" | "tool";
+  /** 大文本工具输出上传开关(默认 true,随 imageUploadEnabled 生效)。 */
+  textUploadEnabled?: boolean;
+  /** tool 输出文本 ≥ 该字符数才上传(默认 32KB)。 */
+  textUploadMinChars?: number;
+  /** 上传后保留的预览字符数(默认 400)。 */
+  textUploadPreviewChars?: number;
   /** 主动 compact 摘要缓存 TTL(ms,默认 3 天)。 */
   proactiveCompactCacheTtlMs?: number;
   /**
@@ -415,18 +393,15 @@ export const HELIX_COMPRESSOR_DEFAULTS: HelixCompressorConfig = {
   proactiveCompactTimeoutMs: 60000,
   tokenBudget: 100000,
   // V1.16:大图降采样默认开启(1.64MB base64 ≈ 110 万 tokens 的事故兜底)。
-  imageDownscale: IMAGE_DOWNSCALE_DEFAULTS.enabled,
-  imageDownscaleMinChars: IMAGE_DOWNSCALE_DEFAULTS.minDataChars,
-  imageDownscaleMaxEdge: IMAGE_DOWNSCALE_DEFAULTS.maxEdge,
-  imageDownscaleJpegQuality: IMAGE_DOWNSCALE_DEFAULTS.jpegQuality,
-  imageDownscaleTargetMaxChars: IMAGE_DOWNSCALE_DEFAULTS.targetMaxChars,
-  imageDownscaleTotalMaxChars: IMAGE_DOWNSCALE_DEFAULTS.totalMaxChars,
   imageUploadEnabled: false,
   imageUploadMcpUrl: "",
   imageUploadMcpToken: "",
   imageUploadMinChars: COS_UPLOAD_DEFAULTS.minDataChars,
   imageUploadTimeoutMs: COS_UPLOAD_DEFAULTS.timeoutMs,
   imageUploadScope: COS_UPLOAD_DEFAULTS.scope,
+  textUploadEnabled: COS_UPLOAD_DEFAULTS.textEnabled,
+  textUploadMinChars: COS_UPLOAD_DEFAULTS.textMinChars,
+  textUploadPreviewChars: COS_UPLOAD_DEFAULTS.textPreviewChars,
   recallModelPatterns: [],
   recallModelExcludePatterns: [],
   recallModelDetected: false,
@@ -530,22 +505,18 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
           (upload.failed > 0 ? `, ${upload.failed} failed` : "")
       );
     }
-    // 硬规则:启用上传后绝不再外发 base64。上传失败/低于阈值/未覆盖的图片,
-    //   统一折成可召回占位符(召回条目本身也压缩/只存标记),不再把 base64 发给上游。
-    compressionMessages = await stripRemainingBase64Media(compressionMessages, context);
-  }
-
-  // V1.16:降采样前置 pass —— 只处理压缩器「当前轮保护」的消息。
-  //   默认只在单图 ≥4MB 时触发(请求体保护);用户图片按视觉解析,不做无谓降质。
-  //   baseline header 仍用上传/降采样前的 messages 计算。
-  const downscaleSettings = imageDownscaleSettings(config);
-  if (downscaleSettings.enabled) {
-    const recentIndices = recentCompressionSkipIndices(compressionMessages, config.keepRecentPairs ?? 1);
-    const pre = await downscaleMessagesMedia(compressionMessages, downscaleSettings, {
-      onlyIndices: recentIndices,
-      enforceTotalBudget: false
-    });
-    compressionMessages = pre.messages as LLMMessage[];
+    // 大文本工具输出:超过阈值也上传 COS,消息里只留 URL + 短预览。
+    const textUpload = await uploadLargeToolOutputs(compressionMessages, uploadSettings, upstreamRequestId);
+    if (textUpload.uploaded > 0) {
+      compressionMessages = textUpload.messages as LLMMessage[];
+      context.logger.info(
+        `[helix-compressor] uploaded ${textUpload.uploaded} large tool output(s) to COS` +
+          (textUpload.failed > 0 ? `, ${textUpload.failed} failed` : "")
+      );
+    }
+    // 硬规则:启用上传后绝不再外发 base64。上传失败的图片直接换成文本标记,
+    //   不再把 base64 发给上游,也不把原文存进召回(避免 recall 再次注入大内容)。
+    compressionMessages = stripRemainingBase64Media(compressionMessages, context);
   }
 
   // 本地压缩:只有命中 recall 白名单的模型才做占位符压缩,否则原样透传。
@@ -589,10 +560,17 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
         try {
           // V1.16:召回条目里的媒体也必须先压缩。tool 消息的 base64 按文本计费,
           //   原样存 1.6MB 会让模型一次 recall 重新注入 ~1M 文本(等于把爆炸推迟一轮)。
-          await compressRecallMediaEntries(cacheEntries as Array<[string, RecallCacheEntry]>, context);
+          const forcedHashes = compressRecallMediaEntries(
+            cacheEntries as Array<[string, RecallCacheEntry]>,
+            context
+          );
           // 缓存目录默认 {DATADIR}/helix-recall;若外部已通过环境变量指定则由 store 读取该值。
           ensureLocalRecallCacheDir();
-          const written = putRecallCacheBatch(cacheEntries as Array<[string, RecallCacheEntry]>);
+          const written = putRecallCacheBatch(
+            cacheEntries as Array<[string, RecallCacheEntry]>,
+            undefined,
+            forcedHashes
+          );
           if (written < cacheEntries.length) {
             // 预检已按同一字节上限过滤,走到这里说明两处口径意外分叉 — 明确指出,
             // 否则表现为"占位符在但召不回"的静默数据丢失。
@@ -637,19 +615,6 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
   // 2. 返回替换 messages 的 body
   let outputMessages = compressed.compressed as LLMMessage[];
 
-  // V1.16(2026-11-17):大图降采样。历史媒体已被本地压缩折成占位符,这里主要处理
-  //   当前轮用户上传的图(必须让模型看见,不能折)以及残留的大图(base64 按文本计 token)。
-  //   copy-on-write,不修改原始 messages,保证 baseline header 仍是降采样前的真实值。
-  if (downscaleSettings.enabled) {
-    const downscaled = await downscaleMessagesMedia(outputMessages, downscaleSettings);
-    if (downscaled.stats.count > 0) {
-      context.logger.info(
-        `[helix-compressor] downscaled ${downscaled.stats.count} image block(s), saved ${downscaled.stats.savedChars} base64 chars`
-      );
-    }
-    outputMessages = downscaled.messages as LLMMessage[];
-  }
-
   const outputBody: Record<string, unknown> = {
     ...body,
     messages: outputMessages
@@ -681,6 +646,10 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
     outputBody.messages = outputMessages;
   }
 
+  // 大请求体(实测 50MB)上 tokenizeMessages 会 JSON.stringify 整包;只算一次。
+  const baselineTokens = tokenizeMessages(messages);
+  const submittedTokens = tokenizeMessages(outputMessages);
+
   return {
     ...(routedModel ? { routedModel } : {}),
     body: outputBody,
@@ -700,13 +669,13 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
       // v1.4: 端到端 baseline = 原始 messages 用 gpt-tokenizer(cl100k_base)真实 token 化。
       //   UI 拿真实 inputTokens 后能对比。注意:这只算 user messages 字段,
       //   system/tool/cache 不在 baseline 里(那些本来也不被压缩)。
-      [helixCompressorBaselineTokensHeader]: String(tokenizeMessages(messages)),
+      [helixCompressorBaselineTokensHeader]: String(baselineTokens),
       // v1.5: 压缩后 messages 的 token 数。UI 显示 "X→Y tok (Z%)" 时用,
       //   全 token 视图避免 chars/tokens 混用的歧义。
-      [helixCompressorCompressedTokensHeader]: String(tokenizeMessages(outputMessages)),
+      [helixCompressorCompressedTokensHeader]: String(submittedTokens),
       // v1.6: ccr 实际提交给 LLM 的 token 数(= 压缩后 body)。DB trigger 读这个 key
       //   填 request_logs.compression_submitted_tokens,不 emit 则 s 列恒为 0。
-      [helixCompressorSubmittedTokensHeader]: String(tokenizeMessages(outputMessages))
+      [helixCompressorSubmittedTokensHeader]: String(submittedTokens)
     },
     responseHeaders: {
       [helixCompressorRequestIdHeader]: upstreamRequestId,
@@ -717,9 +686,9 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
       [helixCompressorScenarioHeader]: compressed.scenario ?? "",
       [helixCompressorRatioHeader]: String(compressed.stats?.ratio ?? 0),
       [helixCompressorEnabledHeader]: "1",
-      [helixCompressorBaselineTokensHeader]: String(tokenizeMessages(messages)),
-      [helixCompressorCompressedTokensHeader]: String(tokenizeMessages(outputMessages)),
-      [helixCompressorSubmittedTokensHeader]: String(tokenizeMessages(outputMessages))
+      [helixCompressorBaselineTokensHeader]: String(baselineTokens),
+      [helixCompressorCompressedTokensHeader]: String(submittedTokens),
+      [helixCompressorSubmittedTokensHeader]: String(submittedTokens)
     }
   };
 };
@@ -727,175 +696,71 @@ export const helixCompressorTransform: GatewayPluginRequestTransformHandler = as
 // ============= 辅助函数 =============
 
 const RECALL_MEDIA_MAX_CHARS = 128 * 1024;
-const RECALL_MEDIA_MIN_COMPRESS_CHARS = 8 * 1024;
 
 /**
- * V1.16:写召回缓存前压缩媒体条目。
+ * V1.17:写召回缓存前检查媒体条目。
  *
- * tool 消息里的 base64 按文本计费;若把 1.6MB 原文存进召回,模型调用 recall 会再次
- * 注入 ~1M 文本,等于把爆炸推迟到下一轮。这里把 qMedia 里的图片降到 ≤128KB 再入缓存;
- * 压不动(格式不支持/解码失败)且仍超限的,只保留一个小标记,绝不存原文。
+ * tool 消息里的 base64 按文本计费;若把 1.6MB 原文存进召回,模型一次 recall 会重新
+ * 注入 ~1M 文本。这里对超过 128KB 的 qMedia 直接丢弃,只保留「媒体过大」标记。
  */
-async function compressRecallMediaEntries(
+function compressRecallMediaEntries(
   entries: Array<[string, RecallCacheEntry]>,
   context: { logger: { info: (message: string) => void; warn: (message: string) => void } }
-): Promise<number> {
-  const settings: ImageDownscaleSettings = {
-    ...IMAGE_DOWNSCALE_DEFAULTS,
-    enabled: true,
-    minDataChars: 1,
-    targetMaxChars: RECALL_MEDIA_MAX_CHARS,
-    totalMaxChars: 0
-  };
-  let compressed = 0;
-  for (const [, entry] of entries) {
+): Set<string> {
+  const forced = new Set<string>();
+  for (const [hash, entry] of entries) {
     if (!Array.isArray(entry.qMedia) || entry.qMedia.length === 0) continue;
-    let omitted = false;
     let omittedBytes = 0;
     let omittedType = "media";
     for (const block of entry.qMedia) {
       const media = recallMediaData(block);
       if (!media) continue;
-      if (media.data.length <= RECALL_MEDIA_MIN_COMPRESS_CHARS) continue;
-      const down = await downscaleImageDataAsync(media.data, media.mime, settings);
-      if (down) {
-        media.apply(down.data, down.mime);
-        compressed += 1;
-        continue;
-      }
-      if (media.data.length > RECALL_MEDIA_MAX_CHARS) {
-        omitted = true;
-        omittedBytes = media.data.length;
-        omittedType = media.mime || "media";
-      }
+      if (media.data.length <= RECALL_MEDIA_MAX_CHARS) continue;
+      omittedBytes = Math.max(omittedBytes, media.data.length);
+      omittedType = media.mime || "media";
     }
-    if (omitted) {
-      entry.q = `[media omitted: ${omittedType}, ${omittedBytes} bytes; too large to compress]`;
-      delete entry.qMedia;
-      context.logger.info(
-        `[helix-compressor] recall media not compressible (${omittedType}, ${omittedBytes} bytes); stored marker instead`
-      );
-    }
+    if (omittedBytes === 0) continue;
+    entry.q = `[media omitted: ${omittedType}, ${omittedBytes} bytes; too large to inline on recall]`;
+    delete entry.qMedia;
+    // 必须覆盖旧版本(旧缓存里可能已经存了带 qMedia 的同 hash 条目),
+    // 否则 recall 仍会读到原始大媒体。
+    forced.add(hash);
   }
-  if (compressed > 0) {
-    context.logger.info(`[helix-compressor] compressed ${compressed} recall media block(s)`);
+  if (forced.size > 0) {
+    context.logger.info(`[helix-compressor] dropped ${forced.size} oversized recall media entry(ies); marker only`);
   }
-  return compressed;
+  return forced;
 }
 
 /**
- * V1.17:启用上传后,把消息里残余的 base64 媒体全部折成占位符(绝不再外发 base64)。
- *
- * 上传成功的图片已经是 URL;这里兜底:上传失败、低于阈值、scope 未覆盖的 base64。
- * 召回条目按 ≥128KB 压缩,压不动的只存标记——所以 recall 也不会重新注入大 base64。
+ * V1.17:启用上传后,把消息里残余的 base64 媒体全部替换成文本标记(绝不再外发 base64)。
+ * 不写召回、不留原文——召回也不会再把大 base64 带回来。
  */
-async function stripRemainingBase64Media(
+function stripRemainingBase64Media(
   messages: LLMMessage[],
   context: { logger: { info: (message: string) => void; warn: (message: string) => void } }
-): Promise<LLMMessage[]> {
-  const slots = collectBase64MediaSlots(messages);
-  if (slots.length === 0) return messages;
-  const recallSettings: ImageDownscaleSettings = {
-    ...IMAGE_DOWNSCALE_DEFAULTS,
-    enabled: true,
-    minDataChars: 1,
-    targetMaxChars: RECALL_MEDIA_MAX_CHARS,
-    totalMaxChars: 0
-  };
-  const entries: Array<[string, RecallCacheEntry]> = [];
-  const replacements: Array<{ slot: (typeof slots)[number]; text: string }> = [];
-  for (const slot of slots) {
-    const hash = computeHash(JSON.stringify(slot.block));
-    const down = await downscaleImageDataAsync(slot.data, slot.mime, recallSettings);
-    const storedBlock = down ? mediaBlockWithData(slot.block, down.data, down.mime) : undefined;
-    const entry: RecallCacheEntry = {
-      q: storedBlock
-        ? `[media block: ${String(slot.block.type)} ${slot.mime || "media"}, ${slot.data.length} bytes]`
-        : `[media omitted: ${slot.mime || "media"}, ${slot.data.length} bytes; upload failed]`,
-      a: "",
-      blockOnly: true,
-      kind: "media",
-      msgIdx: slot.msgIndex,
-      blockIdx: slot.blockIndex,
-      ...(storedBlock ? { qMedia: [storedBlock] } : {})
-    };
-    if (entryFitsBudget(hash, entry)) {
-      entries.push([hash, entry]);
-      replacements.push({ slot, text: makePlaceholder(hash) });
-    } else {
-      replacements.push({
-        slot,
-        text: `[image omitted: ${slot.mime || "media"}, ${slot.data.length} bytes; too large]`
-      });
-    }
+): LLMMessage[] {
+  const result = stripBase64Media(
+    messages,
+    (mime, dataLength) => `[image omitted: ${mime || "media"}, ${dataLength} bytes; upload failed]`
+  );
+  if (result.stripped > 0) {
+    context.logger.info(`[helix-compressor] stripped ${result.stripped} base64 image block(s); markers only`);
   }
-
-  let written = 0;
-  if (entries.length > 0) {
-    try {
-      ensureLocalRecallCacheDir();
-      written = putRecallCacheBatch(entries);
-    } catch (error) {
-      context.logger.warn(`[helix-compressor] strip media: recall cache write failed: ${(error as Error).message}`);
-    }
-  }
-  if (written !== entries.length) {
-    // 无法保证占位符可读回(孤儿风险)→ 全部降级成纯文本标记。
-    context.logger.warn(
-      `[helix-compressor] strip media: recall store kept ${written}/${entries.length}; using text markers instead`
-    );
-    const fallback = replacements.map(({ slot, text }) => ({
-      slot,
-      text: text.startsWith("⟦QA:")
-        ? `[image omitted: ${slot.mime || "media"}, ${slot.data.length} bytes; recall unavailable]`
-        : text
-    }));
-    return replaceBase64MediaSlots(messages, fallback) as LLMMessage[];
-  }
-  context.logger.info(`[helix-compressor] stripped ${slots.length} base64 image block(s); nothing base64 is sent upstream`);
-  return replaceBase64MediaSlots(messages, replacements) as LLMMessage[];
-}
-
-function mediaBlockWithData(
-  block: Record<string, unknown>,
-  data: string,
-  mime: string
-): Record<string, unknown> {
-  if (block.type === "image") {
-    const source = isRecord(block.source) ? block.source : {};
-    return { ...block, source: { ...source, data, media_type: mime } };
-  }
-  const imageUrl = isRecord(block.image_url) ? block.image_url : {};
-  return { ...block, image_url: { ...imageUrl, url: `data:${mime};base64,${data}` } };
+  return result.messages as LLMMessage[];
 }
 
 function recallMediaData(
   block: unknown
-): { data: string; mime: string; apply: (data: string, mime: string) => void } | undefined {
+): { data: string; mime: string } | undefined {
   if (!isRecord(block)) return undefined;
   if (block.type === "image") {
     const source = isRecord(block.source) ? block.source : undefined;
     if (source && typeof source.data === "string") {
-      const mime = typeof source.media_type === "string" ? source.media_type : "";
-      return {
-        data: source.data,
-        mime,
-        apply: (data, nextMime) => {
-          source.data = data;
-          source.media_type = nextMime;
-        }
-      };
+      return { data: source.data, mime: typeof source.media_type === "string" ? source.media_type : "" };
     }
     if (typeof block.data === "string") {
-      const mime = typeof block.mime === "string" ? block.mime : "";
-      return {
-        data: block.data,
-        mime,
-        apply: (data, nextMime) => {
-          block.data = data;
-          block.mime = nextMime;
-        }
-      };
+      return { data: block.data, mime: typeof block.mime === "string" ? block.mime : "" };
     }
     return undefined;
   }
@@ -903,14 +768,8 @@ function recallMediaData(
     const imageUrl = isRecord(block.image_url) ? block.image_url : undefined;
     const url = imageUrl && typeof imageUrl.url === "string" ? imageUrl.url : "";
     const match = url.match(/^data:([^;,]+);base64,(.*)$/s);
-    if (!imageUrl || !match) return undefined;
-    return {
-      data: match[2],
-      mime: match[1],
-      apply: (data, mime) => {
-        imageUrl.url = `data:${mime};base64,${data}`;
-      }
-    };
+    if (!match) return undefined;
+    return { data: match[2], mime: match[1] };
   }
   return undefined;
 }
@@ -927,23 +786,13 @@ function imageUploadSettings(config: HelixCompressorConfig): CosUploadSettings {
     mcpToken,
     minDataChars: positive(config.imageUploadMinChars, COS_UPLOAD_DEFAULTS.minDataChars),
     timeoutMs: positive(config.imageUploadTimeoutMs, COS_UPLOAD_DEFAULTS.timeoutMs),
-    scope
+    scope,
+    textEnabled: config.textUploadEnabled !== false,
+    textMinChars: positive(config.textUploadMinChars, COS_UPLOAD_DEFAULTS.textMinChars),
+    textPreviewChars: positive(config.textUploadPreviewChars, COS_UPLOAD_DEFAULTS.textPreviewChars)
   };
 }
 
-function imageDownscaleSettings(config: HelixCompressorConfig): ImageDownscaleSettings {
-  const positive = (value: unknown, fallback: number): number =>
-    typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
-  return {
-    enabled: config.imageDownscale !== false,
-    minDataChars: positive(config.imageDownscaleMinChars, IMAGE_DOWNSCALE_DEFAULTS.minDataChars),
-    maxEdge: positive(config.imageDownscaleMaxEdge, IMAGE_DOWNSCALE_DEFAULTS.maxEdge),
-    jpegQuality: positive(config.imageDownscaleJpegQuality, IMAGE_DOWNSCALE_DEFAULTS.jpegQuality),
-    targetMaxChars: positive(config.imageDownscaleTargetMaxChars, IMAGE_DOWNSCALE_DEFAULTS.targetMaxChars),
-    totalMaxChars: positive(config.imageDownscaleTotalMaxChars, IMAGE_DOWNSCALE_DEFAULTS.totalMaxChars),
-    maxInputPixels: IMAGE_DOWNSCALE_DEFAULTS.maxInputPixels
-  };
-}
 
 function parseConfig(value: unknown): HelixCompressorConfig {
   if (!isRecord(value)) return HELIX_COMPRESSOR_DEFAULTS;
@@ -958,18 +807,15 @@ function parseConfig(value: unknown): HelixCompressorConfig {
     ...(typeof value.keepRecentToolResults === "number" ? { keepRecentToolResults: value.keepRecentToolResults } : {}),
     ...(typeof value.maxCompressToolResults === "number" ? { maxCompressToolResults: value.maxCompressToolResults } : {}),
     ...(typeof value.tokenBudget === "number" ? { tokenBudget: value.tokenBudget } : {}),
-    ...(typeof value.imageDownscale === "boolean" ? { imageDownscale: value.imageDownscale } : {}),
-    ...(typeof value.imageDownscaleMinChars === "number" ? { imageDownscaleMinChars: value.imageDownscaleMinChars } : {}),
-    ...(typeof value.imageDownscaleMaxEdge === "number" ? { imageDownscaleMaxEdge: value.imageDownscaleMaxEdge } : {}),
-    ...(typeof value.imageDownscaleJpegQuality === "number" ? { imageDownscaleJpegQuality: value.imageDownscaleJpegQuality } : {}),
-    ...(typeof value.imageDownscaleTargetMaxChars === "number" ? { imageDownscaleTargetMaxChars: value.imageDownscaleTargetMaxChars } : {}),
-    ...(typeof value.imageDownscaleTotalMaxChars === "number" ? { imageDownscaleTotalMaxChars: value.imageDownscaleTotalMaxChars } : {}),
     ...(typeof value.imageUploadEnabled === "boolean" ? { imageUploadEnabled: value.imageUploadEnabled } : {}),
     ...(typeof value.imageUploadMcpUrl === "string" ? { imageUploadMcpUrl: value.imageUploadMcpUrl } : {}),
     ...(typeof value.imageUploadMcpToken === "string" ? { imageUploadMcpToken: value.imageUploadMcpToken } : {}),
     ...(typeof value.imageUploadMinChars === "number" ? { imageUploadMinChars: value.imageUploadMinChars } : {}),
     ...(typeof value.imageUploadTimeoutMs === "number" ? { imageUploadTimeoutMs: value.imageUploadTimeoutMs } : {}),
     ...(value.imageUploadScope === "all" || value.imageUploadScope === "tool" ? { imageUploadScope: value.imageUploadScope } : {}),
+    ...(typeof value.textUploadEnabled === "boolean" ? { textUploadEnabled: value.textUploadEnabled } : {}),
+    ...(typeof value.textUploadMinChars === "number" ? { textUploadMinChars: value.textUploadMinChars } : {}),
+    ...(typeof value.textUploadPreviewChars === "number" ? { textUploadPreviewChars: value.textUploadPreviewChars } : {}),
     ...(typeof value.keepRecentTurns === "number" ? { keepRecentTurns: value.keepRecentTurns } : {}),
     ...(typeof value.aggressiveFolding === "boolean" ? { aggressiveFolding: value.aggressiveFolding } : {}),
     ...(typeof value.minFoldedTokens === "number" ? { minFoldedTokens: value.minFoldedTokens } : {}),

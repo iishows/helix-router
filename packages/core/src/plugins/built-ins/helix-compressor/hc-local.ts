@@ -362,15 +362,10 @@ function replaceTextBlocksWithPlaceholder(
  *     从候选范围中剔除(云端 [0, keepFrom) 会把它包含进去)。
  */
 /**
- * V1.16:压缩器「当前轮保护」的消息下标集合。
- *
- * 规则与 `collectBlockCandidates` 完全一致:第一条 user 消息 + 末尾
- * `keepRecentPairs * 2` 条 user/assistant 消息。
- *
- * 暴露给 helix-compressor 的降采样前置 pass:这些消息里的媒体不会被折成占位符
- * (当前轮图片必须让模型看见),先降采样它们,避免压缩器把大图整条折掉。
+ * 压缩器「当前轮保护」的消息下标集合:第一条 user 消息 + 末尾
+ * `keepRecentPairs * 2` 条 user/assistant 消息(这些消息内的媒体/文本不折叠)。
  */
-export function recentCompressionSkipIndices(
+function recentCompressionSkipIndices(
   messages: Array<{ role?: unknown } | null | undefined>,
   keepRecentPairs: number
 ): Set<number> {
